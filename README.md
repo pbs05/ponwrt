@@ -22,14 +22,45 @@ PonWrt is based on [ImmortalWrt](https://github.com/immortalwrt/immortalwrt) and
 ## Build
 
 ```sh
+#  安装编译所需的工具链和库
+#  Install the required toolchain and libraries for building
+sudo apt update -y
+sudo apt full-upgrade -y
+sudo apt install -y ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+  bzip2 ccache clang cmake cpio curl device-tree-compiler ecj fastjar flex gawk gettext gcc-multilib \
+  g++-multilib git gnutls-dev gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+  libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+  libreadline-dev libssl-dev libtool libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano \
+  ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply python3-docutils \
+  python3-pyelftools qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo uglifyjs \
+  upx-ucl unzip vim wget xmlto xxd zlib1g-dev zstd
+
+#  或者使用ImmortalWrt一键脚本安装依赖
+#  Or use the ImmortalWrt one-click script to install dependencies
+sudo bash -c 'bash <(curl -s https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+
+#  拉取源码
+#  Clone the source code
 git clone https://github.com/pbs05/ponwrt.git
 cd ponwrt
 
+#  更新并安装 feeds（软件包源）
+#  Update and install feeds (package sources)
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
+#  选择配置 以7581为例
+#  Select a configuration, using 7581 as an example
 cp configs/an7581.config .config
-# Use configs/an7583.config for AN7583.
+#  若目标是 AN7583，改用下面这行：
+#  If the target is AN7583, use the following line instead:
+cp configs/an7583.config .config
+
+
+#  开始编译
+#  Start building
+# -j$(nproc) 表示用所有 CPU 核心并行编译，加快速度
+# -j$(nproc) means compiling in parallel with all CPU cores to speed things up
 make defconfig
 make -j$(nproc)
 ```
