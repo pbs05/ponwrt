@@ -1,0 +1,28 @@
+From: liujixings <liujixings@outlook.com>
+Subject: [PATCH] net: airoha: preserve TTL for bridge offload
+
+XG2010G LAN1/LAN2 same-subnet tests show TCP packets arriving with TTL
+127 from a Windows host whose initial TTL is 128. Stopping bridger removes
+the TC/PPE rules and restores TTL 128 on the identical path.
+
+Do not enable TTL decrement for the L2 template. IPv4 and IPv6 subflows
+inherit the template control bits, while routed entries retain their
+existing decrement behavior. This does not change NBQ or flow lifetime.
+
+Signed-off-by: liujixings <liujixings@outlook.com>
+---
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -357,8 +357,10 @@
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_UDP, l4proto == IPPROTO_UDP) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VLAN_LAYER, data->vlan.num) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, data->vlan.num) |
+-	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PPPOE, data->pppoe.num) |
+-	      AIROHA_FOE_IB1_BIND_TTL;
++	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PPPOE, data->pppoe.num);
++	/* L2 subflows inherit this template, including TTL handling. */
++	if (type != PPE_PKT_TYPE_BRIDGE)
++		val |= AIROHA_FOE_IB1_BIND_TTL;
+ 	hwe->ib1 = val;
+ 
+ 	val = FIELD_PREP(AIROHA_FOE_IB2_PORT_AG, 0x1f);
