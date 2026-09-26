@@ -149,7 +149,7 @@ define Device/gemtek_xg2010g
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
 	kmod-phy-airoha-en8811h kmod-phy-realtek rtl826x-firmware \
 	kmod-airoha-en7572 kmod-airoha-xpon airoha-ponctl airoha-pond \
-	fitblk nand-utils ubi-utils
+	fitblk nand-utils ubi-utils bridger
 endef
 TARGET_DEVICES += gemtek_xg2010g
 

@@ -1,0 +1,61 @@
+From 7a0d64fcab836c393537bbfdd065a6109e6affb9 Mon Sep 17 00:00:00 2001
+From: Andrey Korshunov <razor1702@gmail.com>
+Date: Thu, 17 Sep 2026 03:50:49 +0300
+Subject: [PATCH] nl: report netlink errors back to the caller
+
+bridge_nl_error_cb() is installed as the NL_CB_CUSTOM error handler and
+returns NL_SKIP on every path, so libnl treats the error message as
+consumed and nl_wait_for_ack() returns 0: every rejected request looks
+like a success to the caller.
+
+bridger_nl_flow_offload_add() depends on that return value. It walks the
+device's offload chain and stops at the first device that accepts the
+flower filter. On a MediaTek MT7988 board with a Motorcomm YT9224 switch
+the DSA user port rejects the skip_sw filter with -EOPNOTSUPP - that
+switch offloads ACL rules, not a redirect to a Wi-Fi netdev - but the
+error was swallowed, so bridger recorded the flow as offloaded and never
+tried the conduit, where the MediaTek PPE accepts the very same rule.
+
+Return NL_STOP instead, which makes libnl return
+-nl_syserr2nlerr(err->error), as its default error handler does. The
+error then reaches the caller, which falls back to the next device:
+
+  Add flow on lan1: No child process   (strerror of NLE_OPNOTSUPP)
+  Add flow on eth1: Success
+
+With that, a LAN to Wi-Fi transfer on this board is offloaded in both
+directions - the ingress and egress netdev counters stay at zero while
+the Wi-Fi station counters keep rising - instead of being forwarded by
+the CPU.
+
+Assisted-By: Claude Opus 5 <noreply@anthropic.com>
+Signed-off-by: Andrey Korshunov <razor1702@gmail.com>
+---
+ nl.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/nl.c b/nl.c
+index f326d8e..f11857f 100644
+--- a/nl.c
++++ b/nl.c
+@@ -1030,7 +1030,7 @@ bridge_nl_error_cb(struct sockaddr_nl *nla, struct nlmsgerr *err,
+ 		return NL_SKIP;
+ 
+ 	if (!(nlh->nlmsg_flags & NLM_F_ACK_TLVS))
+-		return NL_SKIP;
++		return NL_STOP;
+ 
+ 	if (!(nlh->nlmsg_flags & NLM_F_CAPPED))
+ 		ack_len += err->msg.nlmsg_len - sizeof(*nlh);
+@@ -1044,7 +1044,7 @@ bridge_nl_error_cb(struct sockaddr_nl *nla, struct nlmsgerr *err,
+ 
+ 	D("Netlink error(%d): %s\n", err->error, errstr);
+ 
+-	return NL_SKIP;
++	return NL_STOP;
+ }
+ 
+ struct nl_sock *
+-- 
+2.55.0
+

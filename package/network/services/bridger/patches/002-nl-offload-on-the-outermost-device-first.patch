@@ -1,0 +1,106 @@
+From 2a2d1261d12e3054b9e3f9e134f51048bb1ba1ad Mon Sep 17 00:00:00 2001
+From: Andrey Korshunov <razor1702@gmail.com>
+Date: Thu, 17 Sep 2026 17:08:07 +0300
+Subject: [PATCH] nl: offload on the outermost device of the chain first
+
+bridger_nl_flow_offload_add() asks the flow's ingress device to take the
+flower filter and only walks on to its offload chain when that add fails.
+For a DSA user port the switch is asked first, and the conduit - the
+device whose SoC programs the flow - only gets a chance when the switch
+reports an error.
+
+Flows between two ports of the same switch never reach this function,
+device_match_phys_switch() skips them earlier, so an offloaded flow
+always leaves the switch through its conduit anyway.
+
+On a MediaTek MT7988 with a Motorcomm YT9224 the switch offloads ACL
+rules only and cannot program a redirect to a Wi-Fi netdev. With the
+previous commit the refusal becomes visible and the fallback works, but
+the switch is still asked on every re-add, and one of those came back as
+a success with no rule installed anywhere - after which the transfer
+stayed on the CPU for the rest of the flow's life:
+
+  Add flow on lan1: No child process
+  Add flow on eth1: Success
+  ...
+  Add flow on lan1: Success        <- no filter on lan1 or eth1
+
+Try the outermost device of the chain first and fall back inwards.
+Measured with iperf3 from a wired PC to a 5 GHz client: the filters stay
+on the conduit for the whole run, the ingress and egress netdev counters
+stay at zero, ~1.75 Gbit/s over the air, 98% idle CPU.
+
+Assisted-By: Claude Opus 5 <noreply@anthropic.com>
+Signed-off-by: Andrey Korshunov <razor1702@gmail.com>
+Signed-off-by: Felix Fietkau <nbd@nbd.name>
+---
+ device.h | 19 +++++++++++++++++++
+ nl.c     | 13 +++++++++++--
+ 2 files changed, 30 insertions(+), 2 deletions(-)
+
+diff --git a/device.h b/device.h
+index e64b9e9..b6b31e7 100644
+--- a/device.h
++++ b/device.h
+@@ -90,6 +90,25 @@ static inline struct bridge *device_get_br(struct device *dev)
+ 	return dev->br;
+ }
+ 
++static inline unsigned int device_offload_chain_len(struct device *dev)
++{
++	unsigned int len = 0;
++
++	for (; dev; dev = dev->offload_dev)
++		len++;
++
++	return len;
++}
++
++static inline struct device *
++device_offload_chain_get(struct device *dev, unsigned int idx)
++{
++	for (; idx > 0; idx--)
++		dev = dev->offload_dev;
++
++	return dev;
++}
++
+ static inline bool
+ device_match_phys_switch(struct device *dev1, struct device *dev2)
+ {
+diff --git a/nl.c b/nl.c
+index f11857f..1f16077 100644
+--- a/nl.c
++++ b/nl.c
+@@ -877,6 +877,7 @@ __bridger_nl_flow_offload_add(struct bridger_flow *flow, struct device *dev)
+ int bridger_nl_flow_offload_add(struct bridger_flow *flow)
+ {
+ 	struct device *dev;
++	unsigned int i;
+ 	int ifindex;
+ 	int ret = -1;
+ 
+@@ -886,10 +887,18 @@ int bridger_nl_flow_offload_add(struct bridger_flow *flow)
+ 	if (flow->offload_ifindex)
+ 		bridger_nl_flow_offload_del(flow);
+ 
+-	for (dev = flow->fdb_in->dev; dev; dev = dev->offload_dev) {
++	/*
++	 * A DSA user port cannot redirect to a device behind its conduit.
++	 * Flows between two ports of the same switch are skipped earlier, so
++	 * an offloaded flow always leaves the switch through its conduit.
++	 * Start at the lowest device of the chain and fall back upwards.
++	 */
++	for (i = device_offload_chain_len(flow->fdb_in->dev); i > 0; i--) {
++		dev = device_offload_chain_get(flow->fdb_in->dev, i - 1);
+ 		ifindex = device_ifindex(dev);
+ 		ret = __bridger_nl_flow_offload_add(flow, dev);
+-		D("Add flow on %s: %s\n", dev->ifname, ret ? strerror(-ret) : "Success");
++		D("Add flow on %s: %s\n", dev->ifname,
++		  ret ? nl_geterror(ret) : "Success");
+ 		if (!ret)
+ 			break;
+ 	}
+-- 
+2.55.0
+
