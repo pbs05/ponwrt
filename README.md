@@ -27,6 +27,7 @@ The authors and contributors are not responsible for device damage, network serv
 | AN7581 | UnionMan UNG00A | `unionman_ung00a` | `reservearea` |
 | AN7581 | ZNXT ZN504XG-D | `znxt_zn504xg-d` | `reservearea` |
 | AN7581 | ZNXT ZN515XG-D | `znxt_zn515xg-d` | `reservearea` |
+| AN7581 | H3C HM2004-DU | `h3c_hm2004-du` | `factory` |
 | AN7583 | Nokia XG-040G-MF | `nokia_xg-040g-mf`, `nokia_xg-040g-mf-ubi` | `bosa`, `ri` |
 
 ## Build

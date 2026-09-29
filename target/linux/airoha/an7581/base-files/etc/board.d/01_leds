@@ -35,6 +35,12 @@ quantum,q1000k-ubi)
 	ucidef_set_led_netdev "lan1-yellow" "lan1" "yellow:lan" "lan1" "link_10 link_100"
 	ucidef_set_led_netdev "lan1-green" "lan1" "green:lan" "lan1" "link_1000 tx rx"
 	;;
+h3c,hm2004-du)
+	ucidef_set_led_netdev "lan2" "lan2" "mt7530-0:0a:green:lan-2" "lan2" "link tx rx"
+	ucidef_set_led_netdev "lan3" "lan3" "mt7530-0:0b:green:lan-3" "lan3" "link tx rx"
+	ucidef_set_led_netdev "lan4" "lan4" "mt7530-0:0c:green:lan-4" "lan4" "link tx rx"
+	ucidef_set_led_netdev "wlan" "wlan" "green:wlan" "phy0-ap0" "link"
+	;;
 esac
 
 board_config_flush
