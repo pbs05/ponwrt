@@ -12,9 +12,9 @@
 		#size-cells = <2>;
 		ranges;
 
-		npu_pkt: npu-pkt@81000000 {
+		npu_pkt: npu-pkt@8a000000 {
 			no-map;
-			reg = <0x0 0x81000000 0x0 0x2c00000>;
+			reg = <0x0 0x8a000000 0x0 0x2c00000>;
 		};
 
 		npu_txpkt: npu-txpkt@8cc00000 {
