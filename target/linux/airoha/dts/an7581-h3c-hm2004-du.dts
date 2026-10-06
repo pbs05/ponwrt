@@ -311,11 +311,6 @@
 
 &i2c0 {
 	status = "okay";
-
-	/*
-	 * UX3326 BOSA assembly driven by the EN7572-compatible controller;
-	 * reservearea calibration header names the chip explicitly.
-	 */
 	en7572: optical-front-end@50 {
 		compatible = "airoha,en7572";
 		reg = <0x50>;
@@ -344,13 +339,9 @@
 
 &eth {
 	status = "okay";
-
-	/* eth0 is the internal FE/GMAC netdev and the DSA master of the
-	 * integrated switch; its address is declared on gdm1 below. */
 };
 
 &gdm1 {
-	/* eth0: the 0x20 slot of the factory volume. */
 	nvmem-cell-names = "mac-address";
 	nvmem-cells = <&mac_eth0>;
 	status = "okay";
@@ -366,7 +357,6 @@
 		compatible = "ethernet-phy-id03a2.a411";
 		reg = <0xf>;
 		reset-gpios = <&en7581_pinctrl 31 GPIO_ACTIVE_LOW>;
-		/* Hold reset for 1 second and wait 100 ms before MD32 firmware load. */
 		reset-assert-us = <10000>;
 		reset-deassert-us = <20000>;
 
