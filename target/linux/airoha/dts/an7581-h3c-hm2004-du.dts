@@ -52,8 +52,8 @@
 			debounce-interval = <60>;
 		};
 
-		key-wifi {
-			label = "wifi";
+		key-rfkill {
+			label = "rfkill";
 			linux,code = <KEY_RFKILL>;
 			gpios = <&en7581_pinctrl 3 GPIO_ACTIVE_LOW>;
 			debounce-interval = <60>;
