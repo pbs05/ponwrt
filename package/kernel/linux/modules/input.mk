@@ -38,6 +38,23 @@ endef
 $(eval $(call KernelPackage,hid-generic))
 
 
+define KernelPackage/uhid
+  SUBMENU:=$(INPUT_MODULES_MENU)
+  TITLE:=User-space HID device support
+  DEPENDS:=+kmod-hid
+  KCONFIG:=CONFIG_UHID
+  FILES:=$(LINUX_DIR)/drivers/hid/uhid.ko
+  AUTOLOAD:=$(call AutoProbe,uhid)
+endef
+
+define KernelPackage/uhid/description
+ Kernel module that lets user space create HID devices, used by BlueZ
+ for Bluetooth Low Energy HID devices
+endef
+
+$(eval $(call KernelPackage,uhid))
+
+
 define KernelPackage/hid-alps
   SUBMENU:=$(INPUT_MODULES_MENU)
   TITLE:=Alps HID device support
@@ -87,7 +104,7 @@ $(eval $(call KernelPackage,input-core))
 define KernelPackage/input-evdev
   SUBMENU:=$(INPUT_MODULES_MENU)
   TITLE:=Input event device
-  DEPENDS:=+kmod-input-core
+  DEPENDS:=input-support +kmod-input-core
   KCONFIG:=CONFIG_INPUT_EVDEV
   FILES:=$(LINUX_DIR)/drivers/input/evdev.ko
   AUTOLOAD:=$(call AutoLoad,60,evdev)
@@ -179,7 +196,7 @@ $(eval $(call KernelPackage,input-matrix-keypad))
 define KernelPackage/input-joydev
   SUBMENU:=$(INPUT_MODULES_MENU)
   TITLE:=Joystick device support
-  DEPENDS:=+kmod-input-core
+  DEPENDS:=input-support +kmod-input-core
   KCONFIG:=CONFIG_INPUT_JOYDEV
   FILES:=$(LINUX_DIR)/drivers/input/joydev.ko
   AUTOLOAD:=$(call AutoProbe,joydev)

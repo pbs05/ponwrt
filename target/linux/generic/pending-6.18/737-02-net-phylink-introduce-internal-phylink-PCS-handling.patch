@@ -373,7 +373,7 @@ index 7f7a7328124f..d7391a60f01f 100644
  	kfree(pl);
  }
  EXPORT_SYMBOL_GPL(phylink_destroy);
-@@ -2410,8 +2558,15 @@ void phylink_pcs_change(struct phylink_pcs *pcs, bool up)
+@@ -2424,8 +2572,15 @@ void phylink_pcs_change(struct phylink_pcs *pcs, bool up)
  {
  	struct phylink *pl = pcs->phylink;
  
