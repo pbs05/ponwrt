@@ -25,11 +25,25 @@ gemtek,xg2010g)
 	ucidef_set_led_netdev "lan4-green" "lan4" "green:lan-4" "lan4" "link_1000 tx rx"
 	;;
 nokia,xg-040g-md-ubi|\
-nokia,xg-040g-tf-ubi|\
-unionman,ung00a)
+nokia,xg-040g-tf-ubi)
 	ucidef_set_led_netdev "lan2" "lan2" "mt7530-0:0a:green:lan-2" "lan2" "link tx rx"
 	ucidef_set_led_netdev "lan3" "lan3" "mt7530-0:0b:green:lan-3" "lan3" "link tx rx"
 	ucidef_set_led_netdev "lan4" "lan4" "mt7530-0:0c:green:lan-4" "lan4" "link tx rx"
+	;;
+unionman,ung00a)
+	# The UNG00A panel order is the reverse of the switch port order: panel
+	# LAN2/LAN3/LAN4 are switch ports 3/2/1, i.e. PHY 0x0b/0x0a/0x09 (see the
+	# mapping comment in an7581-unionman-ung00a.dts). A PHY LED class device is
+	# named "<mdio-bus-id>:<phy-addr>:<color>:<function>-<enumerator>", so each
+	# line must name the PHY that belongs to its own jack - walking the PHYs in
+	# ascending address order binds every trigger to the wrong port and leaves
+	# the LAN4 jack with no LED device at all (PHY 0x0c is not wired here).
+	#
+	# Panel LAN1 is the EN8811H 2.5G PHY at address 0x0f (GDM4).
+	ucidef_set_led_netdev "lan1" "lan1" "mt7530-0:0f:green:lan-1" "lan1" "link tx rx"
+	ucidef_set_led_netdev "lan2" "lan2" "mt7530-0:0b:green:lan-2" "lan2" "link tx rx"
+	ucidef_set_led_netdev "lan3" "lan3" "mt7530-0:0a:green:lan-3" "lan3" "link tx rx"
+	ucidef_set_led_netdev "lan4" "lan4" "mt7530-0:09:green:lan-4" "lan4" "link tx rx"
 	;;
 fiberhome,hg5585f-ct)
 	# No GE port or USB3.0 LED on this panel.

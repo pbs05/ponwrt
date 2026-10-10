@@ -117,6 +117,13 @@
 		};
 	};
 
+	gswp1_led0_pins: gswp1-led0-pins {
+		mux {
+			function = "phy1_led0";
+			pins = "gpio43";
+		};
+	};
+
 	gswp2_led0_pins: gswp2-led0-pins {
 		mux {
 			function = "phy2_led0";
@@ -299,15 +306,41 @@
 };
 
 /*
- * Panel LAN2, LAN3, and LAN4 map to switch ports 3, 2, and 1.
- * Their PHY addresses are 0x0b, 0x0a, and 0x09, and link state uses polling.
+ * Panel jack to switch port mapping, measured on hardware by moving one cable
+ * between the labelled jacks and watching which netdev gains carrier:
+ *
+ *   panel LAN1 (2.5G) -> gdm4 / EN8811H        (PHY address 0x0f)
+ *   panel LAN2        -> switch port 3         (PHY address 0x0b)
+ *   panel LAN3        -> switch port 2         (PHY address 0x0a)
+ *   panel LAN4        -> switch port 1         (PHY address 0x09)
+ *
+ * The panel order is therefore the reverse of the switch port order, and switch
+ * port 4 (PHY 0x0c) is not wired to a jack on this board. The factory DTB
+ * labels the ports the other way round (port2=lan2 .. port4=lan4), which leaves
+ * the real LAN4 jack dead because it enables an unwired port.
+ *
+ * Confirmed with a one-off diagnostic build that exposed the unwired port as
+ * "lan5": a cable moved into the LAN4 jack always came up on lan4 and never on
+ * lan5, so the mapping above is final and port 4 stays disabled.
+ *
+ * PHY1 link state uses phylib polling (no link-change interrupt on this board).
  */
 &gsw_phy1 {
 	status = "okay";
+	pinctrl-names = "gbe-led";
+	pinctrl-0 = <&gswp1_led0_pins>;
 };
 
 &gsw_port1 {
 	label = "lan4";
+	status = "okay";
+};
+
+&gsw_phy1_led0 {
+	color = <LED_COLOR_ID_GREEN>;
+	function = LED_FUNCTION_LAN;
+	function-enumerator = <4>;
+	active-low;
 	status = "okay";
 };
 
