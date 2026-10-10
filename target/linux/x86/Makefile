@@ -7,7 +7,7 @@ include $(TOPDIR)/rules.mk
 ARCH:=i386
 BOARD:=x86
 BOARDNAME:=x86
-FEATURES:=squashfs ext4 vdi vmdk vhdx pcmcia targz fpu boot-part rootfs-part
+FEATURES:=squashfs ext4 qcow2 vdi vmdk vhdx pcmcia targz fpu boot-part rootfs-part
 SUBTARGETS:=64 generic legacy geode
 
 KERNEL_PATCHVER:=6.18
@@ -23,6 +23,7 @@ DEFAULT_PACKAGES += fdisk mkf2fs partx-utils kmod-button-hotplug kmod-e1000e kmo
 		    kmod-usb-net-asix kmod-usb-net-asix-ax88179 kmod-usb-net-rtl8150 \
 		    kmod-usb-net-rtl8152-vendor grub2-bios-setup i915-firmware-dmc \
 		    automount
+DEFAULT_PACKAGES += video-support
 
 $(eval $(call BuildTarget))
 
