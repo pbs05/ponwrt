@@ -4,10 +4,23 @@
 #include "an7581-fiberhome-hg5585f-common.dtsi"
 
 &mdio {
-	/* The CT variant connects GPY211 over HSGMII with active-low GPIO34 reset. */
+	/*
+	 * The CT variant connects a MaxLinear GPY211C over HSGMII with an
+	 * active-low GPIO34 reset.
+	 *
+	 * The PHY ID is spelled out in the compatible on purpose. With a string
+	 * compatible - or with any "ethernet-phy-ieee802.3-c45" entry in the
+	 * list - the core reads the C45 ID over MDIO while scanning the bus,
+	 * which happens before mdio_probe() releases the reset GPIO. After a
+	 * warm reboot the PHY can still be held in reset at that moment, the ID
+	 * scan returns 0xffffffff and the kernel binds the non-negotiating
+	 * "Generic Clause 45 PHY" instead, leaving lan1 at NO-CARRIER until the
+	 * next cold boot. With the explicit ID the device is created from the
+	 * device tree, so the reset-ordering race cannot happen.
+	 * GPY211B would be 67c9.de08, the GPY2xx family ID is 67c9.dc00.
+	 */
 	gpy211: ethernet-phy@7 {
-		compatible = "maxlinear,gpy211",
-			     "ethernet-phy-ieee802.3-c45";
+		compatible = "ethernet-phy-id67c9.de10";
 		reg = <7>;
 		reset-gpios = <&en7581_pinctrl 34 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <100000>;
