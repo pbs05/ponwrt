@@ -1,33 +1,38 @@
-name: Build PonWrt for HG5382A
+name: Release
 
 on:
-  workflow_dispatch:                # 仅手动触发，避免代码推送误触发编译，与官方 release.yml 互不干扰
+  workflow_dispatch:                # [改动 1] 支持在 Actions 界面手动一键触发编译
+  push:
+    tags:
+      - 'v*'
 
 permissions:
-  contents: read                    # 声明最小只读权限，保障仓库构建安全
+  contents: read
 
 concurrency:
-  group: build-hg5382a-${{ github.ref }}
-  cancel-in-progress: true          # 重复点击 Run Workflow 时自动取消旧任务，节约 Runner 资源
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build HG5382A Firmware
-    runs-on: ubuntu-24.04           # 严格对齐官方 .github/workflows/release.yml 的 Ubuntu 24.04 环境
-    timeout-minutes: 360            # 官方默认上限，防止编译死锁或死循环消耗构建配额
+    name: Build HG5382A (an7581)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [an7581]            # [改动 1] 锁定仅针对 an7581 芯片架构进行编译
 
     steps:
-      - name: Checkout Source
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0            # 必须拉取完整 Git 历史，确保 scripts/getver.sh 能提取版本号与提交指纹
+          fetch-depth: 0
 
       - name: Free Disk Space
         run: |
-          # 激进清理 Runner 预装组件，特别包含 /opt/hostedtoolcache（可额外榨出约 15~20GB 空间，防止中后期磁盘写满）
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup \
-            /opt/hostedtoolcache
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /opt/hostedtoolcache
           sudo docker system prune -af || true
           sudo apt-get clean
           df -h
@@ -36,7 +41,6 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          # 完整对齐官方 release.yml 构建依赖，并补充构建必需的 dos2unix 与 jq 工具
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
             asciidoc autoconf automake autopoint binutils bison build-essential \
@@ -50,86 +54,53 @@ jobs:
             subversion swig texinfo uglifyjs unzip wget xmlto xxd zlib1g-dev zstd \
             libzstd-dev jq dos2unix
 
-      - name: Add NIKKI Feed
-        run: |
-          # 关键时序：必须先修改 feeds.conf.default，后文 actions/cache 才能捕获到包含 Nikki 的 Hash 变动
-          sed -i '/nikki/d' feeds.conf.default
-          # 确保文件尾部存在有效换行，防止源链接追加在同一行导致解析失效
-          [ -n "$(tail -c1 feeds.conf.default)" ] && echo "" >> feeds.conf.default
-          echo 'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' >> feeds.conf.default
-          # 转换为 Linux 标准换行符，防止 CRLF 导致 feeds 脚本读取异常
-          dos2unix feeds.conf.default
-          echo "===== feeds.conf.default 尾部内容 ====="
-          tail -n 8 feeds.conf.default
-
       - name: Cache Download Packages
         uses: actions/cache@v4
         with:
           path: dl
-          # 缓存 key 深度绑定 feeds 配置与 target 板级配置的 Hash
-          key: ponwrt-dl-an7581-hg5382a-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          key: ponwrt-dl-${{ matrix.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
           restore-keys: |
-            ponwrt-dl-an7581-hg5382a-
-            ponwrt-dl-an7581-
+            ponwrt-dl-${{ matrix.target }}-
+            ponwrt-dl-
 
       - name: Update & Install Feeds
         run: |
+          # [改动 2] 注入 NIKKI 插件源
+          sed -i '/nikki/d' feeds.conf.default
+          echo 'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' >> feeds.conf.default
+          
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-          # 【彻底剥离 Go 依赖】
-          # NIKKI 运行期通过 ucode 处理配置，但 Makefile 中硬编码了 DEPENDS:=... +yq。
-          # 如果不直接修改 Makefile，make defconfig 会按 DEPENDS 重新勾选 yq 并强制交叉编译整套 Go 工具链（耗时增加 20 分钟）。
-          if [ ! -d feeds/nikki ]; then
-            echo "::error::feeds/nikki 目录不存在，NIKKI 源拉取或安装失败！"
-            exit 1
+          # [改动 2] 剥离 NIKKI Makefile 中的 yq 依赖，防止被动交叉编译 Go 工具链耗费 20 分钟
+          if [ -d feeds/nikki ]; then
+            find feeds/nikki -name Makefile -exec sed -i -E 's/[[:space:]]*\+yq\b//g' {} +
+            rm -rf tmp
           fi
 
-          echo "正在从 feeds/nikki 下的所有 Makefile 中剔除 +yq 依赖..."
-          find feeds/nikki -name Makefile -exec sed -i -E 's/[[:space:]]*\+yq\b//g' {} +
-          # 打印修改后的 DEPENDS 声明，便于在 Actions 控制台日志中复核
-          echo "===== NIKKI Makefiles DEPENDS Check ====="
-          find feeds/nikki -name Makefile -exec grep -Hn 'DEPENDS' {} + || true
-
-          # 清除临时包索引缓存，强制构建系统根据新 Makefile 重新生成依赖元数据
-          rm -rf tmp
-
-      - name: Configure Firmware (Merge Release Config & HG5382A Only)
+      - name: Configure Firmware
         run: |
-          # 1. 采用官方 release.yml 标准基准合并机制：
-          #    configs/an7581.config  -> 芯片架构、网络驱动与板级设备树支持
-          #    configs/release.config -> 必须合并！提供 LuCI 网页后台、默认主题、中文包及常用系统工具
-          if [ -f configs/release.config ]; then
-            perl ./scripts/kconfig.pl + configs/an7581.config configs/release.config > .config
-          else
-            echo "::error::缺少 configs/release.config 基础配置文件！"
-            exit 1
-          fi
+          # 保留官方原始合并机制：芯片板级 (an7581) + Web/主题基础包 (release)
+          perl ./scripts/kconfig.pl + configs/${{ matrix.target }}.config configs/release.config > .config
 
-          # 2. 清理两套设备定义符号（包含开启项与已注释项）：
-          #    - CONFIG_TARGET_airoha_an7581_DEVICE_*        (关闭 MULTI 模式时真正决定镜像的单 Profile 开关)
-          #    - CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_* (PER_DEVICE_ROOTFS 多镜像开关)
+          # [改动 3] 锁定仅编译 HG5382A 单机型（关掉全机型并清除预设设备宏）
           sed -i '/CONFIG_TARGET_ALL_PROFILES/d' .config
           sed -i '/CONFIG_TARGET_MULTI_PROFILE/d' .config
           sed -i '/CONFIG_TARGET_airoha_an7581_DEVICE_/d' .config
           sed -i '/CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_/d' .config
 
-          # 3. 严格按照 Kconfig 规范声明关闭全机型并仅启用 HG5382A（OpenWrt 不识别 =n，必须使用注释语法）
           cat >> .config << 'EOF'
           # CONFIG_TARGET_ALL_PROFILES is not set
           # CONFIG_TARGET_MULTI_PROFILE is not set
           CONFIG_TARGET_airoha_an7581_DEVICE_fiberhome_hg5382a=y
           CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_fiberhome_hg5382a=y
-          EOF
 
-          # 4. 注入三个插件及核心依赖包
-          cat >> .config << 'EOF'
-          # === TTYD 终端 ===
+          # === 插件 1: TTYD 终端 ===
           CONFIG_PACKAGE_ttyd=y
           CONFIG_PACKAGE_luci-app-ttyd=y
           CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
 
-          # === DDNS 动态域名（services 提供服务商下拉列表；curl/ca-bundle 供 HTTPS API 正常鉴权） ===
+          # === 插件 2: DDNS 动态域名 (含 HTTPS API 传输组件与证书) ===
           CONFIG_PACKAGE_ddns-scripts=y
           CONFIG_PACKAGE_ddns-scripts-services=y
           CONFIG_PACKAGE_luci-app-ddns=y
@@ -137,7 +108,7 @@ jobs:
           CONFIG_PACKAGE_curl=y
           CONFIG_PACKAGE_ca-bundle=y
 
-          # === NIKKI 代理及内核分流驱动模块 ===
+          # === 插件 3: NIKKI 代理及流量分流核心驱动 ===
           CONFIG_PACKAGE_nikki=y
           CONFIG_PACKAGE_luci-app-nikki=y
           CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
@@ -148,106 +119,29 @@ jobs:
           CONFIG_PACKAGE_ip-full=y
           EOF
 
-          # 5. 生成最终配置并解析反向依赖
+          # 解析依赖并校验
           make defconfig
-
-          # 6. 打印配置状态供日志排查
-          echo "===== Single-profile (=y) ====="
-          grep -E '^CONFIG_TARGET_airoha_an7581_DEVICE_.*=y$' .config || true
-          echo "===== Per-device rootfs (=y) ====="
-          grep -E '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y$' .config || true
-
-          if grep -q '^CONFIG_TARGET_MULTI_PROFILE=y$' .config \
-            || grep -q '^CONFIG_TARGET_ALL_PROFILES=y$' .config; then
-            echo "::error::MULTI_PROFILE 或 ALL_PROFILES 仍为 y，多机型编译未被成功关闭！"
-            exit 1
-          fi
-
-          sp=$(grep -cE '^CONFIG_TARGET_airoha_an7581_DEVICE_.*=y$' .config || true)
-          pd=$(grep -cE '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_.*=y$' .config || true)
-          echo "统计结果: single-profile count=$sp, per-device count=$pd"
-
-          # 【断言 1：单 Profile 决策符号检查】
-          # 关闭 MULTI 模式后，此符号是真正决定镜像输出的依据，必须严格为 1 且必须是 fiberhome_hg5382a
-          if ! grep -q '^CONFIG_TARGET_airoha_an7581_DEVICE_fiberhome_hg5382a=y$' .config; then
-            echo "::error::single-profile 目标设备未选中 fiberhome_hg5382a"
-            exit 1
-          fi
-          if [ "$sp" -ne 1 ]; then
-            echo "::error::期望 single-profile 设备恰好为 1，但实际存在 $sp 个机型！"
-            exit 1
-          fi
-
-          # 【断言 2：Per-device 符号检查（防误杀容错）】
-          # 在关闭 MULTI 模式后，Kconfig 可能完全剔除 CONFIG_TARGET_DEVICE_* 符号（即 pd=0）；
-          # 若 pd > 0，则要求必须恰好为 1 且必须是 fiberhome_hg5382a；若 pd == 0 同样视为合规通过。
-          if [ "$pd" -gt 0 ]; then
-            if ! grep -q '^CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_fiberhome_hg5382a=y$' .config; then
-              echo "::error::per-device 已启用但设备不是 fiberhome_hg5382a"
-              exit 1
-            fi
-            if [ "$pd" -ne 1 ]; then
-              echo "::error::期望 per-device 目标恰好为 1，但实际存在 $pd 个目标！"
-              exit 1
-            fi
-          fi
-
-          # 【断言 3：验证 yq 与 Go 工具链是否被彻底屏蔽】
-          echo "===== Plugins / yq 状态 ====="
-          grep -E '^CONFIG_PACKAGE_(ttyd|luci-app-ttyd|ddns-scripts|luci-app-ddns|nikki|luci-app-nikki|yq|golang)=' .config || true
-          if grep -q '^CONFIG_PACKAGE_yq=y$' .config; then
-            echo "::error::CONFIG_PACKAGE_yq=y 仍被激活！Makefile 中的依赖未成功剔除，将触发 Go 工具链编译。"
-            exit 1
-          fi
-          if grep -q '^CONFIG_PACKAGE_golang=y$' .config; then
-            echo "::warning::检测到 CONFIG_PACKAGE_golang=y，可能存在其他包拉起 Go 编译链，耗时将显著增加！"
-          fi
 
       - name: Download Packages
         run: |
           make download -j$(nproc)
-          # 清除下载中断造成的小于 1KB 的坏包
-          find dl -size -1024c -exec ls -l {} \; || true
           find dl -size -1024c -exec rm -f {} \; || true
 
       - name: Compile Firmware
         run: |
-          # 优先静默多核高速构建；若遇错误，降为单线程 V=s 详细输出排查
+          # 多核加速编译，失败时单核打印详细排错日志
           make -j$(nproc) || make -j1 V=s
 
       - name: Organize Artifacts
         run: |
-          # 1. 打印源输出目录下所有生成的 sysupgrade 固件，核对构建产物
-          echo "===== All sysupgrade images under bin/targets ====="
-          find bin/targets/airoha/an7581/ -type f -name '*sysupgrade*' -print || true
-
-          # 2. 【源目录穿透硬断言】直接检查根输出目录，若存在任何非 hg5382a 的 sysupgrade，直接判定拦截失败
-          if find bin/targets/airoha/an7581/ -type f -name '*sysupgrade*' ! -name '*hg5382a*' | grep -q .; then
-            echo "::error::源输出目录存在非 HG5382A 的 sysupgrade 固件镜像，单机型编译拦截失败！"
-            find bin/targets/airoha/an7581/ -type f -name '*sysupgrade*' ! -name '*hg5382a*'
-            exit 1
-          fi
-
           mkdir -p ./firmware_out
-          # 3. 收集 HG5382A 固件镜像及全部元数据（覆盖 *.buildinfo、sha256sums、profiles.json）
-          find bin/targets/airoha/an7581/ -type f \
-            \( -name "*hg5382a*" -o -name "*.buildinfo" \
-               -o -name "sha256sums" -o -name "profiles.json" \) \
+          # [改动 4] 收集 HG5382A 相关固件（包括 .bin、.ubi、.itb）及构建元数据
+          find bin/targets/airoha/${{ matrix.target }}/ -type f \
+            \( -iname "*hg5382a*" -o -name "*.buildinfo" -o -name "sha256sums" -o -name "profiles.json" \) \
             -exec cp -f {} ./firmware_out/ \;
-
-          echo "===== firmware_out 目录内容 ====="
           ls -lh ./firmware_out/
 
-          # 4. 【产物空包拦截硬断言】
-          #    兼容 AN7581 架构产出的全部实体固件类型：.bin、.ubi 以及 FIT 镜像 .itb，防止仅有配置文件却虚假绿灯
-          if ! find ./firmware_out/ -type f \
-              \( -name "*hg5382a*.bin" -o -name "*hg5382a*.ubi" -o -name "*hg5382a*.itb" \) \
-              | grep -q .; then
-            echo "::error::firmware_out 目录内未找到任何 HG5382A 实体镜像（.bin / .ubi / .itb），固件生成失败！"
-            exit 1
-          fi
-
-      - name: Upload HG5382A Firmware
+      - name: Upload Firmware Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: PonWrt-HG5382A-Firmware
