@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  workflow_dispatch:                # [改动 1] 支持在 Actions 界面手动一键触发编译
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build HG5382A (an7581)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [an7581]            # [改动 1] 锁定仅针对 an7581 芯片架构进行编译
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /opt/hostedtoolcache
+          sudo docker system prune -af || true
+          sudo apt-get clean
+          df -h
+
+      - name: Install Build Dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            python3-setuptools qemu-utils re2c rsync scons squashfs-tools \
+            subversion swig texinfo uglifyjs unzip wget xmlto xxd zlib1g-dev zstd \
+            libzstd-dev jq dos2unix
+
+      - name: Cache Download Packages
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-${{ matrix.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: |
+            ponwrt-dl-${{ matrix.target }}-
+            ponwrt-dl-
+
+      - name: Update & Install Feeds
+        run: |
+          # [改动 2] 注入 NIKKI 插件源
+          sed -i '/nikki/d' feeds.conf.default
+          echo 'src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main' >> feeds.conf.default
+          
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          # [改动 2] 剥离 NIKKI Makefile 中的 yq 依赖，防止被动交叉编译 Go 工具链耗费 20 分钟
+          if [ -d feeds/nikki ]; then
+            find feeds/nikki -name Makefile -exec sed -i -E 's/[[:space:]]*\+yq\b//g' {} +
+            rm -rf tmp
+          fi
+
+      - name: Configure Firmware
+        run: |
+          # 保留官方原始合并机制：芯片板级 (an7581) + Web/主题基础包 (release)
+          perl ./scripts/kconfig.pl + configs/${{ matrix.target }}.config configs/release.config > .config
+
+          # [改动 3] 锁定仅编译 HG5382A 单机型（关掉全机型并清除预设设备宏）
+          sed -i '/CONFIG_TARGET_ALL_PROFILES/d' .config
+          sed -i '/CONFIG_TARGET_MULTI_PROFILE/d' .config
+          sed -i '/CONFIG_TARGET_airoha_an7581_DEVICE_/d' .config
+          sed -i '/CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_/d' .config
+
+          cat >> .config << 'EOF'
+          # CONFIG_TARGET_ALL_PROFILES is not set
+          # CONFIG_TARGET_MULTI_PROFILE is not set
+          CONFIG_TARGET_airoha_an7581_DEVICE_fiberhome_hg5382a=y
+          CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_fiberhome_hg5382a=y
+
+          # === 插件 1: TTYD 终端 ===
+          CONFIG_PACKAGE_ttyd=y
+          CONFIG_PACKAGE_luci-app-ttyd=y
+          CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+
+          # === 插件 2: DDNS 动态域名 (含 HTTPS API 传输组件与证书) ===
+          CONFIG_PACKAGE_ddns-scripts=y
+          CONFIG_PACKAGE_ddns-scripts-services=y
+          CONFIG_PACKAGE_luci-app-ddns=y
+          CONFIG_PACKAGE_luci-i18n-ddns-zh-cn=y
+          CONFIG_PACKAGE_curl=y
+          CONFIG_PACKAGE_ca-bundle=y
+
+          # === 插件 3: NIKKI 代理及流量分流核心驱动 ===
+          CONFIG_PACKAGE_nikki=y
+          CONFIG_PACKAGE_luci-app-nikki=y
+          CONFIG_PACKAGE_luci-i18n-nikki-zh-cn=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-socket=y
+          CONFIG_PACKAGE_ip-full=y
+          EOF
+
+          # 解析依赖并校验
+          make defconfig
+
+      - name: Download Packages
+        run: |
+          make download -j$(nproc)
+          find dl -size -1024c -exec rm -f {} \; || true
+
+      - name: Compile Firmware
+        run: |
+          # 多核加速编译，失败时单核打印详细排错日志
+          make -j$(nproc) || make -j1 V=s
+
+      - name: Organize Artifacts
+        run: |
+          mkdir -p ./firmware_out
+          # [改动 4] 收集 HG5382A 相关固件（包括 .bin、.ubi、.itb）及构建元数据
+          find bin/targets/airoha/${{ matrix.target }}/ -type f \
+            \( -iname "*hg5382a*" -o -name "*.buildinfo" -o -name "sha256sums" -o -name "profiles.json" \) \
+            -exec cp -f {} ./firmware_out/ \;
+          ls -lh ./firmware_out/
+
+      - name: Upload Firmware Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PonWrt-HG5382A-Firmware
+          path: ./firmware_out/
+          if-no-files-found: error
+          retention-days: 30

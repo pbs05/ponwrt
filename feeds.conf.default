@@ -8,3 +8,4 @@ src-git pon_userspace https://github.com/pbs05/openwrt-pon-userspace.git
 #src-git targets https://github.com/openwrt/targets.git
 #src-git oldpackages http://git.openwrt.org/packages.git
 #src-link custom /usr/src/openwrt/custom-feed
+src-git nikki https://github.com/nikkinikki-org/OpenWrt-nikki.git;main
