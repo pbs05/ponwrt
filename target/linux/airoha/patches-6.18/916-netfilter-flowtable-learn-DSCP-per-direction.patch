@@ -1,0 +1,243 @@
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 03:33:04 +0000
+Subject: [PATCH] netfilter: flowtable: learn DSCP separately for each direction
+
+The Airoha DSCP offload backport initializes both tuples from the packet
+which executes flow add. This copies one endpoint's marking to the other
+endpoint and selects both hardware queues from the same value. Software
+flow offload also rewrites every packet to that cached marking.
+
+Only initialize the direction represented by the flow-add packet. Learn
+an unobserved direction from its first software fast-path packet after
+encapsulation has been removed, and defer hardware submission until both
+samples are available. Serialize the first sample with the conntrack lock
+and publish its validity with release/acquire ordering. Force a refresh
+when the missing sample arrives, once flow_offload_add has published HW
+ownership, so a newly completed pair need not wait for the normal refresh
+interval. Do not request hardware statistics before an entry was installed.
+
+Use DSCP samples as per-direction hardware QoS metadata, without implicitly
+remarking IPv4 or IPv6 packets in the software fast path. Do not include ECN
+in the DSCP match mask. Flowtable clients which do not request DSCP learning
+retain their existing hardware submission path.
+
+Hardware classification remains a per-direction snapshot. This does not
+provide per-packet hardware reclassification when DSCP changes after bind;
+flows with an unobserved direction remain software-offloaded. Hardware ECN
+preservation and post-bind DSCP behavior still require device validation.
+
+Link: https://github.com/pbs05/ponwrt/issues/37
+Signed-off-by: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+---
+ include/net/netfilter/nf_flow_table.h |  2 ++
+ net/netfilter/nf_flow_table_ip.c      | 45 +++++++++++++++++++++++++----------
+ net/netfilter/nf_flow_table_offload.c | 28 +++++++++++++++++++---
+ net/netfilter/nft_flow_offload.c      |  9 +++++--
+ 4 files changed, 67 insertions(+), 17 deletions(-)
+
+diff --git a/include/net/netfilter/nf_flow_table.h b/include/net/netfilter/nf_flow_table.h
+index cf7d7e3..c2de3f5 100644
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -142,6 +142,7 @@ struct flow_offload_tuple {
+ 					in_vlan_ingress:2;
+ 	u16				mtu;
+ 	u8				dscp;
++	bool				dscp_valid;
+ 	union {
+ 		struct {
+ 			struct dst_entry *dst_cache;
+@@ -176,6 +177,7 @@ enum nf_flow_flags {
+ 	NF_FLOW_HW_PENDING,
+ 	NF_FLOW_HW_BIDIRECTIONAL,
+ 	NF_FLOW_HW_ESTABLISHED,
++	NF_FLOW_DSCP,
+ };
+ 
+ enum flow_offload_type {
+diff --git a/net/netfilter/nf_flow_table_ip.c b/net/netfilter/nf_flow_table_ip.c
+index ae30cc6..c75cc83 100644
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -8,6 +8,7 @@
+ #include <linux/ipv6.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_ether.h>
++#include <net/dsfield.h>
+ #include <net/gso.h>
+ #include <net/ip.h>
+ #include <net/ipv6.h>
+@@ -19,6 +20,30 @@
+ #include <linux/tcp.h>
+ #include <linux/udp.h>
+ 
++static bool nf_flow_dscp_init(struct flow_offload *flow,
++			     struct flow_offload_tuple *tuple, u8 dscp)
++{
++	bool initialized = false;
++
++	if (!test_bit(NF_FLOW_DSCP, &flow->flags) ||
++	    smp_load_acquire(&tuple->dscp_valid))
++		return false;
++
++	/*
++	 * Several CPUs may see the first packet of this direction. Publish
++	 * one immutable sample before allowing the HW workqueue to use it.
++	 */
++	spin_lock_bh(&flow->ct->lock);
++	if (!tuple->dscp_valid) {
++		tuple->dscp = dscp;
++		smp_store_release(&tuple->dscp_valid, true);
++		initialized = true;
++	}
++	spin_unlock_bh(&flow->ct->lock);
++
++	return initialized;
++}
++
+ static int nf_flow_state_check(struct flow_offload *flow, int proto,
+ 			       struct sk_buff *skb, unsigned int thoff)
+ {
+@@ -384,6 +409,7 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 	enum flow_offload_tuple_dir dir;
+ 	struct flow_offload *flow;
+ 	unsigned int thoff, mtu;
++	bool dscp_initialized;
+ 	struct iphdr *iph;
+ 	u8 dscp;
+ 
+@@ -407,8 +433,6 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 	if (skb_try_make_writable(skb, thoff + ctx->hdrsize))
+ 		return -1;
+ 
+-	flow_offload_refresh(flow_table, flow, false);
+-
+ 	nf_flow_encap_pop(skb, tuplehash);
+ 	thoff -= ctx->offset;
+ 
+@@ -416,10 +440,9 @@ static int nf_flow_offload_forward(struct nf_flowtable_ctx *ctx,
+ 	nf_flow_nat_ip(flow, skb, thoff, dir, iph);
+ 
+ 	dscp = FIELD_GET(INET_DSCP_MASK, ipv4_get_dsfield(iph));
+-	if (tuplehash->tuple.dscp != dscp)
+-		ipv4_change_dsfield(iph, INET_ECN_MASK,
+-				    FIELD_PREP(INET_DSCP_MASK,
+-					       tuplehash->tuple.dscp));
++	dscp_initialized = nf_flow_dscp_init(flow, &tuplehash->tuple, dscp);
++	flow_offload_refresh(flow_table, flow,
++			     dscp_initialized && test_bit(NF_FLOW_HW, &flow->flags));
+ 
+ 	ip_decrease_ttl(iph);
+ 	skb_clear_tstamp(skb);
+@@ -680,6 +703,7 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+ 	enum flow_offload_tuple_dir dir;
+ 	struct flow_offload *flow;
+ 	unsigned int thoff, mtu;
++	bool dscp_initialized;
+ 	struct ipv6hdr *ip6h;
+ 	u8 dscp;
+ 
+@@ -703,18 +727,15 @@ static int nf_flow_offload_ipv6_forward(struct nf_flowtable_ctx *ctx,
+ 	if (skb_try_make_writable(skb, thoff + ctx->hdrsize))
+ 		return -1;
+ 
+-	flow_offload_refresh(flow_table, flow, false);
+-
+ 	nf_flow_encap_pop(skb, tuplehash);
+ 
+ 	ip6h = ipv6_hdr(skb);
+ 	nf_flow_nat_ipv6(flow, skb, dir, ip6h);
+ 
+ 	dscp = FIELD_GET(INET_DSCP_MASK, ipv6_get_dsfield(ip6h));
+-	if (tuplehash->tuple.dscp != dscp)
+-		ipv6_change_dsfield(ip6h, INET_ECN_MASK,
+-				    FIELD_PREP(INET_DSCP_MASK,
+-					       tuplehash->tuple.dscp));
++	dscp_initialized = nf_flow_dscp_init(flow, &tuplehash->tuple, dscp);
++	flow_offload_refresh(flow_table, flow,
++			     dscp_initialized && test_bit(NF_FLOW_HW, &flow->flags));
+ 
+ 	ip6h->hop_limit--;
+ 	skb_clear_tstamp(skb);
+diff --git a/net/netfilter/nf_flow_table_offload.c b/net/netfilter/nf_flow_table_offload.c
+index 362abed..b5b6610 100644
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -169,9 +169,11 @@ static int nf_flow_rule_match(struct nf_flow_match *match,
+ 	match->dissector.used_keys |= BIT_ULL(key->control.addr_type);
+ 	mask->basic.n_proto = 0xffff;
+ 
+-	key->ip.tos = FIELD_PREP(INET_DSCP_MASK, tuple->dscp);
+-	mask->ip.tos = 0xff;
+-	match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IP);
++	if (smp_load_acquire(&tuple->dscp_valid)) {
++		key->ip.tos = FIELD_PREP(INET_DSCP_MASK, tuple->dscp);
++		mask->ip.tos = INET_DSCP_MASK;
++		match->dissector.used_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IP);
++	}
+ 
+ 	switch (tuple->l4proto) {
+ 	case IPPROTO_TCP:
+@@ -1122,6 +1124,21 @@ void nf_flow_offload_add(struct nf_flowtable *flowtable,
+ 			 struct flow_offload *flow)
+ {
+ 	struct flow_offload_work *offload;
++	int dir;
++
++	/*
++	 * Do not submit a guessed DSCP for an unobserved direction. The
++	 * software fast path retries once both direction samples are ready.
++	 */
++	if (test_bit(NF_FLOW_DSCP, &flow->flags)) {
++		for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++			struct flow_offload_tuple *tuple;
++
++			tuple = &flow->tuplehash[dir].tuple;
++			if (!smp_load_acquire(&tuple->dscp_valid))
++				return;
++		}
++	}
+ 
+ 	offload = nf_flow_offload_work_alloc(flowtable, flow, FLOW_CLS_REPLACE);
+ 	if (!offload)
+@@ -1149,6 +1166,11 @@ void nf_flow_offload_stats(struct nf_flowtable *flowtable,
+ 	struct flow_offload_work *offload;
+ 	__s32 delta;
+ 
++	/* There may be no HW entry yet while learning the other direction. */
++	if (test_bit(NF_FLOW_DSCP, &flow->flags) &&
++	    !test_bit(IPS_HW_OFFLOAD_BIT, &flow->ct->status))
++		return;
++
+ 	delta = nf_flow_timeout_delta(flow->timeout);
+ 	if ((delta >= (9 * flow_offload_get_timeout(flow)) / 10))
+ 		return;
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index 8a31b0b..1721c64 100644
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -39,8 +39,9 @@ static void nft_flow_set_dscp(const struct nft_pktinfo *pkt,
+ 					ipv6_get_dsfield(ipv6_hdr(skb)));
+ 		break;
+ 	default:
+-		break;
++		return;
+ 	}
++	tuple->dscp_valid = true;
+ }
+ 
+ static bool nft_flow_offload_skip(struct sk_buff *skb, int family)
+@@ -141,8 +142,12 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 	if (!flow)
+ 		goto err_flow_alloc;
+ 
++	/*
++	 * The packet only describes its own direction. Learn the other
++	 * direction from its first software fast-path packet before HW offload.
++	 */
++	__set_bit(NF_FLOW_DSCP, &flow->flags);
+ 	nft_flow_set_dscp(pkt, flow, dir);
+-	nft_flow_set_dscp(pkt, flow, !dir);
+ 
+ 	if (routing)
+ 		flow_offload_route_init(flow, &route);
