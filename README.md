@@ -21,8 +21,8 @@ mappings. Controller unregister retains its networking RCU synchronization.
 This does not ignore OLT Deactivate, force O5, change credentials, suppress
 key-confirm errors or make unsupported OMCI entities return success.
 
-`feeds.conf.default` pins driver commit `f96e706` and userspace commit `70302c9`:
-`kmod-airoha-xpon` r74, `kmod-airoha-en7572` r14,
+`feeds.conf.default` pins driver commit `67df6ec` and userspace commit `70302c9`:
+`kmod-airoha-xpon` r75, `kmod-airoha-en7572` r15,
 `airoha-pond` 0.3.0-r3, `airoha-ponctl` 0.2.0-r2 and
 `luci-app-pon` 0.1.0-r4. These include the opt-in stock BWmap policy and the
 four missing standard PM entities. Rebuild the kernel/firmware as well as
@@ -36,6 +36,23 @@ before uploading calibration to MD32; invalid tables fail probe explicitly
 instead of being reported as ready or truncated into registers. Erased-table
 handling remains unchanged. This protects against observed invalid calibration
 data, but does not fix its underlying read cause or guarantee XGTC/O5 recovery.
+
+Driver r75 improves the existing implementation using selected external fixes,
+not a wholesale fork merge. Threaded PLOAM IRQ processing tries `state_lock`
+and defers FIFO draining to `link_work` on contention, preserving the
+`state_lock -> ploam_lock` order without blocking an IRQ that MAC recovery
+must synchronize. Deferred Deactivate is still processed if frontend status
+sampling fails. AES switch completion remains advisory; a rate-limited warning
+and `key_switch_timeouts` in the debugfs `crypto` snapshot expose missing
+completion without claiming that hardware switched keys.
+
+Frontend r15 reloads MD32 on subsequent interface starts, reusing probe's image
+for the first prepare. GPIO TX_DISABLE and BEN close before reload; failure
+leaves the provider unprepared, with an explicit error. Empty-table defaults
+and r14's validation remain. This does not reload firmware on every OLT
+Deactivate, replace the activation state machine, copy the full A2 analog
+calibration into A0 or enable experimental GPON support. Existing ACK, BWmap
+and RCU-path fixes remain in place.
 
 For the affected AN7583/HWTC setup, select **Stock filters (HWTC compatibility)**
 under **PON → Configuration → PON line → XG-PON BWmap compatibility**, save
@@ -55,6 +72,8 @@ flow-update refinement is not an established fix for the remaining rejection.
 固定版本的 PON feeds，单独升级 xPON 包不会包含这处底层以太网驱动修复。
 HWTC 场景仍需显式开启 BWmap 原厂兼容模式。本分支尚未证明稳定 O5；
 必须刷入后确认没有撤销循环、业务映射有效，而不只看瞬间显示 O5。
+当前固定驱动 r75 / 前端 r15：借鉴外部实现完善 IRQ 锁顺序、MD32 暖启动和
+AES 超时诊断，不替换状态机或跨模式复制模拟校准；userspace 固定版本不变。
 
 ## ⚠️ Disclaimer
 
