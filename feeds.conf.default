@@ -3,7 +3,7 @@ src-git luci https://github.com/immortalwrt/luci.git
 src-git routing https://github.com/openwrt/routing.git
 src-git telephony https://github.com/openwrt/telephony.git
 src-git video https://github.com/openwrt/video.git
-src-git pon_drivers https://github.com/rayniel/openwrt-pon-drivers.git^77c7d0b5e96b4170d9f81a87fd74b4b7e14ccb37
+src-git pon_drivers https://github.com/rayniel/openwrt-pon-drivers.git^f96e70682f9ed121cc4957402067f17cb06c4da8
 src-git pon_userspace https://github.com/rayniel/openwrt-pon-userspace.git^70302c964a62c351b70b9ed5acb440b2a4be1ac6
 #src-git targets https://github.com/openwrt/targets.git
 #src-git oldpackages http://git.openwrt.org/packages.git

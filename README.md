@@ -14,13 +14,21 @@ patch now uses an expedited grace period, retaining the wait before freeing
 the old table or retiring GEM mappings. It does not ignore OLT Deactivate,
 force O5, change credentials, or suppress key-confirm errors.
 
-`feeds.conf.default` pins driver commit `77c7d0b` and userspace commit `70302c9`:
-`kmod-airoha-xpon` r74, `airoha-pond` 0.3.0-r3, `airoha-ponctl` 0.2.0-r2 and
+`feeds.conf.default` pins driver commit `f96e706` and userspace commit `70302c9`:
+`kmod-airoha-xpon` r74, `kmod-airoha-en7572` r14,
+`airoha-pond` 0.3.0-r3, `airoha-ponctl` 0.2.0-r2 and
 `luci-app-pon` 0.1.0-r4. These include the opt-in stock BWmap policy and the
 four missing standard PM entities. Rebuild the kernel/firmware as well as
 the feeds; updating only the xPON package cannot change this `airoha_eth` fix.
 If reusing a build tree, update the two PON feed definitions to these pinned
 revisions rather than retaining previously selected feed versions.
+
+EN7572 frontend r14 rejects populated BOB calibration tables with analog codes
+that exceed their register field widths. Validation runs with BEN closed,
+before uploading calibration to MD32; invalid tables fail probe explicitly
+instead of being reported as ready or truncated into registers. Erased-table
+handling remains unchanged. This protects against observed invalid calibration
+data, but does not fix its underlying read cause or guarantee XGTC/O5 recovery.
 
 For the affected AN7583/HWTC setup, select **Stock filters (HWTC compatibility)**
 under **PON → Configuration → PON line → XG-PON BWmap compatibility**, save
