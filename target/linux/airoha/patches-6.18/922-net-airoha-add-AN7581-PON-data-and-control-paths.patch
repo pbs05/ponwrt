@@ -8,19 +8,19 @@ flow tables, and shared QDMA data-path counters.
 
 Transport OMCI and OAM through dedicated control netdevs while the Ethernet driver owns QDMA, DMA, IRQ and NAPI.
 
-Use expedited RCU grace periods for flow replacement. The xPON caller
-holds its PLOAM command lock while applying these mappings; waiting for
-a normal grace period stalls both OMCI replies and PLOAM processing.
-Keep the grace period before freeing the old table or retiring old GEMs.
+Retire old flow tables with kfree_rcu when every old GEM/T-CONT path remains
+usable. The xPON caller holds its PLOAM command lock while applying these
+mappings, so avoid synchronously waiting for classification-only updates.
+Keep an expedited grace period before returning when a hardware path or
+legacy fallback is withdrawn, allowing the caller to retire old mappings.
 
 Signed-off-by: pbs05 <27010143+pbs05@users.noreply.github.com>
 ---
- drivers/net/ethernet/airoha/airoha_eth.c  | 669 ++++++++++++++++++++--
- drivers/net/ethernet/airoha/airoha_eth.h  |  52 ++
- drivers/net/ethernet/airoha/airoha_regs.h |   7 +
- include/linux/airoha-eth.h                | 105 ++++
- 4 files changed, 797 insertions(+), 36 deletions(-)
- create mode 100644 include/linux/airoha-eth.h
+ drivers/net/ethernet/airoha/airoha_eth.c  |  702 ++++++++++++++++++++++++++++-
+ drivers/net/ethernet/airoha/airoha_eth.h  |   52 ++
+ drivers/net/ethernet/airoha/airoha_regs.h |    7
+ include/linux/airoha-eth.h                |  105 ++++
+ 4 files changed, 830 insertions(+), 36 deletions(-)
 
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
 index b37b425..12b1ad2 100644
@@ -684,7 +684,7 @@ index b37b425..12b1ad2 100644
  	return phylink_ethtool_ksettings_set(dev->phylink, cmd);
  }
  
-@@ -3631,6 +4008,212 @@ static const struct net_device_ops airoha_netdev_ops = {
+@@ -3631,6 +4008,245 @@ static const struct net_device_ops airoha_netdev_ops = {
  	.ndo_setup_tc		= airoha_dev_tc_setup,
  };
  
@@ -721,6 +721,31 @@ index b37b425..12b1ad2 100644
 +}
 +EXPORT_SYMBOL_GPL(airoha_eth_pon_xmit_control);
 +
++static bool airoha_pon_paths_retained(
++	const struct airoha_pon_flow_table *old,
++	const struct airoha_pon_flow_table *next)
++{
++	const u32 path_mask = AIROHA_PON_QDMA_VALID | AIROHA_PON_QDMA_EPON |
++		AIROHA_PON_QDMA_TCONT_MASK | AIROHA_PON_QDMA_GEM_MASK;
++	unsigned int i, j;
++
++	if (!old)
++		return true;
++	if (!next)
++		return false;
++
++	for (i = 0; i < old->count; i++) {
++		for (j = 0; j < next->count; j++)
++			if ((old->entries[i].tag & path_mask) ==
++			    (next->entries[j].tag & path_mask))
++				break;
++		if (j == next->count)
++			return false;
++	}
++
++	return true;
++}
++
 +int airoha_eth_pon_replace_flows(
 +	struct net_device *netdev, const struct airoha_pon_flow_config *flows,
 +	unsigned int count)
@@ -728,6 +753,7 @@ index b37b425..12b1ad2 100644
 +	struct airoha_pon_flow_table *table = NULL, *old;
 +	struct airoha_gdm_dev *dev;
 +	unsigned int i, j;
++	u32 old_tag;
 +
 +	if (!netdev || netdev->netdev_ops != &airoha_netdev_ops)
 +		return -EINVAL;
@@ -771,13 +797,20 @@ index b37b425..12b1ad2 100644
 +		}
 +	}
 +
++	old_tag = READ_ONCE(dev->pon_qdma_tag);
 +	old = rcu_replace_pointer(dev->pon_flow_table, table, true);
 +	WRITE_ONCE(dev->pon_qdma_tag, 0);
-+	/* The xPON caller holds its PLOAM command lock here. Keep the
-+	 * networking RCU grace period, but do not wait for a normal one.
++	/* Classification updates must not block OMCI/PLOAM while all old
++	 * GEM/T-CONT paths remain usable. Retire only the table asynchronously.
 +	 */
-+	synchronize_rcu_expedited();
-+	kfree(old);
++	if (!old_tag && airoha_pon_paths_retained(old, table)) {
++		if (old)
++			kfree_rcu(old, rcu);
++	} else {
++		/* The caller may retire hardware immediately after this returns. */
++		synchronize_rcu_expedited();
++		kfree(old);
++	}
 +	return 0;
 +}
 +EXPORT_SYMBOL_GPL(airoha_eth_pon_replace_flows);
@@ -897,7 +930,7 @@ index b37b425..12b1ad2 100644
  static const struct ethtool_ops airoha_ethtool_ops = {
  	.get_drvinfo		= airoha_ethtool_get_drvinfo,
  	.get_eth_mac_stats      = airoha_ethtool_get_mac_stats,
-@@ -3904,9 +4485,22 @@ static int airoha_alloc_gdm_device(struct airoha_eth *eth,
+@@ -3904,9 +4520,22 @@ static int airoha_alloc_gdm_device(struct airoha_eth *eth,
  	dev->port = port;
  	dev->eth = eth;
  	dev->nbq = nbq;
@@ -921,7 +954,7 @@ index b37b425..12b1ad2 100644
  }
  
  static int airoha_alloc_gdm_port(struct airoha_eth *eth,
-@@ -4170,7 +4764,8 @@ static void airoha_remove(struct platform_device *pdev)
+@@ -4170,7 +4799,8 @@ static void airoha_remove(struct platform_device *pdev)
  
  			netdev = netdev_from_priv(dev);
  			unregister_netdev(netdev);

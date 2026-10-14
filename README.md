@@ -7,12 +7,19 @@ PonWrt is based on [ImmortalWrt](https://github.com/immortalwrt/immortalwrt) and
 ## HWTC O5 investigation branch
 
 This fork's `rayniel/hwtc-control-latency` branch addresses a measured
-post-O5 control-path stall. Flow replacement previously waited for a normal
-networking RCU grace period while the xPON caller held its PLOAM command lock
-and the OMCI daemon waited for the mapping write before replying. The kernel
-patch now uses an expedited grace period, retaining the wait before freeing
-the old table or retiring GEM mappings. It does not ignore OLT Deactivate,
-force O5, change credentials, or suppress key-confirm errors.
+post-O5 control-path stall. Flow replacement waited for a networking RCU grace
+period while the xPON caller held its PLOAM command lock and the OMCI daemon
+waited for the mapping write before replying. The first fix expedited that
+wait, but retained it even when no hardware path was being retired.
+
+Flow replacement now checks the old GEM/T-CONT paths. When all remain usable,
+including VLAN/P-bit-only changes and path additions, it frees the old table
+with `kfree_rcu()` without synchronously waiting. Removing or reassigning any
+old path, or clearing a legacy fallback mapping, still waits for an expedited
+grace period before returning, so the caller can safely retire old hardware
+mappings. Controller unregister retains its networking RCU synchronization.
+This does not ignore OLT Deactivate, force O5, change credentials, suppress
+key-confirm errors or make unsupported OMCI entities return success.
 
 `feeds.conf.default` pins driver commit `f96e706` and userspace commit `70302c9`:
 `kmod-airoha-xpon` r74, `kmod-airoha-en7572` r14,
@@ -39,9 +46,12 @@ from the unrelated AN7581 report.
 No local firmware compilation or stable-O5 validation has been performed.
 The fixes remove observed defects; whether the OLT continues to Deactivate
 must be verified after deployment, with fresh OMCI/PLOAM and service counters.
+Captured Deactivate cycles also occur without slow mapping writes, so the
+flow-update refinement is not an established fix for the remaining rejection.
 
-本分支针对实测的 O5 后控制通路阻塞，将流表更新中的普通 RCU 等待改为加速
-宽限期，仍等待旧读者退出，不直接删除同步保护。需要重新编译内核/固件及
+本分支针对实测的 O5 后控制通路阻塞：保留全部旧 GEM/T-CONT 硬件路径的更新
+改为 RCU 延后释放旧流表，不再同步等待；删除或改绑旧路径仍等待加速宽限期，
+不直接删除硬件回收前的同步保护。需要重新编译内核/固件及
 固定版本的 PON feeds，单独升级 xPON 包不会包含这处底层以太网驱动修复。
 HWTC 场景仍需显式开启 BWmap 原厂兼容模式。本分支尚未证明稳定 O5；
 必须刷入后确认没有撤销循环、业务映射有效，而不只看瞬间显示 O5。
