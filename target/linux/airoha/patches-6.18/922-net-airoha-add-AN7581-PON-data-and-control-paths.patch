@@ -8,13 +8,18 @@ flow tables, and shared QDMA data-path counters.
 
 Transport OMCI and OAM through dedicated control netdevs while the Ethernet driver owns QDMA, DMA, IRQ and NAPI.
 
+Use expedited RCU grace periods for flow replacement. The xPON caller
+holds its PLOAM command lock while applying these mappings; waiting for
+a normal grace period stalls both OMCI replies and PLOAM processing.
+Keep the grace period before freeing the old table or retiring old GEMs.
+
 Signed-off-by: pbs05 <27010143+pbs05@users.noreply.github.com>
 ---
- drivers/net/ethernet/airoha/airoha_eth.c  | 664 ++++++++++++++++++++--
+ drivers/net/ethernet/airoha/airoha_eth.c  | 669 ++++++++++++++++++++--
  drivers/net/ethernet/airoha/airoha_eth.h  |  52 ++
  drivers/net/ethernet/airoha/airoha_regs.h |   7 +
  include/linux/airoha-eth.h                | 105 ++++
- 4 files changed, 792 insertions(+), 36 deletions(-)
+ 4 files changed, 797 insertions(+), 36 deletions(-)
  create mode 100644 include/linux/airoha-eth.h
 
 diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
@@ -679,7 +684,7 @@ index b37b425..12b1ad2 100644
  	return phylink_ethtool_ksettings_set(dev->phylink, cmd);
  }
  
-@@ -3631,6 +4008,209 @@ static const struct net_device_ops airoha_netdev_ops = {
+@@ -3631,6 +4008,212 @@ static const struct net_device_ops airoha_netdev_ops = {
  	.ndo_setup_tc		= airoha_dev_tc_setup,
  };
  
@@ -768,7 +773,10 @@ index b37b425..12b1ad2 100644
 +
 +	old = rcu_replace_pointer(dev->pon_flow_table, table, true);
 +	WRITE_ONCE(dev->pon_qdma_tag, 0);
-+	synchronize_net();
++	/* The xPON caller holds its PLOAM command lock here. Keep the
++	 * networking RCU grace period, but do not wait for a normal one.
++	 */
++	synchronize_rcu_expedited();
 +	kfree(old);
 +	return 0;
 +}
@@ -889,7 +897,7 @@ index b37b425..12b1ad2 100644
  static const struct ethtool_ops airoha_ethtool_ops = {
  	.get_drvinfo		= airoha_ethtool_get_drvinfo,
  	.get_eth_mac_stats      = airoha_ethtool_get_mac_stats,
-@@ -3904,9 +4482,22 @@ static int airoha_alloc_gdm_device(struct airoha_eth *eth,
+@@ -3904,9 +4485,22 @@ static int airoha_alloc_gdm_device(struct airoha_eth *eth,
  	dev->port = port;
  	dev->eth = eth;
  	dev->nbq = nbq;
@@ -913,7 +921,7 @@ index b37b425..12b1ad2 100644
  }
  
  static int airoha_alloc_gdm_port(struct airoha_eth *eth,
-@@ -4170,7 +4761,8 @@ static void airoha_remove(struct platform_device *pdev)
+@@ -4170,7 +4764,8 @@ static void airoha_remove(struct platform_device *pdev)
  
  			netdev = netdev_from_priv(dev);
  			unregister_netdev(netdev);
