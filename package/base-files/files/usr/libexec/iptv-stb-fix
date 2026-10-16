@@ -1,0 +1,97 @@
+#!/bin/sh
+# IPTV 机顶盒修复：关闭组播 VLAN 端口的 MAC 学习，并清掉学错在该端口上的单播 MAC。
+# 参数来自 /etc/iptv-stb-fix.conf；详见 docs/iptv-udpxy-omcproxy-guide.md
+#
+# 换机自愈：若配置里的端口在当前机器上不存在（换板子/改了 VLAN 名/VLAN 重新配置），
+#           会自动重新探测网桥与组播 VLAN 端口，并把结果写回 /etc/iptv-stb-fix.conf。
+CONF=/etc/iptv-stb-fix.conf
+BRIDGE=br-iptv
+MC_PORT=ct-iptv-mc
+SVC_PORT=ct-iptv-svc
+STB_PORT=lan2
+[ -r "$CONF" ] && . "$CONF"
+
+BR=/usr/sbin/bridge
+[ -x "$BR" ] || BR=$(command -v bridge) || exit 0
+
+# ---------- 自动探测（仅在配置失效时执行） ----------
+detect_ports() {
+	# 优先用配置里那个网桥（若它存在且确实是 IPTV 桥）
+	cands=""
+	if [ -d "/sys/class/net/$BRIDGE/bridge" ]; then cands="$BRIDGE"; fi
+	for d in /sys/class/net/*/bridge; do
+		[ -d "$d" ] || continue
+		b=$(basename "$(dirname "$d")")
+		[ "$b" = "$BRIDGE" ] && continue
+		cands="$cands $b"
+	done
+
+	for b in $cands; do
+		bi=$(cat "/sys/class/net/$b/ifindex" 2>/dev/null) || continue
+		lan=""; vlans=""
+		for p in /sys/class/net/*; do
+			n=$(basename "$p")
+			[ "$(cat "$p/master/ifindex" 2>/dev/null)" = "$bi" ] || continue
+			case "$n" in lan[0-9]*) [ -n "$lan" ] || lan="$n" ;; esac
+			ip -d link show "$n" 2>/dev/null | grep -q "vlan protocol 802.1Q" && vlans="$vlans $n"
+		done
+		[ -n "$vlans" ] || continue
+
+		mc=""
+		if command -v tcpdump >/dev/null 2>&1; then
+			for p in $vlans; do
+				if timeout 2 tcpdump -i "$p" -n -c 1 "ip multicast and not igmp" >/dev/null 2>&1; then
+					mc="$p"; break
+				fi
+			done
+		fi
+		if [ -z "$mc" ]; then
+			for p in $vlans; do case "$p" in *mc*) mc="$p"; break ;; esac; done
+		fi
+		if [ -z "$mc" ]; then for p in $vlans; do mc="$p"; done; fi
+
+		svc=""
+		for p in $vlans; do [ "$p" = "$mc" ] || { svc="$p"; break; }; done
+
+		BRIDGE="$b"; MC_PORT="$mc"; SVC_PORT="$svc"; STB_PORT="$lan"
+		cat > "$CONF" <<CONFEOF
+# 由 /usr/libexec/iptv-stb-fix 自动探测生成于 $(date '+%F %T')
+# （原因：原配置里的端口在本机不存在 —— 通常是换了板子或改了 VLAN 名）
+BRIDGE=$BRIDGE
+MC_PORT=$MC_PORT
+SVC_PORT=$SVC_PORT
+STB_PORT=$STB_PORT
+CONFEOF
+		logger -t iptv-stb "自动探测更新配置: BRIDGE=$BRIDGE MC_PORT=$MC_PORT SVC_PORT=$SVC_PORT STB_PORT=$STB_PORT"
+		return 0
+	done
+	return 1
+}
+
+# 配置里的组播端口不存在 → 尝试重新探测；探测不到就安静退出（未配置 IPTV 时无副作用）
+if [ ! -e "/sys/class/net/$MC_PORT" ]; then
+	detect_ports || exit 0
+fi
+
+# 等端口真正入桥（最多 5s），否则设置会被"端口入桥"动作重置
+i=0
+while [ "$i" -lt 20 ]; do
+	b=$(cat "/sys/class/net/$BRIDGE/ifindex" 2>/dev/null)
+	m=$(cat "/sys/class/net/$MC_PORT/master/ifindex" 2>/dev/null)
+	if [ -n "$b" ] && [ "$b" = "$m" ]; then break; fi
+	i=$((i + 1)); sleep 0.25
+done
+
+if ! $BR link set dev "$MC_PORT" learning off 2>/dev/null; then
+	logger -t iptv-stb "ERROR: 无法关闭 $MC_PORT 的 MAC 学习 (bridge=$BRIDGE)"
+	exit 1
+fi
+
+# 清掉学在组播口上的动态表项，让网桥尽快在正确端口重新学习
+$BR fdb show br "$BRIDGE" 2>/dev/null | grep "dev $MC_PORT " | grep -v permanent | \
+while read -r mac _rest; do
+	$BR fdb del "$mac" dev "$MC_PORT" 2>/dev/null
+done
+
+logger -t iptv-stb "$MC_PORT: MAC learning off (机顶盒单播修复)"
+exit 0

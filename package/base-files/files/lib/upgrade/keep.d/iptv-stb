@@ -1,0 +1,11 @@
+# IPTV 机顶盒修复（组播 VLAN 端口关闭 MAC 学习）
+# 少了这些文件，恢复到新机器后盒子会重新报 2001 网络不可达
+# 详见 docs/iptv-udpxy-omcproxy-guide.md
+/etc/sysupgrade.conf
+/etc/iptv-stb-fix.conf
+/usr/libexec/iptv-stb-fix
+/usr/libexec/iptv-stb-watchdog
+/etc/hotplug.d/iface/99-iptv-mc-nolearn
+/etc/init.d/iptv-stb
+/etc/rc.d/S95iptv-stb
+/etc/uci-defaults/99-iptv-stb-enable
