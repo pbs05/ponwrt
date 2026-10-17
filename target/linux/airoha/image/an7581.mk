@@ -286,6 +286,7 @@ define Device/znxt_zn515xg-d
   $(call Device/znxt_zn50xg-d-common)
   DEVICE_MODEL := ZN515XG-D
   DEVICE_DTS := an7581-znxt-zn515xg-d
+  SUPPORTED_DEVICES += znxt,zn515xg-d-10g-sfp
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
     kmod-usb3 kmod-usb-ledtrig-usbport kmod-phy-airoha-en8811h \
     kmod-airoha-en7572 kmod-airoha-xpon airoha-ponctl airoha-pond \
@@ -296,16 +297,46 @@ define Device/znxt_zn515xg-d
 endef
 TARGET_DEVICES += znxt_zn515xg-d
 
+define Device/znxt_zn515xg-d-10g-sfp
+  $(call Device/znxt_zn50xg-d-common)
+  DEVICE_MODEL := ZN515XG-D
+  DEVICE_VARIANT := 10G-SFP
+  DEVICE_DTS := an7581-znxt-zn515xg-d-10g-sfp
+  DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
+    kmod-usb3 kmod-usb-ledtrig-usbport kmod-airoha-en7572 \
+    kmod-airoha-xpon airoha-ponctl airoha-pond \
+    kmod-mt7915e kmod-mt7916-firmware znxt-zn515-mt7916-eeprom \
+    wpad-openssl \
+    nand-utils ubi-utils $(AIROHA_USB_STORAGE_PACKAGES)
+  DEVICE_PACKAGES += fitblk
+  SUPPORTED_DEVICES += znxt,zn515xg-d
+endef
+TARGET_DEVICES += znxt_zn515xg-d-10g-sfp
+
 define Device/znxt_zn504xg-d
   $(call Device/znxt_zn50xg-d-common)
   DEVICE_MODEL := ZN504XG-D
   DEVICE_DTS := an7581-znxt-zn504xg-d
+  SUPPORTED_DEVICES += znxt,zn504xg-d-10g-sfp
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
     kmod-phy-airoha-en8811h kmod-airoha-en7572 kmod-airoha-xpon \
     airoha-ponctl airoha-pond nand-utils ubi-utils
   DEVICE_PACKAGES += fitblk
 endef
 TARGET_DEVICES += znxt_zn504xg-d
+
+define Device/znxt_zn504xg-d-10g-sfp
+  $(call Device/znxt_zn50xg-d-common)
+  DEVICE_MODEL := ZN504XG-D
+  DEVICE_VARIANT := 10G-SFP
+  DEVICE_DTS := an7581-znxt-zn504xg-d-10g-sfp
+  DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
+    kmod-airoha-en7572 kmod-airoha-xpon \
+    airoha-ponctl airoha-pond nand-utils ubi-utils
+  DEVICE_PACKAGES += fitblk
+  SUPPORTED_DEVICES += znxt,zn504xg-d
+endef
+TARGET_DEVICES += znxt_zn504xg-d-10g-sfp
 
 # UNG00A uses BL2 in the first block followed by a full-capacity UBI partition.
 define Device/unionman_ung00a
@@ -326,17 +357,45 @@ define Device/unionman_ung00a
   IMAGE/sysupgrade.itb = append-kernel | \
 	fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb external-static-with-rootfs | \
 	append-metadata
+  SUPPORTED_DEVICES += unionman,ung00a-10g-sfp
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
 	 kmod-phy-airoha-en8811h kmod-airoha-en7572 kmod-airoha-xpon \
 	 airoha-ponctl airoha-pond fitblk nand-utils ubi-utils
 endef
 TARGET_DEVICES += unionman_ung00a
 
+define Device/unionman_ung00a-10g-sfp
+  $(call Device/FitImageLzma)
+  DEVICE_VENDOR := Unionman
+  DEVICE_MODEL := UNG00A
+  DEVICE_VARIANT := 10G-SFP
+  DEVICE_DTS := an7581-unionman-ung00a-10g-sfp
+  KERNEL_LOADADDR := 0x8a000000
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  UBOOTENV_IN_UBI := 1
+  KERNEL_IN_UBI := 1
+  KERNEL := kernel-bin | gzip
+  KERNEL_INITRAMFS = kernel-bin | lzma | \
+	fit lzma $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd | pad-to 128k
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  IMAGES := sysupgrade.itb
+  IMAGE/sysupgrade.itb = append-kernel | \
+	fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb external-static-with-rootfs | \
+	append-metadata
+  DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
+	 kmod-airoha-en7572 kmod-airoha-xpon \
+	 airoha-ponctl airoha-pond fitblk nand-utils ubi-utils
+  SUPPORTED_DEVICES += unionman,ung00a
+endef
+TARGET_DEVICES += unionman_ung00a-10g-sfp
+
 define Device/h3c_hm2004-du
   $(call Device/FitImageLzma)
   DEVICE_VENDOR := H3C
   DEVICE_MODEL := HM2004-DU
   DEVICE_DTS := an7581-h3c-hm2004-du
+  SUPPORTED_DEVICES += h3c,hm2004-du-10g-sfp
   KERNEL_LOADADDR := 0x8a000000
   BLOCKSIZE := 128k
   PAGESIZE := 2048
@@ -358,6 +417,35 @@ define Device/h3c_hm2004-du
 	 fitblk nand-utils ubi-utils $(AIROHA_USB_STORAGE_PACKAGES)
 endef
 TARGET_DEVICES += h3c_hm2004-du
+
+define Device/h3c_hm2004-du-10g-sfp
+  $(call Device/FitImageLzma)
+  DEVICE_VENDOR := H3C
+  DEVICE_MODEL := HM2004-DU
+  DEVICE_VARIANT := 10G-SFP
+  DEVICE_DTS := an7581-h3c-hm2004-du-10g-sfp
+  KERNEL_LOADADDR := 0x8a000000
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  UBOOTENV_IN_UBI := 1
+  KERNEL_IN_UBI := 1
+  KERNEL := kernel-bin | gzip
+  KERNEL_INITRAMFS = kernel-bin | lzma | \
+	fit lzma $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd | pad-to 128k
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  IMAGES := sysupgrade.itb
+  IMAGE/sysupgrade.itb = append-kernel | \
+	fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb external-static-with-rootfs | \
+	append-metadata
+  DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
+	 kmod-usb3 kmod-usb-ledtrig-usbport \
+	 kmod-airoha-en7572 kmod-airoha-xpon \
+	 airoha-ponctl airoha-pond \
+	 kmod-mt7915e kmod-mt7916-firmware wpad-openssl \
+	 fitblk nand-utils ubi-utils $(AIROHA_USB_STORAGE_PACKAGES)
+  SUPPORTED_DEVICES += h3c,hm2004-du
+endef
+TARGET_DEVICES += h3c_hm2004-du-10g-sfp
 
 define Device/nokia_xg-040g-md-common
   $(call Device/FitImageLzma)
@@ -399,7 +487,8 @@ define Device/nokia_xg-040g-md-ubi
   $(call Device/nokia_xg-040g-md-common)
   DEVICE_VARIANT := (UBI)
   DEVICE_DTS := an7581-nokia_xg-040g-md-ubi
-  SUPPORTED_DEVICES += nokia,xg-040g-md-ubi-usb-sfp
+  SUPPORTED_DEVICES += nokia,xg-040g-md-ubi-usb-sfp \
+		       nokia,xg-040g-md-ubi-10g-sfp
   $(call Device/nokia_xg-040g-md-ubi-images)
 endef
 TARGET_DEVICES += nokia_xg-040g-md-ubi
@@ -412,6 +501,16 @@ define Device/nokia_xg-040g-md-ubi-usb-sfp
   $(call Device/nokia_xg-040g-md-ubi-images)
 endef
 TARGET_DEVICES += nokia_xg-040g-md-ubi-usb-sfp
+
+define Device/nokia_xg-040g-md-ubi-10g-sfp
+  $(call Device/nokia_xg-040g-md-common)
+  DEVICE_VARIANT := (UBI-10G-SFP)
+  DEVICE_DTS := an7581-nokia_xg-040g-md-ubi-10g-sfp
+  DEVICE_PACKAGES += -kmod-phy-airoha-en8811h
+  SUPPORTED_DEVICES += nokia,xg-040g-md-ubi
+  $(call Device/nokia_xg-040g-md-ubi-images)
+endef
+TARGET_DEVICES += nokia_xg-040g-md-ubi-10g-sfp
 
 define Device/quantum_q1000k-ubi
   DEVICE_VENDOR := Quantum Fiber
@@ -448,6 +547,7 @@ define Device/nokia_xg-040g-tf-ubi
   $(call Device/nokia_xg-040g-tf-common)
   DEVICE_VARIANT := (UBI)
   DEVICE_DTS := an7581-nokia_xg-040g-tf-ubi
+  SUPPORTED_DEVICES += nokia,xg-040g-tf-ubi-10g-sfp
   UBOOTENV_IN_UBI := 1
   KERNEL_IN_UBI := 1
   KERNEL := kernel-bin | gzip
@@ -461,3 +561,23 @@ define Device/nokia_xg-040g-tf-ubi
   DEVICE_PACKAGES += fitblk
 endef
 TARGET_DEVICES += nokia_xg-040g-tf-ubi
+
+define Device/nokia_xg-040g-tf-ubi-10g-sfp
+  $(call Device/nokia_xg-040g-tf-common)
+  DEVICE_VARIANT := (UBI-10G-SFP)
+  DEVICE_DTS := an7581-nokia_xg-040g-tf-ubi-10g-sfp
+  DEVICE_PACKAGES += -kmod-phy-airoha-en8811h
+  SUPPORTED_DEVICES += nokia,xg-040g-tf-ubi
+  UBOOTENV_IN_UBI := 1
+  KERNEL_IN_UBI := 1
+  KERNEL := kernel-bin | gzip
+  KERNEL_INITRAMFS := kernel-bin | lzma | \
+	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 128k
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  IMAGES := sysupgrade.itb
+  IMAGE/sysupgrade.itb := append-kernel | \
+	fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | \
+	append-metadata
+  DEVICE_PACKAGES += fitblk
+endef
+TARGET_DEVICES += nokia_xg-040g-tf-ubi-10g-sfp

@@ -1,0 +1,41 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+#include "an7581-nokia_xg-040g-md-common.dtsi"
+#include "an758x-nokia_xg-040g-ubi-parts.dtsi"
+
+/ {
+	model = "Nokia XG-040G-MD (UBI)";
+	compatible = "nokia,xg-040g-md-ubi", "airoha,an7581",
+		     "airoha,en7581";
+	variant = "10g-sfp";
+};
+
+/*
+ * The 10G-SFP variant repurposes the gdm4/eth_pcs HSGMII link as a
+ * 10GBASE-R SFP cage. Only the TX/RX differential pairs are wired;
+ * there is no I2C EEPROM or MDIO PHY, so the MAC runs with
+ * managed = "in-band-status".
+ */
+&mdio {
+	/delete-node/ ethernet-phy@f;
+};
+
+&gdm4 {
+	/delete-property/ pcs-handle;
+	/delete-property/ phy-handle;
+	/delete-property/ phy-mode;
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	lan_10g_sfp: ethernet-port@0 {
+		compatible = "airoha,eth-port";
+		reg = <0>;
+		managed = "in-band-status";
+		pcs-handle = <&eth_pcs>;
+		phy-mode = "10gbase-r";
+		nvmem-cell-names = "mac-address";
+		nvmem-cells = <&macaddr_factory_3e (0)>;
+		openwrt,netdev-name = "lan1";
+		status = "okay";
+	};
+};

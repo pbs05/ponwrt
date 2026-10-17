@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+
+/* Firmware reserves the first 2 MiB of DRAM. */
+/memreserve/ 0x80000000 0x200000;
+
+#include "an7581-znxt-zn515xg-d-common.dtsi"
+
+/ {
+	model = "ZNXT ZN515XG-D";
+	compatible = "znxt,zn515xg-d", "airoha,an7581", "airoha,en7581";
+	variant = "10g-sfp";
+};
+
+/*
+ * The 10G-SFP variant removes the EN8811H PHY and drives the gdm4/eth_pcs
+ * link as 10GBASE-R. The SFP cage carries only TX/RX pairs, so the MAC
+ * uses in-band status with no MDIO PHY.
+ */
+&mdio {
+	/delete-node/ ethernet-phy@f;
+};
+
+&gdm4 {
+	/delete-property/ pcs-handle;
+	/delete-property/ phy-handle;
+	/delete-property/ phy-mode;
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	lan_10g_sfp: ethernet-port@0 {
+		compatible = "airoha,eth-port";
+		reg = <0>;
+		managed = "in-band-status";
+		pcs-handle = <&eth_pcs>;
+		phy-mode = "10gbase-r";
+		nvmem-cell-names = "mac-address";
+		nvmem-cells = <&macaddr_factory 1>;
+		openwrt,netdev-name = "lan1";
+		status = "okay";
+	};
+};
