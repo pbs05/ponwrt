@@ -1,0 +1,119 @@
+#!/bin/sh
+#
+# Restore the FiberHome HG5585F-CU panel LED bindings after an upgrade.
+#
+# board.d/01_leds only writes /etc/board.json, and the block in
+# /bin/config_generate that turns board.json into UCI - generate_led included -
+# sits behind `if [ ! -s /etc/config/system ]`. An upgrade that keeps settings
+# has a non-empty system config, so that whole block is skipped, while
+# board.json is regenerated every time (it is not in the keep list, whose
+# base-files entry names only /etc/config/). The result is a correct
+# board.json next to a stale UCI config, and six panel LEDs that leds-gpio
+# registers but nothing ever binds a trigger to:
+#
+#   blue:lan-1..4   the four GE jacks follow their netdev and stay dark while
+#                   the ports link fine - the jacks look dead, the jacks are
+#                   fine, and this is the symptom that was reported.
+#   blue:usb-1/-2   the two USB jacks stay dark on a fresh install too, because
+#                   DEVICE_PACKAGES shipped kmod-leds-gpio but not
+#                   kmod-usb-ledtrig-usbport, so the usbport trigger the CU case
+#                   asks for did not exist. image/an7581.mk now ships it.
+#
+# Two halves, because there are two ways to arrive here:
+#
+#   1. An install from an earlier revision of this board's bindings still names
+#      mt7530-0:09/0a/0b/0c:green:lan-1..4, class devices that no longer exist.
+#      Those sections are renamed rather than replaced, so a trigger or mode the
+#      user edited by hand survives. This is upstream's own mechanism
+#      (migrate_leds(), used by 15 other targets in 04_led_migration).
+#   2. An install older than the CU LED work has no led section at all, because
+#      before the upstream merge 01_leds had no CU case. Nothing to rename, so
+#      the missing bindings are added here.
+#
+# Idempotent, and narrow: a section is only renamed when it names one of the
+# four withdrawn devices, and a binding is only added when the class device
+# exists and no section targets it yet. On a fresh install, where
+# config_generate wrote both files together, nothing happens.
+
+. /lib/functions.sh
+. /lib/functions/migrations.sh
+
+# The sections board.d/01_leds describes for this board, in the same order:
+# section|name|class device|type|type arguments.
+CU_LEDS="
+led_lan1|lan1|blue:lan-1|netdev|lan1
+led_lan2|lan2|blue:lan-2|netdev|lan2
+led_lan3|lan3|blue:lan-3|netdev|lan3
+led_lan4|lan4|blue:lan-4|netdev|lan4
+led_usb1|USB 1|blue:usb-1|usbport|usb3-port1 usb4-port1
+led_usb2|USB 2|blue:usb-2|usbport|usb1-port1 usb2-port1
+"
+
+_led_sections() {
+	uci -q show system | sed -n 's/^system\.\([^=]*\)=led$/\1/p'
+}
+
+_led_is_bound() {
+	local want="$1" s
+
+	for s in $(_led_sections); do
+		[ "$(uci -q get "system.$s.sysfs")" = "$want" ] && return 0
+	done
+
+	return 1
+}
+
+# Echo a free section name derived from $1, or return 1 if both candidates are
+# taken - never take over a section that already exists under that name.
+_led_section_new() {
+	local s
+
+	for s in "$1" "${1}_cu"; do
+		[ -z "$(uci -q get "system.$s")" ] && {
+			echo "$s"
+			return 0
+		}
+	done
+
+	return 1
+}
+
+case "$(board_name)" in
+fiberhome,hg5585f-cu)
+	migrate_leds "mt7530-0:09:green:lan-1=blue:lan-1" \
+		     "mt7530-0:0a:green:lan-2=blue:lan-2" \
+		     "mt7530-0:0b:green:lan-3=blue:lan-3" \
+		     "mt7530-0:0c:green:lan-4=blue:lan-4"
+
+	echo "$CU_LEDS" | while IFS='|' read -r section name class type args; do
+		[ -n "$section" ] || continue
+		[ -e "/sys/class/leds/$class" ] || continue
+		_led_is_bound "$class" && continue
+		section="$(_led_section_new "$section")" || continue
+
+		uci -q set "system.$section=led"
+		uci -q set "system.$section.name=$name"
+		uci -q set "system.$section.sysfs=$class"
+
+		case "$type" in
+		netdev)
+			uci -q set "system.$section.trigger=netdev"
+			uci -q set "system.$section.mode=link tx rx"
+			uci -q set "system.$section.dev=$args"
+			;;
+		usbport)
+			uci -q set "system.$section.trigger=usbport"
+			for port in $args; do
+				uci -q add_list "system.$section.port=$port"
+			done
+			;;
+		esac
+
+		logger -t hg5585f-cu-leds "added the ${name} LED binding"
+	done
+	;;
+esac
+
+migrations_apply system
+
+exit 0

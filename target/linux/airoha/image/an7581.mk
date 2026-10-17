@@ -205,7 +205,11 @@ define Device/fiberhome_hg5585f-common
   KERNEL_INITRAMFS_SUFFIX := -recovery.itb
   IMAGES := sysupgrade.itb
   # PON and MT7916D read per-device calibration from factory UBI NVMEM cells.
+  # kmod-usb-ledtrig-usbport is not optional: the CU binds its two panel USB
+  # LEDs and the CT its one (board.d/01_leds, trigger "usbport"), and without
+  # the module that trigger never appears, so those jacks stay dark.
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio kmod-usb3 \
+    kmod-usb-ledtrig-usbport \
     kmod-airoha-paged-bosa kmod-airoha-xpon airoha-ponctl airoha-pond \
 	 kmod-mt7915e kmod-mt7916-firmware wpad-openssl \
 	 fitblk nand-utils ubi-utils $(AIROHA_USB_STORAGE_PACKAGES)
