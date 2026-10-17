@@ -4,8 +4,8 @@
 #include "an758x-nokia_xg-040g-ubi-parts.dtsi"
 
 / {
-	model = "Nokia XG-040G-TF (UBI) 10G-SFP";
-	compatible = "nokia,xg-040g-tf-ubi-10g-sfp", "airoha,an7581",
+	model = "Nokia XG-040G-TF (UBI)";
+	compatible = "nokia,xg-040g-tf-ubi", "airoha,an7581",
 		     "airoha,en7581";
 	variant = "10g-sfp";
 };

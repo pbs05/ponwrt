@@ -7,8 +7,9 @@
 #include "an7581-znxt-zn515xg-d-common.dtsi"
 
 / {
-	model = "ZNXT ZN515XG-D 10G-SFP";
-	compatible = "znxt,zn515xg-d-10g-sfp", "airoha,an7581", "airoha,en7581";
+	model = "ZNXT ZN515XG-D";
+	compatible = "znxt,zn515xg-d", "airoha,an7581", "airoha,en7581";
+	variant = "10g-sfp";
 };
 
 /*

@@ -7,8 +7,9 @@
 #include "an7581-unionman-ung00a-common.dtsi"
 
 / {
-	model = "Unionman UNG00A 10G-SFP";
-	compatible = "unionman,ung00a-10g-sfp", "airoha,an7581", "airoha,en7581";
+	model = "Unionman UNG00A";
+	compatible = "unionman,ung00a", "airoha,an7581", "airoha,en7581";
+	variant = "10g-sfp";
 };
 
 /*

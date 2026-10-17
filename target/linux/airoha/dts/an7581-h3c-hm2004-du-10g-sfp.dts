@@ -6,8 +6,9 @@
 #include "an7581-h3c-hm2004-du-common.dtsi"
 
 / {
-	model = "H3C HM2004-DU 10G-SFP";
-	compatible = "h3c,hm2004-du-10g-sfp", "airoha,an7581", "airoha,en7581";
+	model = "H3C HM2004-DU";
+	compatible = "h3c,hm2004-du", "airoha,an7581", "airoha,en7581";
+	variant = "10g-sfp";
 };
 
 /*

@@ -7,8 +7,9 @@
 #include "an7581-znxt-zn50xg-d-common.dtsi"
 
 / {
-	model = "ZNXT ZN504XG-D 10G-SFP";
-	compatible = "znxt,zn504xg-d-10g-sfp", "airoha,an7581", "airoha,en7581";
+	model = "ZNXT ZN504XG-D";
+	compatible = "znxt,zn504xg-d", "airoha,an7581", "airoha,en7581";
+	variant = "10g-sfp";
 };
 
 &znxt_proline_layout {
