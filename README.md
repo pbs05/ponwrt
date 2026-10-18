@@ -28,7 +28,18 @@ key-confirm errors or make unsupported OMCI entities return success.
 four missing standard PM entities. Rebuild the kernel/firmware as well as
 the feeds; updating only the xPON package cannot change this `airoha_eth` fix.
 If reusing a build tree, update the two PON feed definitions to these pinned
-revisions rather than retaining previously selected feed versions.
+revisions rather than retaining previously selected feed versions. A local
+`feeds.conf` overrides `feeds.conf.default`; check both the effective feed URLs
+and the installed feed revisions. The pinned objects are fetched from the
+public `pbs05` repositories, without reverting to their older `main` tips.
+
+This branch integrates `master` through `edaeeb300c9d` (Linux 6.18.55),
+including Airoha thermal sensor fixes, opt-in fraglist GRO, HG5585F-CT PHY
+identification and UNG00A port/LED corrections. Patch 925 retains PPE
+mapping serialization and affected-flow invalidation while preserving patch
+922's conditional RCU retirement. A clean Git merge alone is not sufficient:
+the complete kernel patch stack and both target builds must pass before
+deployment, followed by device-specific PON and offload validation.
 
 EN7572 frontend r14 rejects populated BOB calibration tables with analog codes
 that exceed their register field widths. Validation runs with BEN closed,
