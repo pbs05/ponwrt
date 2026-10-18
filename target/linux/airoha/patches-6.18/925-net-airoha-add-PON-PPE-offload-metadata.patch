@@ -43,7 +43,7 @@ Signed-off-by: pbs05 <27010143+pbs05@users.noreply.github.com>
  			  u16 hash, bool rx_wlan);
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -4031,12 +4031,41 @@ static bool airoha_pon_paths_retained(
+@@ -4139,14 +4139,43 @@ static bool airoha_pon_paths_retained(
  	return true;
  }
  
@@ -87,7 +87,9 @@ Signed-off-by: pbs05 <27010143+pbs05@users.noreply.github.com>
  	unsigned int i, j;
 -	u32 old_tag;
  
-@@ -4086,20 +4115,7 @@ int airoha_eth_pon_replace_flows(
+ 	if (!netdev || netdev->netdev_ops != &airoha_netdev_ops)
+ 		return -EINVAL;
+@@ -4190,20 +4219,7 @@ int airoha_eth_pon_replace_flows(
  		}
  	}
  
@@ -109,7 +111,7 @@ Signed-off-by: pbs05 <27010143+pbs05@users.noreply.github.com>
  	return 0;
  }
  EXPORT_SYMBOL_GPL(airoha_eth_pon_replace_flows);
-@@ -4133,12 +4149,11 @@ int airoha_eth_pon_configure_epon(struct
+@@ -4236,12 +4252,11 @@ int airoha_eth_pon_configure_epon(struct
  		return -EOPNOTSUPP;
  	if (valid && channel >= 32)
  		return -ERANGE;
