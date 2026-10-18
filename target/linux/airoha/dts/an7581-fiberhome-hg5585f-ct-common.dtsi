@@ -4,10 +4,12 @@
 #include "an7581-fiberhome-hg5585f-common.dtsi"
 
 &mdio {
-	/* The CT variant connects GPY211 over HSGMII with active-low GPIO34 reset. */
+	/*
+	 * The explicit GPY211C ID lets phylib register GPIO34 before the first
+	 * MDIO transaction, so warm boots cannot probe the PHY while it is reset.
+	 */
 	gpy211: ethernet-phy@7 {
-		compatible = "maxlinear,gpy211",
-			     "ethernet-phy-ieee802.3-c45";
+		compatible = "ethernet-phy-id67c9.de10";
 		reg = <7>;
 		reset-gpios = <&en7581_pinctrl 34 GPIO_ACTIVE_LOW>;
 		reset-assert-us = <100000>;

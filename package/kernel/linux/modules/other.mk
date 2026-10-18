@@ -312,7 +312,7 @@ $(eval $(call KernelPackage,parport-pc))
 define KernelPackage/lp
   SUBMENU:=$(OTHER_MENU)
   TITLE:=Parallel port line printer device support
-  DEPENDS:=+kmod-ppdev
+  DEPENDS:=printer-support +kmod-ppdev
   KCONFIG:= \
 	CONFIG_PRINTER
   FILES:= \
@@ -525,6 +525,22 @@ define KernelPackage/mtdram/description
 endef
 
 $(eval $(call KernelPackage,mtdram))
+
+
+define KernelPackage/phram
+  SUBMENU:=$(OTHER_MENU)
+  TITLE:=MTD device backed by physical RAM
+  KCONFIG:=CONFIG_MTD_PHRAM
+  FILES:=$(LINUX_DIR)/drivers/mtd/devices/phram.ko
+  AUTOLOAD:=$(call AutoProbe,phram)
+endef
+
+define KernelPackage/phram/description
+  Exposes a physical memory range as an MTD device. Memory regions can be
+  specified via module parameters or device tree nodes with compatible="phram".
+endef
+
+$(eval $(call KernelPackage,phram))
 
 
 define KernelPackage/ramoops
@@ -1077,6 +1093,22 @@ define KernelPackage/tpm/description
 endef
 
 $(eval $(call KernelPackage,tpm))
+
+define KernelPackage/tpm-crb
+  SUBMENU:=$(OTHER_MENU)
+  TITLE:=TCG CRB 2.0 TPM Interface
+  DEPENDS:=@(TARGET_x86||TARGET_armsr) +kmod-tpm
+  KCONFIG:=CONFIG_TCG_CRB
+  FILES:=$(LINUX_DIR)/drivers/char/tpm/tpm_crb.ko
+  AUTOLOAD:=$(call AutoLoad,15,tpm_crb,1)
+endef
+
+define KernelPackage/tpm-crb/description
+  This device driver implements the TPM interface as defined in
+  the TCG CRB 2.0 TPM specification.
+endef
+
+$(eval $(call KernelPackage,tpm-crb))
 
 define KernelPackage/tpm-ftpm-tee
   SUBMENU:=$(OTHER_MENU)
