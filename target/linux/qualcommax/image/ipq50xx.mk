@@ -1,5 +1,5 @@
 DTS_DIR := $(DTS_DIR)/qcom
-DEVICE_VARS += BOOT_SCRIPT
+DEVICE_VARS += BOOT_SCRIPT MERCUSYS_SUPPORT_STRING
 
 define Build/mstc-header
 	$(eval version=$(word 1,$(1)))
@@ -9,14 +9,30 @@ define Build/mstc-header
 		printf "CMOC"; \
 		tail -c+5 $@.crclen; head -c4 $@.crclen; \
 		printf '$(call toupper,$(LINUX_KARCH)) $(VERSION_DIST) Linux-$(LINUX_VERSION)' | \
-			dd bs=64 count=1 conv=sync 2>/dev/null; \
+			dd bs=64 count=1 conv=sync iflag=fullblock 2>/dev/null; \
 		printf "$(version)" | \
-			dd bs=64 count=1 conv=sync 2>/dev/null; \
+			dd bs=64 count=1 conv=sync iflag=fullblock 2>/dev/null; \
 		dd if=/dev/zero bs=$$(($(hdrlen) - 0x8c)) count=1 2>/dev/null; \
 		cat $@; \
 	) > $@.new
 	mv $@.new $@
 	rm -f $@.crclen
+endef
+
+# Wrap the OpenWrt UBI in a Mercusys fwup container the stock web UI accepts.
+# Keyless: the stock loader (nvrammanager) only RSA-checks fw-type "Cloud";
+# any other fw-type falls back to a salt-seeded MD5 integrity check.
+define Build/mercusys-fwup
+	$(TOPDIR)/scripts/mercusys-fwup.py $@ \
+		--fw-type $(if $(1),$(1),MR80X) \
+		--support "$(MERCUSYS_SUPPORT_STRING)" \
+		-o $@.new
+	mv $@.new $@
+endef
+
+define Build/tplink-re700x-factory
+	$(TOPDIR)/scripts/tplink-re700x-factory.py --rootfs $@ --output $@.factory
+	mv $@.factory $@
 endef
 
 define Device/cmcc_mr3000d-ci
@@ -48,6 +64,20 @@ define Device/cmcc_pz-l8
 	NAND_SIZE := 128m
 endef
 TARGET_DEVICES += cmcc_pz-l8
+
+define Device/cmcc_rax3000q
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := CMCC
+	DEVICE_MODEL := RAX3000Q
+	DEVICE_DTS_CONFIG := config@mp02.1
+	SOC := ipq5018
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	IMAGE_SIZE := 59392k
+	NAND_SIZE := 128m
+endef
+TARGET_DEVICES += cmcc_rax3000q
 
 define Device/elecom_wrc-x3000gs2
 	$(call Device/FitImageLzma)
@@ -98,15 +128,43 @@ define Device/glinet_gl-b3000
 	NAND_SIZE := 128m
 	DEVICE_DTS_CONFIG := config@mp03.5-c1
 	SUPPORTED_DEVICES += b3000
-	BOOT_SCRIPT:= glinet_gl-b3000.bootscript
+	BOOT_SCRIPT := glinet_qsdk.bootscript
 	IMAGES := factory.img sysupgrade.bin
-	IMAGE/factory.img := append-ubi | gl-qsdk-factory | append-metadata
+	IMAGE/factory.img := append-ubi | \
+		gl-qsdk-factory ubi_offset=0x00800000 ubi_size=0x07800000 | \
+		append-metadata
 	DEVICE_PACKAGES := \
 		ath11k-firmware-ipq5018-qcn6122 \
 		ipq-wifi-glinet_gl-b3000 \
 		dumpimage
 endef
 TARGET_DEVICES += glinet_gl-b3000
+
+define Device/glinet_gl-x2000
+	$(call Device/FitImage)
+	DEVICE_VENDOR := GL.iNet
+	DEVICE_MODEL := GL-X2000
+	SOC := ipq5018
+	KERNEL_IN_UBI := 1
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	NAND_SIZE := 128m
+	DEVICE_DTS_CONFIG := config@mp03.5-c1
+	SUPPORTED_DEVICES += x2000
+	BOOT_SCRIPT := glinet_qsdk.bootscript
+	IMAGES := factory.img sysupgrade.bin
+	IMAGE/factory.img := append-ubi | \
+		gl-qsdk-factory ubi_offset=0x00a00000 ubi_size=0x07600000 | \
+		append-metadata
+	DEVICE_PACKAGES := \
+		ath11k-firmware-ipq5018-qcn6122 \
+		ipq-wifi-glinet_gl-x2000 \
+		kmod-hwmon-pwmfan \
+		kmod-usb-net-qmi-wwan \
+		kmod-usb-serial-option \
+		dumpimage
+endef
+TARGET_DEVICES += glinet_gl-x2000
 
 define Device/iodata_wn-dax3000gr
 	$(call Device/FitImageLzma)
@@ -139,6 +197,17 @@ define Device/linksys_ipq50xx_mx_base
 	IMAGES += factory.bin
 	IMAGE/factory.bin := append-kernel | pad-to $$$$(KERNEL_SIZE) | append-ubi | linksys-image type=$$$$(DEVICE_MODEL)
 endef
+
+define Device/linksys_mr2000
+	$(call Device/linksys_ipq50xx_mx_base)
+	DEVICE_MODEL := MR2000
+	DEVICE_DTS_CONFIG := config@mp03.5-c1
+	DEVICE_PACKAGES := ath11k-firmware-ipq5018-qcn6122 \
+		ipq-wifi-linksys_mr2000 \
+		kmod-usb-storage \
+		kmod-usb-ledtrig-usbport
+endef
+TARGET_DEVICES += linksys_mr2000
 
 define Device/linksys_mr5500
 	$(call Device/linksys_ipq50xx_mx_base)
@@ -201,6 +270,27 @@ define Device/linksys_spnmx56
 endef
 TARGET_DEVICES += linksys_spnmx56
 
+define Device/mercusys_mr80x-v2
+	$(call Device/FitImageLzma)
+	DEVICE_VENDOR := MERCUSYS
+	DEVICE_MODEL := MR80X
+	DEVICE_VARIANT := v2
+	SOC := ipq5018
+	DEVICE_DTS_CONFIG := config@mp02.1
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	NAND_SIZE := 128m
+	KERNEL_IN_UBI := 1
+	IMAGE_SIZE := 43008k
+	DEVICE_PACKAGES := kmod-dsa-rtl8365mb
+	IMAGES += factory.bin
+	IMAGE/factory.bin := append-ubi | check-size | mercusys-fwup MR80X
+	MERCUSYS_SUPPORT_STRING := SupportList:\n \
+		{product_name:MR80X,product_ver:2.0.0,special_id:45550000}\n \
+		{product_name:MR80X,product_ver:2.0.0,special_id:55530000}\n
+endef
+TARGET_DEVICES += mercusys_mr80x-v2
+
 define Device/tplink_archer-ax55-v1
 	$(call Device/FitImageLzma)
 	$(call Device/UbiFit)
@@ -225,6 +315,60 @@ endif
 endif
 endef
 TARGET_DEVICES += tplink_archer-ax55-v1
+
+define Device/tplink_eap650-outdoor-v1
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := TP-Link
+	DEVICE_MODEL := EAP650-Outdoor
+	DEVICE_VARIANT := v1
+	DEVICE_DTS_CONFIG := config@mp03.1
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	NAND_SIZE := 128m
+	SOC := ipq5018
+	DEVICE_PACKAGES := ath11k-firmware-ipq5018 \
+		kmod-ath11k-pci \
+		ath11k-firmware-qcn9074 \
+		ipq-wifi-tplink_eap650-outdoor-v1 \
+		kmod-phy-realtek
+endef
+TARGET_DEVICES += tplink_eap650-outdoor-v1
+
+define Device/tplink_re700x
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := TP-Link
+	DEVICE_MODEL := RE700X
+	DEVICE_VARIANT := v1
+	SOC := ipq5018
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	NAND_SIZE := 128m
+	IMAGE_SIZE := 43008k
+	DEVICE_DTS_CONFIG := config@mp02.1
+	IMAGES += factory-webflash.bin
+	IMAGE/factory-webflash.bin := append-ubi | tplink-re700x-factory
+	DEVICE_PACKAGES := ath11k-firmware-ipq5018-qcn6122 \
+		ipq-wifi-tplink_re700x kmod-phy-realtek
+endef
+TARGET_DEVICES += tplink_re700x
+
+define Device/wallys_dr5018s
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := Wallys
+	DEVICE_MODEL := DR5018S
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	IMAGE_SIZE := 59392k
+	NAND_SIZE := 128m
+	SOC := ipq5018
+	DEVICE_DTS_CONFIG := config@mp03.5-c2
+	DEVICE_PACKAGES := ath11k-firmware-ipq5018-qcn6122 \
+		ipq-wifi-wallys_dr5018s
+endef
+TARGET_DEVICES += wallys_dr5018s
 
 define Device/xiaomi_ipq50xx_ax_base
 	$(call Device/FitImage)

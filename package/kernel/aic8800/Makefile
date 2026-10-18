@@ -61,11 +61,9 @@ define KernelPackage/aic8800-sdio
 endef
 
 define KernelPackage/aic8800-sdio/config
-  if PACKAGE_kmod-aic8800-sdio
-	config AIC8800_SDIO_BT_SUPPORT
-		bool "Enable Bluetooth support"
-		default y
-  endif
+  config AIC8800_SDIO_BT_SUPPORT
+  bool "Enable Bluetooth support"
+  default y
 endef
 
 define KernelPackage/aic8800-usb

@@ -7,6 +7,78 @@
 #include "qos.h"
 #include "rtl-otto.h"
 
+#define RTL839X_TBL_ACCESS_DATA_2(i)		(0x6120 + (((i) << 2)))
+
+#define RTL838X_SCHED_P_EGR_RATE_CTRL(p)	(0xC008 + (((p) << 7)))
+
+/* QoS */
+#define RTL838X_QM_INTPRI2QID_CTRL		(0x5F00)
+#define RTL839X_QM_INTPRI2QID_CTRL(q)		(0x1110 + (q << 2))
+#define RTL839X_QM_PORT_QNUM(p)			(0x1130 + (((p / 10) << 2)))
+#define RTL839X_PRI_SEL_PORT_PRI(p)		(0x10A8 + (((p / 10) << 2)))
+#define RTL838X_QM_PKT2CPU_INTPRI_MAP		(0x5F10)
+#define RTL839X_QM_PKT2CPU_INTPRI_MAP		(0x1154)
+#define RTL838X_PRI_SEL_TBL_CTRL(i)		(0x5FD8 + (((i) << 2)))
+#define RTL839X_PRI_SEL_TBL_CTRL(i)		(0x10D0 + (((i) << 2)))
+#define RTL838X_QM_PKT2CPU_INTPRI_1		(0x5F08)
+#define RTL838X_QM_PKT2CPU_INTPRI_2		(0x5F0C)
+#define RTL839X_OAM_CTRL			(0x2100)
+#define RTL839X_OAM_PORT_ACT_CTRL(p)		(0x2104 + (((p) << 2)))
+#define RTL839X_RMK_PORT_DEI_TAG_CTRL(p)	(0x6A9C + (((p >> 5) << 2)))
+#define RTL839X_PRI_SEL_IPRI_REMAP		(0x1080)
+#define RTL838X_PRI_SEL_IPRI_REMAP		(0x5F8C)
+#define RTL839X_PRI_SEL_DEI2DP_REMAP		(0x10EC)
+#define RTL839X_RMK_DEI_CTRL			(0x6AA4)
+#define RTL839X_WRED_PORT_THR_CTRL(i)		(0x6084 + ((i) << 2))
+#define RTL839X_WRED_QUEUE_THR_CTRL(q, i)	(0x6090 + ((q) * 12) + ((i) << 2))
+#define RTL838X_PRI_DSCP_INVLD_CTRL0		(0x5FE8)
+#define RTL838X_RMK_IPRI_CTRL			(0xA460)
+#define RTL838X_RMK_OPRI_CTRL			(0xA464)
+#define RTL838X_SCHED_P_TYPE_CTRL(p)		(0xC04C + (((p) << 7)))
+#define RTL838X_SCHED_LB_CTRL(p)		(0xC004 + (((p) << 7)))
+#define RTL838X_FC_P_EGR_DROP_CTRL(p)		(0x6B1C + (((p) << 2)))
+
+#define RTL930X_REMAP_DSCP(p)			(0x9B04 + (((p) / 10) * 4))
+#define RTL931X_REMAP_DSCP(p)			(0x9034 + (((p) / 10) * 4))
+#define RTL93XX_REMAP_DSCP_INTPRI_DSCP_OFFSET(p) \
+						(((p) % 10) * 3)
+#define RTL93XX_REMAP_DSCP_INTPRI_DSCP_MASK(index) \
+						(0x7 << RTL93XX_REMAP_DSCP_INTPRI_DSCP_OFFSET(index))
+
+#define RTL930X_PORT_TBL_IDX_CTRL(port)		(0x9B20 + (((port) / 16) * 4))
+#define RTL931X_PORT_TBL_IDX_CTRL(port)		(0x9064 + (((port) / 16) * 4))
+#define RTL93XX_PORT_TBL_IDX_CTRL_IDX_OFFSET(port) \
+						(((port) & 0xF) << 1)
+#define RTL93XX_PORT_TBL_IDX_CTRL_IDX_MASK(port) \
+						(0x3 << RTL93XX_PORT_TBL_IDX_CTRL_IDX_OFFSET(port))
+
+#define RTL930X_PRI_SEL_TBL_CTRL(group)		(0x9B28 + ((group) * 4))
+#define RTL931X_PRI_SEL_TBL_CTRL(group)		(0x9074 + ((group) * 8))
+
+#define RTL93XX_PRI_SEL_TBL_CTRL_OTAG_MASK	GENMASK(19, 16)
+#define RTL93XX_PRI_SEL_TBL_CTRL_ITAG_MASK	GENMASK(15, 12)
+#define RTL93XX_PRI_SEL_TBL_CTRL_DSCP_MASK	GENMASK(11, 8)
+#define RTL93XX_PRI_SEL_TBL_CTRL_PORT_MASK	GENMASK(3, 0)
+
+/* port: 0-23, index: 0-7 */
+#define RTL930X_SCHED_PORT_Q_CTRL_SET0(port, index) \
+						(0x3D48 + ((port) * 384) + ((index) * 4))
+/* port: 24-27, index: 0-11 */
+#define RTL930X_SCHED_PORT_Q_CTRL_SET1(port, index) \
+						((0xE860 + ((port) - 24) * 48) + ((index) * 4))
+/* port: 0-51, index: 0-7 */
+#define RTL931X_SCHED_PORT_Q_CTRL_SET0(port, index) \
+						(0x2888 + ((port) << 5) + ((index) * 4))
+/* port: 52-55, index: 0-11 */
+#define RTL931X_SCHED_PORT_Q_CTRL_SET1(port, index) \
+						((0x2F08 + ((port) - 52) * 48) + ((index) * 4))
+
+#define RTL930X_QM_INTPRI2QID_CTRL		(0xA320)
+#define RTL931X_QM_INTPRI2QID_CTRL		(0xA9D0)
+
+#define MAX_PRIOS 8
+#define DSCP_MAP_MAX 64
+
 enum scheduler_type {
 	WEIGHTED_FAIR_QUEUE = 0,
 	WEIGHTED_ROUND_ROBIN,
@@ -43,7 +115,7 @@ static void rtl839x_read_out_q_table(int port)
 	rtl839x_exec_tbl2_cmd(cmd);
 }
 
-u32 rtldsa_838x_get_egress_rate(struct rtl838x_switch_priv *priv, int port)
+u32 rtldsa_838x_get_egress_rate(struct otto_dsa_priv *priv, int port)
 {
 	if (port > priv->r->cpu_port)
 		return 0;
@@ -52,7 +124,7 @@ u32 rtldsa_838x_get_egress_rate(struct rtl838x_switch_priv *priv, int port)
 }
 
 /* Sets the rate limit, 10MBit/s is equal to a rate value of 625 */
-int rtldsa_838x_set_egress_rate(struct rtl838x_switch_priv *priv, int port, u32 rate)
+int rtldsa_838x_set_egress_rate(struct otto_dsa_priv *priv, int port, u32 rate)
 {
 	u32 old_rate;
 
@@ -66,7 +138,7 @@ int rtldsa_838x_set_egress_rate(struct rtl838x_switch_priv *priv, int port, u32 
 }
 
 /* Sets the rate limit, 10MBit/s is equal to a rate value of 625 */
-u32 rtldsa_839x_get_egress_rate(struct rtl838x_switch_priv *priv, int port)
+u32 rtldsa_839x_get_egress_rate(struct otto_dsa_priv *priv, int port)
 {
 	u32 rate;
 
@@ -88,7 +160,7 @@ u32 rtldsa_839x_get_egress_rate(struct rtl838x_switch_priv *priv, int port)
 }
 
 /* Sets the rate limit, 10MBit/s is equal to a rate value of 625, returns previous rate */
-int rtldsa_839x_set_egress_rate(struct rtl838x_switch_priv *priv, int port, u32 rate)
+int rtldsa_839x_set_egress_rate(struct otto_dsa_priv *priv, int port, u32 rate)
 {
 	u32 old_rate;
 
@@ -173,7 +245,7 @@ static void rtldsa_839x_set_ingress_priority(int port, int priority)
 	sw_w32_mask(7 << shift, priority << shift, RTL839X_PRI_SEL_PORT_PRI(port));
 }
 
-static int rtl839x_get_scheduling_algorithm(struct rtl838x_switch_priv *priv, int port)
+static int rtl839x_get_scheduling_algorithm(struct otto_dsa_priv *priv, int port)
 {
 	u32 v;
 
@@ -190,7 +262,7 @@ static int rtl839x_get_scheduling_algorithm(struct rtl838x_switch_priv *priv, in
 	return WEIGHTED_FAIR_QUEUE;
 }
 
-static void rtl839x_set_scheduling_algorithm(struct rtl838x_switch_priv *priv, int port,
+static void rtl839x_set_scheduling_algorithm(struct otto_dsa_priv *priv, int port,
 					     enum scheduler_type sched)
 {
 	enum scheduler_type t = rtl839x_get_scheduling_algorithm(priv, port);
@@ -248,7 +320,7 @@ static void rtl839x_set_scheduling_algorithm(struct rtl838x_switch_priv *priv, i
 	mutex_unlock(&priv->reg_mutex);
 }
 
-static void rtl839x_set_scheduling_queue_weights(struct rtl838x_switch_priv *priv, int port,
+static void rtl839x_set_scheduling_queue_weights(struct otto_dsa_priv *priv, int port,
 						 int *queue_weights)
 {
 	mutex_lock(&priv->reg_mutex);
@@ -272,7 +344,7 @@ static void rtl839x_set_scheduling_queue_weights(struct rtl838x_switch_priv *pri
 	mutex_unlock(&priv->reg_mutex);
 }
 
-void rtldsa_838x_qos_init(struct rtl838x_switch_priv *priv)
+void rtldsa_838x_qos_init(struct otto_dsa_priv *priv)
 {
 	u32 v;
 
@@ -317,7 +389,7 @@ void rtldsa_838x_qos_init(struct rtl838x_switch_priv *priv)
 	sw_w32_mask(0, 7, RTL838X_QM_PKT2CPU_INTPRI_1);
 }
 
-void rtldsa_839x_qos_init(struct rtl838x_switch_priv *priv)
+void rtldsa_839x_qos_init(struct otto_dsa_priv *priv)
 {
 	u32 v;
 
@@ -401,7 +473,7 @@ static void rtldsa_930x_qos_prio2queue_matrix(int *min_queues)
 	sw_w32(v, RTL930X_QM_INTPRI2QID_CTRL);
 }
 
-static void rtldsa_930x_qos_set_scheduling_queue_weights(struct rtl838x_switch_priv *priv)
+static void rtldsa_930x_qos_set_scheduling_queue_weights(struct otto_dsa_priv *priv)
 {
 	struct dsa_port *dp;
 	u32 addr;
@@ -418,7 +490,7 @@ static void rtldsa_930x_qos_set_scheduling_queue_weights(struct rtl838x_switch_p
 	}
 }
 
-void rtldsa_930x_qos_init(struct rtl838x_switch_priv *priv)
+void rtldsa_930x_qos_init(struct otto_dsa_priv *priv)
 {
 	struct dsa_port *dp;
 	u32 v;
@@ -473,7 +545,7 @@ static void rtldsa_931x_qos_prio2queue_matrix(int *min_queues)
 	sw_w32(v, RTL931X_QM_INTPRI2QID_CTRL);
 }
 
-static void rtldsa_931x_qos_set_scheduling_queue_weights(struct rtl838x_switch_priv *priv)
+static void rtldsa_931x_qos_set_scheduling_queue_weights(struct otto_dsa_priv *priv)
 {
 	struct dsa_port *dp;
 	u32 addr;
@@ -490,7 +562,7 @@ static void rtldsa_931x_qos_set_scheduling_queue_weights(struct rtl838x_switch_p
 	}
 }
 
-void rtldsa_931x_qos_init(struct rtl838x_switch_priv *priv)
+void rtldsa_931x_qos_init(struct otto_dsa_priv *priv)
 {
 	struct dsa_port *dp;
 	u32 v;

@@ -891,7 +891,7 @@ $(eval $(call KernelPackage,dsa-mxl862xx))
 define KernelPackage/dsa-qca8k
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Qualcomm Atheros QCA8xxx switch family DSA support
-  DEPENDS:=+kmod-dsa +kmod-regmap-core +!LINUX_6_12:kmod-mdio-devres
+  DEPENDS:=+kmod-dsa +kmod-phy-qca83xx +kmod-regmap-core +!LINUX_6_12:kmod-mdio-devres
   KCONFIG:= \
 	CONFIG_NET_DSA_QCA8K \
 	CONFIG_NET_DSA_QCA8K_LEDS_SUPPORT=y \
@@ -2012,6 +2012,7 @@ define KernelPackage/mlx5-core
 	CONFIG_MLX5_FPGA=n \
 	CONFIG_MLX5_FPGA_IPSEC=n \
 	CONFIG_MLX5_FPGA_TLS=n \
+	CONFIG_MLX5_MACSEC=y \
 	CONFIG_MLX5_MPFS=y \
 	CONFIG_MLX5_SW_STEERING=n \
 	CONFIG_MLX5_HW_STEERING=n \
