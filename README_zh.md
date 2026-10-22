@@ -4,6 +4,17 @@
 
 PonWrt 基于 [ImmortalWrt](https://github.com/immortalwrt/immortalwrt)，增加了对 Airoha AN7581 和 AN7583 PON 设备的支持。
 
+## HWTC 控制通路延迟分支
+
+本分支整合 `master` 至 `edaeeb300c9d`，包含 Linux 6.18.55、Airoha 温控、
+可选 fraglist GRO 及板级 PHY/端口 LED 修复。PON 驱动与用户态仍固定为
+`67df6ec6` 和 `70302c96`，从公开的 `pbs05` 仓库获取，不回退到旧的 `main`。
+已有构建目录应检查优先于 `feeds.conf.default` 的本地 `feeds.conf` 及实际 feed 提交。
+PPE 映射更新保留互斥和受影响流失效处理；仅保留全部旧硬件路径时异步回收流表，
+撤销路径时仍等待加速 RCU 宽限期。需要重新编译内核及 feeds，并验证完整补丁栈、
+两种目标固件和实机行为；不能仅凭合并成功或短暂 O5 判断问题已解决。
+详见 [英文分支说明](README.md#hwtc-o5-investigation-branch)。
+
 ## ⚠️ 免责声明
 
 PonWrt 是一个用于研究和开发的开源光猫固件项目。

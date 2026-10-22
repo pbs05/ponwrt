@@ -43,30 +43,38 @@ Signed-off-by: pbs05 <27010143+pbs05@users.noreply.github.com>
  			  u16 hash, bool rx_wlan);
 --- a/drivers/net/ethernet/airoha/airoha_eth.c
 +++ b/drivers/net/ethernet/airoha/airoha_eth.c
-@@ -3936,11 +3936,33 @@ drop:
+@@ -4139,14 +4139,43 @@ static bool airoha_pon_paths_retained(
+ 	return true;
  }
- EXPORT_SYMBOL_GPL(airoha_eth_pon_xmit_control);
  
 +static void
 +airoha_eth_pon_commit_config(struct airoha_gdm_dev *dev,
 +			     struct airoha_pon_flow_table *table, u32 qdma_tag)
 +{
 +	struct airoha_pon_flow_table *old;
++	u32 old_tag;
 +
 +	/* PPE resolves mappings and builds FOEs under flow_offload_mutex.
 +	 * Mapping replacement and FOE removal share one critical section.
 +	 * Concurrent FLOW_CLS_REPLACE observes the current bearer metadata.
-+	 * synchronize_net() later drains software readers of the old table.
++	 * Drain software readers before the caller retires hardware paths.
 +	 */
 +	mutex_lock(&flow_offload_mutex);
++	old_tag = READ_ONCE(dev->pon_qdma_tag);
 +	old = rcu_replace_pointer(dev->pon_flow_table, table,
 +				  lockdep_is_held(&flow_offload_mutex));
 +	WRITE_ONCE(dev->pon_qdma_tag, qdma_tag);
 +	airoha_ppe_remove_egress_flows(dev);
 +	mutex_unlock(&flow_offload_mutex);
 +
-+	synchronize_net();
-+	kfree(old);
++	/* Classification-only updates must not stall OMCI/PLOAM. */
++	if (!old_tag && airoha_pon_paths_retained(old, table)) {
++		if (old)
++			kfree_rcu(old, rcu);
++	} else {
++		synchronize_rcu_expedited();
++		kfree(old);
++	}
 +}
 +
  int airoha_eth_pon_replace_flows(
@@ -77,20 +85,33 @@ Signed-off-by: pbs05 <27010143+pbs05@users.noreply.github.com>
 +	struct airoha_pon_flow_table *table = NULL;
  	struct airoha_gdm_dev *dev;
  	unsigned int i, j;
+-	u32 old_tag;
  
-@@ -3984,10 +4006,7 @@ int airoha_eth_pon_replace_flows(
+ 	if (!netdev || netdev->netdev_ops != &airoha_netdev_ops)
+ 		return -EINVAL;
+@@ -4190,20 +4219,7 @@ int airoha_eth_pon_replace_flows(
  		}
  	}
  
+-	old_tag = READ_ONCE(dev->pon_qdma_tag);
 -	old = rcu_replace_pointer(dev->pon_flow_table, table, true);
 -	WRITE_ONCE(dev->pon_qdma_tag, 0);
--	synchronize_net();
--	kfree(old);
+-	/* Classification updates must not block OMCI/PLOAM while all old
+-	 * GEM/T-CONT paths remain usable. Retire only the table asynchronously.
+-	 */
+-	if (!old_tag && airoha_pon_paths_retained(old, table)) {
+-		if (old)
+-			kfree_rcu(old, rcu);
+-	} else {
+-		/* The caller may retire hardware immediately after this returns. */
+-		synchronize_rcu_expedited();
+-		kfree(old);
+-	}
 +	airoha_eth_pon_commit_config(dev, table, 0);
  	return 0;
  }
  EXPORT_SYMBOL_GPL(airoha_eth_pon_replace_flows);
-@@ -4020,12 +4039,11 @@ int airoha_eth_pon_configure_epon(struct
+@@ -4236,12 +4252,11 @@ int airoha_eth_pon_configure_epon(struct
  		return -EOPNOTSUPP;
  	if (valid && channel >= 32)
  		return -ERANGE;
