@@ -330,9 +330,9 @@ generate_static_system() {
 		set system.ntp.enabled='1'
 		set system.ntp.enable_server='0'
 		add_list system.ntp.server='time.apple.com'
-		add_list system.ntp.server='time1.google.com'
-		add_list system.ntp.server='time.cloudflare.com'
-		add_list system.ntp.server='pool.ntp.org'
+		add_list system.ntp.server='ntp.aliyun.com'
+		add_list system.ntp.server='ntp.tencent.com'
+		add_list system.ntp.server='ntp1.ntsc.ac.cn'
 	EOF
 
 	if json_is_a system object; then
