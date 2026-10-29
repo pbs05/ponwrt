@@ -1,0 +1,9 @@
+#!/bin/sh
+# 触发点1：接口 up 时应用 IPTV 机顶盒修复（开机 / network reload / ifup）
+[ "$ACTION" = "ifup" ] || exit 0
+case "$INTERFACE" in
+	luci_iptv|lan) ;;
+	*) exit 0 ;;
+esac
+[ -x /usr/libexec/iptv-stb-fix ] && /usr/libexec/iptv-stb-fix
+exit 0

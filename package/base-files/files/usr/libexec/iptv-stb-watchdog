@@ -1,0 +1,33 @@
+#!/bin/sh
+# 触发点4：常驻守护（轮询兜底）
+# 原因：netifd 的 `ubus call network reload` / `/etc/init.d/network reload` 不会发出
+#       iface hotplug 事件，却会重建网桥端口并把 MAC 学习重置为 on —— 实测确认过。
+#       只能靠轮询发现并重新关闭。
+CONF=/etc/iptv-stb-fix.conf
+MC_PORT=ct-iptv-mc
+BRIDGE=br-iptv
+[ -r "$CONF" ] && . "$CONF"
+
+BR=/usr/sbin/bridge
+[ -x "$BR" ] || BR=$(command -v bridge) || exit 0
+
+INTERVAL=${IPTV_STB_WATCHDOG_INTERVAL:-15}
+while :; do
+	sleep "$INTERVAL"
+	[ -e "/sys/class/net/$MC_PORT" ] || continue
+
+	if $BR -d link show dev "$MC_PORT" 2>/dev/null | grep -q "learning on"; then
+		logger -t iptv-stb "watchdog: $MC_PORT 的 MAC 学习被重置为 on，重新关闭"
+		/usr/libexec/iptv-stb-fix
+		continue
+	fi
+
+	# 学习虽然已关闭，但 reload 瞬间可能已学进了组播口的单播 MAC（例如网关 MAC）。
+	# 这类残留会让盒子的单播在一段时间内仍被送错端口，这里周期性清掉。
+	$BR fdb show br "$BRIDGE" 2>/dev/null | grep "dev $MC_PORT " | grep -v permanent | \
+	while read -r mac _rest; do
+		[ -n "$mac" ] || continue
+		$BR fdb del "$mac" dev "$MC_PORT" 2>/dev/null && \
+			logger -t iptv-stb "watchdog: 清除 $MC_PORT 上的残留单播表项 $mac"
+	done
+done
