@@ -183,6 +183,22 @@ endef
 $(eval $(call KernelPackage,libeth))
 
 
+define KernelPackage/libeth-xdp
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=Common Intel Ethernet XDP library
+  DEPENDS:=+kmod-libeth
+  KCONFIG:=CONFIG_LIBETH_XDP
+  HIDDEN:=1
+  FILES:=$(LINUX_DIR)/drivers/net/ethernet/intel/libeth/libeth_xdp.ko
+endef
+
+define KernelPackage/libeth-xdp/description
+ Common Intel Ethernet XDP library
+endef
+
+$(eval $(call KernelPackage,libeth-xdp))
+
+
 define KernelPackage/libphy
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=PHY library
@@ -190,8 +206,8 @@ define KernelPackage/libphy
 	   CONFIG_PHYLIB_LEDS=y \
 	   CONFIG_MDIO_BUS
   FILES:=$(LINUX_DIR)/drivers/net/phy/libphy.ko \
-    $(LINUX_DIR)/drivers/net/phy/mdio-bus.ko@ge6.18
-  AUTOLOAD:=$(call AutoLoad,15,libphy mdio-bus@ge6.18,1)
+    $(LINUX_DIR)/drivers/net/phy/mdio-bus.ko
+  AUTOLOAD:=$(call AutoLoad,15,libphy mdio-bus,1)
 endef
 
 define KernelPackage/libphy/description
@@ -378,6 +394,7 @@ define KernelPackage/phy-ax88796b
    DEPENDS:=+kmod-libphy
    FILES:=$(LINUX_DIR)/drivers/net/phy/ax88796b.ko
    AUTOLOAD:=$(call AutoProbe,ax88796b)
+   DEFAULT_VARIANT:=1
 endef
 
 define KernelPackage/phy-ax88796b/description
@@ -386,6 +403,27 @@ define KernelPackage/phy-ax88796b/description
 endef
 
 $(eval $(call KernelPackage,phy-ax88796b))
+
+
+define KernelPackage/phy-ax88796b-rust
+   SUBMENU:=$(NETWORK_DEVICES_MENU)
+   TITLE:=Asix PHY driver written in Rust
+   KCONFIG:= \
+	CONFIG_AX88796B_RUST_PHY \
+	CONFIG_PHYLIB=y \
+	CONFIG_RUST_PHYLIB_ABSTRACTIONS=y
+   DEPENDS:=@KERNEL_RUST
+   PROVIDES:=kmod-phy-ax88796b
+   FILES:=$(LINUX_DIR)/drivers/net/phy/ax88796b_rust.ko
+   AUTOLOAD:=$(call AutoProbe,ax88796b_rust)
+endef
+
+define KernelPackage/phy-ax88796b-rust/description
+   The Rust reference driver for the Asix Electronics PHYs, equivalent to
+   kmod-phy-ax88796b and installable in its place.
+endef
+
+$(eval $(call KernelPackage,phy-ax88796b-rust))
 
 
 define KernelPackage/phy-broadcom
@@ -656,7 +694,7 @@ $(eval $(call KernelPackage,phy-aquantia))
 define KernelPackage/phy-motorcomm
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Motorcomm Ethernet PHYs
-  DEPENDS:=+kmod-libphy
+  DEPENDS:=+kmod-libphy +kmod-phy-package
   KCONFIG:=CONFIG_MOTORCOMM_PHY
   FILES:=$(LINUX_DIR)/drivers/net/phy/motorcomm.ko
   AUTOLOAD:=$(call AutoLoad,18,motorcomm,1)
@@ -1517,7 +1555,7 @@ $(eval $(call KernelPackage,i40e))
 define KernelPackage/ice
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Intel(R) Ethernet Controller E810 Series support
-  DEPENDS:=@PCI_SUPPORT +kmod-ptp +kmod-hwmon-core +kmod-libie +kmod-libie-adminq +kmod-libie-fwlog
+  DEPENDS:=@PCI_SUPPORT +kmod-ptp +kmod-hwmon-core +kmod-libie +kmod-libie-adminq +kmod-libie-fwlog +kmod-libeth-xdp
   KCONFIG:=CONFIG_ICE \
     CONFIG_ICE_HWMON=y \
     CONFIG_ICE_HWTS=y \
@@ -1598,7 +1636,7 @@ define KernelPackage/pcnet32
   DEPENDS:=@(PCI_SUPPORT||TARGET_malta) +kmod-mii
   KCONFIG:=CONFIG_PCNET32
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/amd/pcnet32.ko
-  AUTOLOAD:=$(call AutoProbe,pcnet32)
+  AUTOLOAD:=$(call AutoProbe,pcnet32,1)
 endef
 
 define KernelPackage/pcnet32/description
@@ -2285,7 +2323,7 @@ $(eval $(call KernelPackage,hinic))
 define KernelPackage/hinic3
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Huawei 3rd generation network adapters (HINIC3) support
-  DEPENDS:=@PCI_SUPPORT @(TARGET_armsr_armv8||TARGET_loongarch64||TARGET_x86) @LINUX_6_18
+  DEPENDS:=@PCI_SUPPORT @(TARGET_armsr_armv8||TARGET_loongarch64||TARGET_x86)
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/huawei/hinic3/hinic3.ko
   KCONFIG:=CONFIG_HINIC3
   AUTOLOAD:=$(call AutoProbe,hinic3)
@@ -2477,7 +2515,7 @@ $(eval $(call KernelPackage,lan743x))
 define KernelPackage/amazon-ena
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Elastic Network Adapter (for Amazon AWS)
-  DEPENDS:=@TARGET_x86_64||TARGET_armsr +LINUX_6_18:kmod-ptp
+  DEPENDS:=@TARGET_x86_64||TARGET_armsr +kmod-ptp
   KCONFIG:=CONFIG_ENA_ETHERNET
   FILES:=$(LINUX_DIR)/drivers/net/ethernet/amazon/ena/ena.ko
   AUTOLOAD:=$(call AutoLoad,12,ena)

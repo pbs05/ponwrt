@@ -166,8 +166,7 @@ define KernelPackage/mlxreg
 	CONFIG_SENSORS_MLXREG_FAN \
 	CONFIG_LEDS_MLXREG
   FILES:= \
-	$(LINUX_DIR)/drivers/platform/x86/mlx-platform.ko@lt6.18 \
-	$(LINUX_DIR)/drivers/platform/mellanox/mlx-platform.ko@ge6.18 \
+	$(LINUX_DIR)/drivers/platform/mellanox/mlx-platform.ko \
 	$(LINUX_DIR)/drivers/platform/mellanox/mlxreg-hotplug.ko \
 	$(LINUX_DIR)/drivers/platform/mellanox/mlxreg-io.ko \
 	$(LINUX_DIR)/drivers/hwmon/mlxreg-fan.ko \
@@ -408,7 +407,7 @@ $(eval $(call KernelPackage,softdog))
 define KernelPackage/ssb
   SUBMENU:=$(OTHER_MENU)
   TITLE:=Silicon Sonics Backplane glue code
-  DEPENDS:=@PCI_SUPPORT @!TARGET_bcm47xx @!TARGET_bcm63xx
+  DEPENDS:=@PCI_SUPPORT @!TARGET_bcm47xx
   KCONFIG:=\
 	CONFIG_SSB \
 	CONFIG_SSB_B43_PCI_BRIDGE=y \
@@ -632,7 +631,7 @@ define KernelPackage/serial-8250-exar
   TITLE:=Exar 8250 UARTs
   KCONFIG:= CONFIG_SERIAL_8250_EXAR
   FILES:=$(LINUX_DIR)/drivers/tty/serial/8250/8250_exar.ko
-  AUTOLOAD:=$(call AutoProbe,8250 8250_base 8250_exar)
+  AUTOLOAD:=$(call AutoProbe,8250_exar)
   DEPENDS:=@PCI_SUPPORT +kmod-serial-8250 +kmod-eeprom-93cx6
 endef
 
@@ -641,6 +640,24 @@ define KernelPackage/serial-8250-exar/description
 endef
 
 $(eval $(call KernelPackage,serial-8250-exar))
+
+
+define KernelPackage/serial-sc16is7xx
+  SUBMENU:=$(OTHER_MENU)
+  TITLE:=NXP SC16IS7xx SPI UARTs
+  KCONFIG:=CONFIG_SERIAL_SC16IS7XX
+  FILES:= \
+	$(LINUX_DIR)/drivers/tty/serial/sc16is7xx.ko \
+	$(LINUX_DIR)/drivers/tty/serial/sc16is7xx_spi.ko
+  AUTOLOAD:=$(call AutoProbe,sc16is7xx sc16is7xx_spi)
+  DEPENDS:=+kmod-regmap-spi
+endef
+
+define KernelPackage/serial-sc16is7xx/description
+ Kernel module for the NXP SC16IS7xx single and dual UART bridges on SPI.
+endef
+
+$(eval $(call KernelPackage,serial-sc16is7xx))
 
 
 define KernelPackage/regmap-core
@@ -874,8 +891,7 @@ define KernelPackage/ptp-qoriq
   TITLE:=Freescale QorIQ PTP support
   DEPENDS:=@(TARGET_mpc85xx||TARGET_qoriq) +kmod-ptp
   KCONFIG:=CONFIG_PTP_1588_CLOCK_QORIQ
-  FILES:=$(LINUX_DIR)/drivers/ptp/ptp-qoriq.ko@lt6.18 \
-	$(LINUX_DIR)/drivers/ptp/ptp_qoriq.ko@ge6.18
+  FILES:=$(LINUX_DIR)/drivers/ptp/ptp_qoriq.ko
   AUTOLOAD:=$(call AutoProbe,ptp-qoriq)
 endef
 
@@ -899,6 +915,27 @@ define KernelPackage/random-core/description
 endef
 
 $(eval $(call KernelPackage,random-core))
+
+
+define KernelPackage/seg-led-gpio
+  SUBMENU:=$(OTHER_MENU)
+  TITLE:=GPIO seven-segment display support
+  DEPENDS:=@GPIO_SUPPORT
+  KCONFIG:= \
+	CONFIG_AUXDISPLAY=y \
+	CONFIG_LINEDISP \
+	CONFIG_SEG_LED_GPIO
+  FILES:= \
+	$(LINUX_DIR)/drivers/auxdisplay/line-display.ko \
+	$(LINUX_DIR)/drivers/auxdisplay/seg-led-gpio.ko
+  AUTOLOAD:=$(call AutoProbe,seg-led-gpio)
+endef
+
+define KernelPackage/seg-led-gpio/description
+  Support for seven-segment displays connected to GPIO pins.
+endef
+
+$(eval $(call KernelPackage,seg-led-gpio))
 
 
 define KernelPackage/thermal
@@ -1044,7 +1081,7 @@ define KernelPackage/keys-trusted
   DEPENDS:=@KERNEL_KEYS +kmod-crypto-hash +kmod-crypto-hmac +kmod-crypto-sha1 +kmod-tpm
   KCONFIG:=CONFIG_TRUSTED_KEYS
   FILES:= $(LINUX_DIR)/security/keys/trusted-keys/trusted.ko
-  AUTOLOAD:=$(call AutoLoad,01,trusted-keys,1)
+  AUTOLOAD:=$(call AutoLoad,01,trusted,1)
 endef
 
 define KernelPackage/keys-trusted/description

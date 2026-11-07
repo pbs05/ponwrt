@@ -7,17 +7,6 @@
 
 struct otto_dsa_priv;
 struct rtl838x_l2_entry;
-struct rtldsa_l2_uc;
-struct otto_l3_nexthop;
-
-enum rtldsa_flood_type {
-	RTLDSA_FLOOD_TYPE_FORWARD = 0,
-	RTLDSA_FLOOD_TYPE_DROP,
-	RTLDSA_FLOOD_TYPE_TRAP2CPU,
-	RTLDSA_FLOOD_TYPE_COPY2CPU,
-	RTLDSA_FLOOD_TYPE_TRAP2MASTER,
-	RTLDSA_FLOOD_TYPE_COPY2MASTER,
-};
 
 #define RTL838X_PORT_ISO_CTRL(port)		(0x4100 + ((port) << 2))
 
@@ -57,73 +46,73 @@ enum rtldsa_flood_type {
 #define RTL931X_MC_PMASK_ALL_PORTS (GENMASK_ULL(RTL931X_CPU_PORT, 0))
 #define MC_PMASK_ALL_PORTS_IDX	((MAX_MC_PMASKS - 1))
 
-#define RTLDSA_L2_L3_REFCOUNT_MAX	0x7fff
-
 /* Returns the L2 ageing time in seconds. */
 int otto_l2_get_ageing_time(struct otto_dsa_priv *priv);
 int otto_l2_find_hash_entry(struct otto_dsa_priv *priv, u64 seed,
 			    bool must_exist, struct rtl838x_l2_entry *e);
 int otto_l2_find_cam_entry(struct otto_dsa_priv *priv, u64 seed,
 			   bool must_exist, struct rtl838x_l2_entry *e);
-struct rtldsa_l2_uc *otto_l2_uc_lookup(struct otto_dsa_priv *priv, int idx);
-
-int otto_l2_nexthop_add(struct otto_dsa_priv *priv, struct otto_l3_nexthop *nh);
-int otto_l2_nexthop_del(struct otto_dsa_priv *priv, struct otto_l3_nexthop *nh);
-bool otto_l2_nexthop_current(struct otto_dsa_priv *priv, struct otto_l3_nexthop *nh);
 
 u64 otto_l2_838x_hash_seed(u64 mac, u32 vid);
 u32 otto_l2_838x_hash_key(struct otto_dsa_priv *priv, u64 seed);
 int otto_l2_838x_port_new_salrn(int p);
 int otto_l2_838x_port_new_sa_fwd(int p);
 u64 otto_l2_838x_read_entry_using_hash(u32 hash, u32 pos, struct rtl838x_l2_entry *e);
-void otto_l2_838x_write_entry_using_hash(u32 hash, u32 pos, struct rtl838x_l2_entry *e);
+void otto_l2_838x_write_entry_using_hash(struct otto_dsa_priv *priv,
+					 u32 hash, u32 pos, struct rtl838x_l2_entry *e);
 u64 otto_l2_838x_read_cam(int idx, struct rtl838x_l2_entry *e);
 void otto_l2_838x_write_cam(int idx, struct rtl838x_l2_entry *e);
 u64 otto_l2_838x_read_mcast_pmask(int idx);
 void otto_l2_838x_write_mcast_pmask(int idx, u64 portmask);
-void otto_l2_838x_learning_setup(void);
-void otto_l2_838x_enable_learning(int port, bool enable);
-void otto_l2_838x_enable_flood(int port, enum rtldsa_flood_type mode);
-void otto_l2_838x_enable_mcast_flood(int port, bool enable);
-void otto_l2_838x_enable_bcast_flood(int port, bool enable);
-void otto_l2_838x_set_static_move_action(int port, bool forward);
+void otto_l2_838x_learning_setup(struct otto_dsa_priv *priv);
+void otto_l2_838x_enable_learning(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_838x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap);
+void otto_l2_838x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_838x_enable_mcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_838x_enable_bcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_838x_set_static_move_action(struct otto_dsa_priv *priv,
+					 int port, bool forward);
 int otto_l2_838x_fast_age(struct otto_dsa_priv *priv, int port, int vid);
-int otto_l2_838x_set_ageing_time(unsigned long msec);
+int otto_l2_838x_set_ageing_time(struct otto_dsa_priv *priv, unsigned long msec);
 u64 otto_l2_839x_hash_seed(u64 mac, u32 vid);
 u32 otto_l2_839x_hash_key(struct otto_dsa_priv *priv, u64 seed);
 int otto_l2_839x_port_new_salrn(int p);
 int otto_l2_839x_port_new_sa_fwd(int p);
 u64 otto_l2_839x_read_entry_using_hash(u32 hash, u32 pos, struct rtl838x_l2_entry *e);
-void otto_l2_839x_write_entry_using_hash(u32 hash, u32 pos, struct rtl838x_l2_entry *e);
+void otto_l2_839x_write_entry_using_hash(struct otto_dsa_priv *priv,
+					 u32 hash, u32 pos, struct rtl838x_l2_entry *e);
 u64 otto_l2_839x_read_cam(int idx, struct rtl838x_l2_entry *e);
 void otto_l2_839x_write_cam(int idx, struct rtl838x_l2_entry *e);
 u64 otto_l2_839x_read_mcast_pmask(int idx);
 void otto_l2_839x_write_mcast_pmask(int idx, u64 portmask);
-void otto_l2_839x_learning_setup(void);
-void otto_l2_839x_enable_learning(int port, bool enable);
-void otto_l2_839x_enable_flood(int port, enum rtldsa_flood_type mode);
-void otto_l2_839x_enable_mcast_flood(int port, bool enable);
-void otto_l2_839x_enable_bcast_flood(int port, bool enable);
-void otto_l2_839x_set_static_move_action(int port, bool forward);
+void otto_l2_839x_learning_setup(struct otto_dsa_priv *priv);
+void otto_l2_839x_enable_learning(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_839x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap);
+void otto_l2_839x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_839x_enable_mcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_839x_enable_bcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_839x_set_static_move_action(struct otto_dsa_priv *priv,
+					 int port, bool forward);
 int otto_l2_839x_fast_age(struct otto_dsa_priv *priv, int port, int vid);
-int otto_l2_839x_set_ageing_time(unsigned long msec);
+int otto_l2_839x_set_ageing_time(struct otto_dsa_priv *priv, unsigned long msec);
 int otto_l2_930x_port_new_salrn(int p);
 int otto_l2_930x_port_new_sa_fwd(int p);
-void otto_l2_930x_learning_setup(void);
-void otto_l2_930x_enable_learning(int port, bool enable);
-void otto_l2_930x_set_port_new_sa_fwd(int port, enum rtldsa_flood_type mode);
-void otto_l2_930x_enable_flood(int port, enum rtldsa_flood_type mode);
-void otto_l2_930x_enable_bcast_flood(int port, bool enable);
+void otto_l2_930x_learning_setup(struct otto_dsa_priv *priv);
+void otto_l2_930x_enable_learning(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_930x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap);
+void otto_l2_930x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_930x_enable_bcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
 u64 otto_l2_930x_hash_seed(u64 mac, u32 vid);
 u32 otto_l2_930x_hash_key(struct otto_dsa_priv *priv, u64 seed);
 u64 otto_l2_930x_read_entry_using_hash(u32 hash, u32 pos, struct rtl838x_l2_entry *e);
-void otto_l2_930x_write_entry_using_hash(u32 hash, u32 pos, struct rtl838x_l2_entry *e);
+void otto_l2_930x_write_entry_using_hash(struct otto_dsa_priv *priv,
+					 u32 hash, u32 pos, struct rtl838x_l2_entry *e);
 u64 otto_l2_930x_read_cam(int idx, struct rtl838x_l2_entry *e);
 void otto_l2_930x_write_cam(int idx, struct rtl838x_l2_entry *e);
 u64 otto_l2_930x_read_mcast_pmask(int idx);
 void otto_l2_930x_write_mcast_pmask(int idx, u64 portmask);
 int otto_l2_930x_fast_age(struct otto_dsa_priv *priv, int port, int vid);
-int otto_l2_930x_set_ageing_time(unsigned long msec);
+int otto_l2_930x_set_ageing_time(struct otto_dsa_priv *priv, unsigned long msec);
 int otto_l2_931x_port_new_salrn(int p);
 int otto_l2_931x_port_new_sa_fwd(int p);
 u64 otto_l2_931x_hash_seed(u64 mac, u32 vid);
@@ -131,17 +120,16 @@ u32 otto_l2_931x_hash_key(struct otto_dsa_priv *priv, u64 seed);
 u64 otto_l2_931x_read_entry_using_hash(u32 hash, u32 pos, struct rtl838x_l2_entry *e);
 u64 otto_l2_931x_read_cam(int idx, struct rtl838x_l2_entry *e);
 void otto_l2_931x_write_cam(int idx, struct rtl838x_l2_entry *e);
-void otto_l2_931x_write_entry_using_hash(u32 hash, u32 pos, struct rtl838x_l2_entry *e);
-void otto_l2_931x_learning_setup(void);
-void otto_l2_931x_enable_learning(int port, bool enable);
-void otto_l2_931x_set_port_new_sa_fwd(int port, enum rtldsa_flood_type mode);
-void otto_l2_931x_enable_flood(int port, enum rtldsa_flood_type mode);
-void otto_l2_931x_enable_bcast_flood(int port, bool enable);
+void otto_l2_931x_write_entry_using_hash(struct otto_dsa_priv *priv,
+					 u32 hash, u32 pos, struct rtl838x_l2_entry *e);
+void otto_l2_931x_learning_setup(struct otto_dsa_priv *priv);
+void otto_l2_931x_enable_learning(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_931x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap);
+void otto_l2_931x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable);
+void otto_l2_931x_enable_bcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
 u64 otto_l2_931x_read_mcast_pmask(int idx);
 void otto_l2_931x_write_mcast_pmask(int idx, u64 portmask);
-int otto_l2_931x_set_ageing_time(unsigned long msec);
+int otto_l2_931x_set_ageing_time(struct otto_dsa_priv *priv, unsigned long msec);
 int otto_l2_931x_fast_age(struct otto_dsa_priv *priv, int port, int vid);
-
-void otto_l2_dbgfs_init(struct otto_dsa_priv *priv);
 
 #endif /* _OTTO_L2_H */
