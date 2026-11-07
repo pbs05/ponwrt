@@ -394,7 +394,7 @@ Signed-off-by: pbs05 <27010143+pbs05@users.noreply.github.com>
 +			   airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(i)));
 +		seq_printf(m, "ppe%u_table_cfg: %08x\n", i,
 +			   airoha_fe_rr(eth, REG_PPE_TB_CFG(i)));
-+		seq_printf(m, "ppe%u_gdm2_default_cpu_port: %u\n", i,
++		seq_printf(m, "ppe%u_gdm2_default_cpu_port: %lu\n", i,
 +			   FIELD_GET(DFT_CPORT_MASK(AIROHA_GDM2_IDX), cport));
 +	}
 +

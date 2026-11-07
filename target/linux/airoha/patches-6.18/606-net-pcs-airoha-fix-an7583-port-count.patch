@@ -22,7 +22,7 @@ Signed-off-by: Robert Marko <robert.marko@sartura.hr>
  
 +	if (index >= priv->data->num_port)
 +		return dev_err_ptr_probe(dev, -EINVAL,
-+					 "invalid PCS index %d\n", index);
++					 "invalid PCS index %llu\n", index);
 +
  	return &priv->ports[index].pcs;
  }

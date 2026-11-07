@@ -21,7 +21,7 @@ to reprogram PPE_BIND_RATE on every PPE instance.
 +	for (i = 0; i < ppe->eth->soc->num_ppe; i++) {
 +		u32 rate = airoha_fe_rr(ppe->eth, REG_PPE_BIND_RATE(i));
 +
-+		seq_printf(m, "ppe%u: l2b=%u l3=%u\n", i,
++		seq_printf(m, "ppe%u: l2b=%lu l3=%lu\n", i,
 +			   FIELD_GET(PPE_BIND_RATE_L2B_BIND_MASK, rate),
 +			   FIELD_GET(PPE_BIND_RATE_BIND_MASK, rate));
 +	}
