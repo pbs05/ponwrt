@@ -238,7 +238,7 @@ Signed-off-by: Bohdan Chubuk <chbgdn@gmail.com>
 +		if (!pskb_may_pull(skb, offset + sizeof(struct ipv6hdr)))
 +			goto do_not_track;
  
- 		len = sizeof(struct ipv6hdr) + ntohs(ipv6_hdr(skb)->payload_len);
+ 		len = sizeof(struct ipv6hdr) + skb_ipv6_payload_len(skb);
 -		if (pskb_trim_rcsum(skb, len))
 -			return NF_ACCEPT;
 +		if (pppoe_len && pppoe_len != len)
