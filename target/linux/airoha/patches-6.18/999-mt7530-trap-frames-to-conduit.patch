@@ -19,18 +19,20 @@ user port are delivered to lldpd; without it, they are dropped.
 Fixes: 2b0229f67932 ("net: dsa: mt7530: Add EN7581 support")
 Signed-off-by: Tao Gong <gongtao0607@gmail.com>
 ---
- drivers/net/dsa/mt7530.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
+ drivers/net/dsa/mt7530.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
 
 --- a/drivers/net/dsa/mt7530.c
 +++ b/drivers/net/dsa/mt7530.c
-@@ -3163,7 +3163,8 @@
+@@ -3274,8 +3274,9 @@
  	 * forwarded to the numerically smallest CPU port whose conduit
  	 * interface is up.
  	 */
--	if (priv->id != ID_MT7530 && priv->id != ID_MT7621)
+-	if (priv->id != ID_MT7530 && priv->id != ID_MT7621 &&
+-	    priv->id != ID_EN7528)
 +	if (priv->id != ID_MT7530 && priv->id != ID_MT7621 &&
-+	    priv->id != ID_EN7581 && priv->id != ID_AN7583)
++	    priv->id != ID_EN7528 && priv->id != ID_EN7581 &&
++	    priv->id != ID_AN7583)
  		return;
  
  	mask = BIT(cpu_dp->index);
