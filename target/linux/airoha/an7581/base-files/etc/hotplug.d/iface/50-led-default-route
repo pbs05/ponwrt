@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+case "$ACTION" in
+	ifup|ifdown|ifupdate) ;;
+	*) exit 0 ;;
+esac
+
+[ "$(uci -q get system.@system[-1].leds_off)" = 1 ] && exit 0
+
+. /lib/functions.sh
+
+update_default_route_led() {
+	local trigger sysfs
+
+	config_get trigger "$1" trigger
+	[ "$trigger" = default-route ] || return 0
+	config_get sysfs "$1" sysfs
+	# Reapply only this LED, using current routes rather than event metadata.
+	# Any interface can add/remove the default route; names are not filters.
+	[ -n "$sysfs" ] && /etc/init.d/led start "$sysfs"
+	return 0
+}
+
+config_load system
+config_foreach update_default_route_led led
