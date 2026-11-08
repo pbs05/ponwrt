@@ -1,0 +1,560 @@
+From 72e31feba836d92def764b44ea46bc7711035ee3 Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:31:30 +0800
+Subject: [PATCH] net: airoha: carry DSCP hardware classes without changing skb
+ priority
+
+---
+ drivers/net/ethernet/airoha/Kconfig           |   7 +
+ drivers/net/ethernet/airoha/Makefile          |   1 +
+ drivers/net/ethernet/airoha/airoha_eth.c      |  51 ++++-
+ drivers/net/ethernet/airoha/airoha_eth.h      |   4 +
+ drivers/net/ethernet/airoha/airoha_ppe.c      |  16 +-
+ drivers/net/ethernet/airoha/airoha_qos_test.c | 189 ++++++++++++++++++
+ include/net/airoha_qos.h                      | 166 +++++++++++++++
+ 7 files changed, 429 insertions(+), 5 deletions(-)
+ create mode 100644 drivers/net/ethernet/airoha/airoha_qos_test.c
+ create mode 100644 include/net/airoha_qos.h
+
+diff --git a/drivers/net/ethernet/airoha/Kconfig b/drivers/net/ethernet/airoha/Kconfig
+index df76a9360..acc440451 100644
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -14,6 +14,13 @@ config NET_AIROHA_PRIORITY_KUNIT_TEST
+ 
+ if NET_VENDOR_AIROHA
+ 
++config NET_AIROHA_QOS_KUNIT_TEST
++	tristate "Airoha QoS metadata tests" if !KUNIT_ALL_TESTS
++	depends on KUNIT && INET
++	default KUNIT_ALL_TESTS
++	help
++	  Test hardware channel/ring separation and QoS metadata without hardware.
++
+ config NET_AIROHA_NPU
+ 	tristate "Airoha NPU support"
+ 	select WANT_DEV_COREDUMP
+diff --git a/drivers/net/ethernet/airoha/Makefile b/drivers/net/ethernet/airoha/Makefile
+index fdc3705ed..1ddf25804 100644
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -9,3 +9,4 @@ obj-$(CONFIG_NET_AIROHA) += airoha-eth.o
+ airoha-eth-y := airoha_eth.o airoha_ppe.o
+ airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
++obj-$(CONFIG_NET_AIROHA_QOS_KUNIT_TEST) += airoha_qos_test.o
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 5488d0be6..343cf9ed7 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2695,10 +2695,26 @@ static u16 airoha_dev_select_queue(struct net_device *netdev,
+ 	 * index, rely on port id otherwise. Select QoS queue based on the
+ 	 * skb priority.
+ 	 */
+-	channel = netdev_uses_dsa(netdev) ? skb_get_queue_mapping(skb) : port->id;
+-	channel = channel % AIROHA_NUM_QOS_CHANNELS;
+ 	queue = airoha_is_7581(dev->eth) ? airoha_priority_queue(skb->priority) :
+ 		skb->priority % AIROHA_NUM_QOS_QUEUES;
++	if (READ_ONCE(dev->eth->qos_dscp)) {
++		bool mtk = false;
++
++#if IS_ENABLED(CONFIG_NET_DSA)
++		if (netdev_uses_dsa(netdev))
++			mtk = netdev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_MTK;
++#endif
++		queue = airoha_qos_cpu_class(&dev->eth->qos_profile, skb, mtk, queue);
++	}
++	channel = netdev_uses_dsa(netdev) ? skb_get_queue_mapping(skb) : port->id;
++	channel = channel % AIROHA_NUM_QOS_CHANNELS;
++	if (READ_ONCE(dev->eth->qos_dscp) && airoha_is_lan_gdm_dev(dev)) {
++		struct airoha_qos_egress e;
++		int dsa = netdev_uses_dsa(netdev) ? skb_get_queue_mapping(skb) : -1;
++
++		if (!airoha_qos_resolve_egress(port->id, dev->nbq, dsa, -1, &e))
++			channel = e.ring_bank;
++	}
+ 	queue = channel * AIROHA_NUM_QOS_QUEUES + queue;
+ 
+ 	return queue < netdev->num_tx_queues ? queue : 0;
+@@ -2962,14 +2978,35 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 		 */
+ 		nboq = channel;
+ 	} else {
++		u8 channel = qid / AIROHA_NUM_QOS_QUEUES;
++
+ 		if (airoha_get_dsa_tag(skb, owner_netdev, &tag))
+ 			goto error_unlock;
++		nboq = dev->nbq;
++		if (READ_ONCE(dev->eth->qos_dscp) && airoha_is_lan_gdm_dev(dev)) {
++			struct airoha_qos_egress e;
++			int dsa = -1;
++
++			if (netdev_uses_dsa(owner_netdev)) {
++				u32 ports = tag & AIROHA_STAG_PORTS;
++
++				if (!is_power_of_2(ports))
++					goto error_unlock;
++				dsa = __ffs(ports);
++			}
++			if (airoha_qos_resolve_egress(dev->port->id, dev->nbq,
++						      dsa, -1, &e))
++				goto error_unlock;
++			channel = e.channel;
++			nboq = e.nbq;
++			if (dsa >= 0)
++				tag = airoha_stag_set_priority(tag, qid % 8);
++		}
+ 		msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK,
+-				  qid / AIROHA_NUM_QOS_QUEUES) |
++				  channel) |
+ 		       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
+ 				  qid % AIROHA_NUM_QOS_QUEUES) |
+ 		       FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, tag);
+-		nboq = dev->nbq;
+ 	}
+ 	if (!ctrl && skb->ip_summed == CHECKSUM_PARTIAL)
+ 		msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_TCO_MASK, 1) |
+@@ -4153,6 +4190,12 @@ static int airoha_tc_setup_qdisc_htb(struct net_device *netdev,
+ static int airoha_dev_tc_setup(struct net_device *dev,
+ 			       enum tc_setup_type type, void *type_data)
+ {
++	struct airoha_gdm_dev *gdm = netdev_priv(dev);
++
++	if (READ_ONCE(gdm->eth->qos_dscp) &&
++	    (type == TC_SETUP_QDISC_HTB || type == TC_SETUP_QDISC_ETS))
++		return -EOPNOTSUPP;
++
+ 	switch (type) {
+ 	case TC_SETUP_QDISC_ETS:
+ 		return airoha_tc_setup_qdisc_ets(dev, type_data);
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 2046b2a3b..561ac0132 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -17,6 +17,7 @@
+ #include <linux/soc/airoha/airoha_offload.h>
+ #include <net/airoha_priority.h>
+ #include <net/dsa.h>
++#include <net/airoha_qos.h>
+ 
+ #define AIROHA_MAX_NUM_GDM_PORTS	4
+ #define AIROHA_MAX_NUM_GDM_DEVS		2
+@@ -749,6 +750,9 @@ struct airoha_eth_soc_data {
+ };
+ 
+ struct airoha_eth {
++	/* Enabled only by the coordinated boot profile. */
++	bool qos_dscp;
++	struct airoha_qos_profile qos_profile;
+ 	struct device *dev;
+ 
+ 	const struct airoha_eth_soc_data *soc;
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 48e9e741a..fd10dfe23 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -487,12 +487,23 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 					return err;
+ 				channel = FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK,
+ 						    pon_tag);
++			} else if (READ_ONCE(eth->qos_dscp) && airoha_is_lan_gdm_dev(dev)) {
++				struct airoha_qos_egress e;
++
++				err = airoha_qos_resolve_egress(port->id, dev->nbq,
++							     dsa_port, -1, &e);
++				if (err)
++					return err;
++				channel = e.channel;
++				pse_port = e.fport;
+ 			} else {
+ 				channel = dsa_port >= 0 ? dsa_port : port->id;
+ 				channel %= AIROHA_NUM_QOS_CHANNELS;
+ 			}
+ 			priority = rt_tos2priority(dsfield);
+-			priority = airoha_is_7581(eth) ? airoha_priority_queue(priority) :
++			priority = READ_ONCE(eth->qos_dscp) ?
++				airoha_qos_class(&eth->qos_profile, dsfield) :
++				airoha_is_7581(eth) ? airoha_priority_queue(priority) :
+ 				priority % AIROHA_NUM_QOS_QUEUES;
+ 			qdata |= FIELD_PREP(AIROHA_FOE_CHANNEL, channel) |
+ 				 FIELD_PREP(AIROHA_FOE_QID, priority);
+@@ -574,6 +585,9 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 	} else if (dsa_port >= 0) {
+ 		l2->etype = BIT(dsa_port);
+ 		l2->etype |= !data->vlan.num ? BIT(15) : 0;
++		if (READ_ONCE(eth->qos_dscp))
++			l2->etype = airoha_stag_set_priority(l2->etype,
++				airoha_qos_class(&eth->qos_profile, dsfield));
+ 	} else if (pon_tag & AIROHA_PON_QDMA_VALID) {
+ 		/* PON MAC interprets FOE etype as GPON GEM Port-ID. EPON selects LLID
+ 		 * through channel and leaves special tag zero. IB1_PPPOE and pppoe_id
+diff --git a/drivers/net/ethernet/airoha/airoha_qos_test.c b/drivers/net/ethernet/airoha/airoha_qos_test.c
+new file mode 100644
+index 000000000..69d65640d
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_qos_test.c
+@@ -0,0 +1,189 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <kunit/test.h>
++#include <net/airoha_qos.h>
++#include <net/airoha_priority.h>
++
++static void airoha_egress_test(struct kunit *test)
++{
++	struct airoha_qos_egress e;
++	int p;
++
++	KUNIT_ASSERT_EQ(test, airoha_qos_resolve_egress(4, 0, -1, -1, &e), 0);
++	KUNIT_EXPECT_EQ(test, e.channel, 13);
++	KUNIT_EXPECT_EQ(test, e.ring_bank, 0);
++	KUNIT_EXPECT_EQ(test, e.fport, 9);
++	KUNIT_EXPECT_EQ(test, e.nbq, 0);
++	for (p = 2; p <= 4; p++) {
++		KUNIT_ASSERT_EQ(test, airoha_qos_resolve_egress(1, 0, p, -1, &e), 0);
++		KUNIT_EXPECT_EQ(test, e.channel, p);
++		KUNIT_EXPECT_EQ(test, e.nbq, p);
++		KUNIT_EXPECT_EQ(test, e.ring_bank, p - 1);
++	}
++	for (p = 0; p < 32; p++) {
++		KUNIT_ASSERT_EQ(test, airoha_qos_resolve_egress(2, 0, -1, p, &e), 0);
++		KUNIT_EXPECT_EQ(test, e.channel, p);
++		KUNIT_EXPECT_EQ(test, e.nbq, p);
++		KUNIT_EXPECT_EQ(test, e.ring_bank, 2);
++	}
++	KUNIT_EXPECT_EQ(test, airoha_qos_resolve_egress(2, 0, -1, 32, &e), -EINVAL);
++	KUNIT_EXPECT_EQ(test, airoha_qos_resolve_egress(1, 0, 6, -1, &e), -EINVAL);
++	KUNIT_EXPECT_EQ(test, airoha_qos_resolve_egress(4, 1, -1, -1, &e), -EOPNOTSUPP);
++}
++
++static void airoha_stag_test(struct kunit *test)
++{
++	int p;
++	u16 tag = BIT(2) | BIT(4) | BIT(6), result;
++
++	for (p = 0; p < 8; p++) {
++		result = airoha_stag_set_priority(tag, p);
++		KUNIT_EXPECT_EQ(test, FIELD_GET(AIROHA_STAG_UP, result), p);
++		KUNIT_EXPECT_TRUE(test, result & AIROHA_STAG_FUP);
++		KUNIT_EXPECT_EQ(test, result & ~(AIROHA_STAG_UP | AIROHA_STAG_FUP), tag);
++	}
++}
++
++
++static void airoha_cpu_priority_preserved_test(struct kunit *test)
++{
++	static const u32 priorities[] = { 0, 2, 4, 7, 0x10004, U32_MAX };
++	struct airoha_qos_profile p;
++	struct sk_buff *skb = alloc_skb(64, GFP_KERNEL);
++	u8 *buf;
++	int d, e, i;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	buf = skb_put_zero(skb, 64);
++	put_unaligned_be16(ETH_P_IP, buf + 12);
++	buf[14] = 0x45;
++	airoha_qos_default_profile(&p);
++	for (d = 0; d < 64; d++)
++	for (e = 0; e < 4; e++)
++	for (i = 0; i < ARRAY_SIZE(priorities); i++) {
++		buf[15] = (d << 2) | e;
++		skb->priority = priorities[i];
++		KUNIT_EXPECT_EQ(test, airoha_qos_cpu_class(&p, skb, false,
++				airoha_priority_queue(skb->priority)), p.map[d]);
++		KUNIT_EXPECT_EQ(test, skb->priority, priorities[i]);
++	}
++	/* Zero is an authoritative queue, and class 2 must not become class 0. */
++	buf[15] = 3 << 2;
++	KUNIT_EXPECT_EQ(test, airoha_qos_cpu_class(&p, skb, false, 4), 2);
++	buf[15] = 8 << 2;
++	KUNIT_EXPECT_EQ(test, airoha_qos_cpu_class(&p, skb, false, 4), 0);
++	put_unaligned_be16(ETH_P_ARP, buf + 12);
++	KUNIT_EXPECT_EQ(test, airoha_qos_cpu_class(&p, skb, false, 4), 4);
++	KUNIT_EXPECT_EQ(test, skb->priority, U32_MAX);
++	kfree_skb(skb);
++}
++
++static void airoha_profile_test(struct kunit *test)
++{
++	struct airoha_qos_profile p;
++	int d, e;
++
++	airoha_qos_default_profile(&p);
++	for (d = 0; d < 64; d++)
++		for (e = 0; e < 4; e++)
++			KUNIT_EXPECT_EQ(test, airoha_qos_class(&p, d * 4 + e),
++					rt_tos2priority(d * 4) & 7);
++	KUNIT_EXPECT_EQ(test, p.map[7], 4);
++	KUNIT_EXPECT_EQ(test, p.map[3], 2);
++	KUNIT_EXPECT_EQ(test, p.map[8], 0);
++	p.map[7] = 0;
++	KUNIT_EXPECT_EQ(test, airoha_qos_class(&p, 7 << 2), 0);
++}
++
++static void airoha_parser_test(struct kunit *test)
++{
++	int v6, vlan, ppp, mtk, ds;
++
++	for (v6 = 0; v6 < 2; v6++)
++	for (vlan = 0; vlan < 3; vlan++)
++	for (ppp = 0; ppp < 2; ppp++)
++	for (mtk = 0; mtk < 2; mtk++)
++	for (ds = 0; ds < 256; ds++) {
++		struct sk_buff *skb = alloc_skb(128, GFP_KERNEL), *clone;
++		u8 *buf, result = 0;
++		int i, off = 12;
++		u16 proto = v6 ? ETH_P_IPV6 : ETH_P_IP;
++
++		KUNIT_ASSERT_NOT_NULL(test, skb);
++		buf = skb_put_zero(skb, 100);
++		if (mtk && !vlan) {
++			put_unaligned_be16(BIT(4), buf + off);
++			off += 4;
++		}
++		for (i = 0; i < vlan; i++) {
++			put_unaligned_be16(mtk && !i ? 0x0210 : ETH_P_8021AD, buf + off);
++			put_unaligned_be16(0xb123, buf + off + 2);
++			off += 4;
++		}
++		put_unaligned_be16(ppp ? ETH_P_PPP_SES : proto, buf + off);
++		off += 2;
++		if (ppp) {
++			buf[off] = 0x11;
++			put_unaligned_be16(42, buf + off + 4);
++			put_unaligned_be16(v6 ? PPP_IPV6 : PPP_IP, buf + off + 6);
++			off += 8;
++		}
++		buf[off] = v6 ? 0x60 | (ds >> 4) : 0x45;
++		buf[off + 1] = v6 ? (ds << 4) | 5 : ds;
++		skb_shinfo(skb)->gso_size = 1400;
++		clone = skb_clone(skb, GFP_KERNEL);
++		KUNIT_ASSERT_NOT_NULL(test, clone);
++		KUNIT_EXPECT_TRUE(test, airoha_qos_skb_dsfield(clone, mtk, &result));
++		KUNIT_EXPECT_EQ(test, result, ds);
++		KUNIT_EXPECT_TRUE(test, skb_cloned(clone));
++		KUNIT_EXPECT_EQ(test, skb_headlen(clone), 100);
++		kfree_skb(clone);
++		/* Force header reads across a non-linear fragment boundary. */
++		{
++			struct page *page = alloc_page(GFP_KERNEL);
++			int len = skb->len - 13;
++
++			KUNIT_ASSERT_NOT_NULL(test, page);
++			memcpy(page_address(page), skb->data + 13, len);
++			skb_trim(skb, 13);
++			skb_add_rx_frag(skb, 0, page, 0, len, PAGE_SIZE);
++			KUNIT_EXPECT_TRUE(test, airoha_qos_skb_dsfield(skb, mtk, &result));
++			KUNIT_EXPECT_EQ(test, result, ds);
++			KUNIT_EXPECT_EQ(test, skb_headlen(skb), 13);
++		}
++		kfree_skb(skb);
++	}
++}
++
++static void airoha_parser_reject_test(struct kunit *test)
++{
++	struct sk_buff *skb = alloc_skb(80, GFP_KERNEL);
++	u8 *buf, ds = 123;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	buf = skb_put_zero(skb, 80);
++	put_unaligned_be16(ETH_P_ARP, buf + 12);
++	KUNIT_EXPECT_FALSE(test, airoha_qos_skb_dsfield(skb, false, &ds));
++	put_unaligned_be16(ETH_P_IP, buf + 12);
++	KUNIT_EXPECT_FALSE(test, airoha_qos_skb_dsfield(skb, false, &ds));
++	buf[14] = 0x45;
++	skb_trim(skb, 33);
++	KUNIT_EXPECT_FALSE(test, airoha_qos_skb_dsfield(skb, false, &ds));
++	KUNIT_EXPECT_EQ(test, ds, 123);
++	kfree_skb(skb);
++}
++
++static struct kunit_case airoha_qos_cases[] = {
++	KUNIT_CASE(airoha_egress_test),
++	KUNIT_CASE(airoha_cpu_priority_preserved_test),
++	KUNIT_CASE(airoha_profile_test),
++	KUNIT_CASE(airoha_parser_test),
++	KUNIT_CASE(airoha_parser_reject_test),
++	KUNIT_CASE(airoha_stag_test),
++	{}
++};
++
++static struct kunit_suite airoha_qos_suite = {
++	.name = "airoha-qos", .test_cases = airoha_qos_cases,
++};
++kunit_test_suite(airoha_qos_suite);
++MODULE_LICENSE("GPL");
+diff --git a/include/net/airoha_qos.h b/include/net/airoha_qos.h
+new file mode 100644
+index 000000000..34ea23855
+--- /dev/null
++++ b/include/net/airoha_qos.h
+@@ -0,0 +1,166 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NET_AIROHA_QOS_H
++#define _NET_AIROHA_QOS_H
++
++#include <linux/bitfield.h>
++#include <linux/errno.h>
++#include <linux/if_vlan.h>
++#include <linux/ppp_defs.h>
++#include <linux/skbuff.h>
++#include <linux/unaligned.h>
++#include <net/route.h>
++
++#define AIROHA_QOS_QUEUES 8
++#define AIROHA_QOS_CHANNELS 32
++#define AIROHA_STAG_FUP BIT(15)
++#define AIROHA_STAG_UP GENMASK(14, 12)
++#define AIROHA_STAG_PORTS GENMASK(5, 0)
++
++/* A CPU ring bank is not a hardware scheduling channel or a replica slot. */
++struct airoha_qos_egress {
++	u8 ring_bank;
++	u8 channel;
++	u8 fport;
++	u8 nbq;
++};
++
++static inline int
++airoha_qos_resolve_egress(int gdm, int nbq, int dsa_port, int pon_channel,
++			  struct airoha_qos_egress *out)
++{
++	if (pon_channel >= 0) {
++		if (gdm != 2 || pon_channel >= AIROHA_QOS_CHANNELS)
++			return -EINVAL;
++		*out = (struct airoha_qos_egress) {
++			.ring_bank = 2, .channel = pon_channel,
++			.fport = 2, .nbq = pon_channel,
++		};
++		return 0;
++	}
++	if (dsa_port >= 0) {
++		if (gdm != 1 || dsa_port > 5)
++			return -EINVAL;
++		*out = (struct airoha_qos_egress) {
++			/* HG's switch ports 2/3/4 use banks 1/2/3. */
++			.ring_bank = dsa_port >= 2 && dsa_port <= 4 ?
++				     dsa_port - 1 : dsa_port % 4,
++			.channel = dsa_port, .fport = 1, .nbq = dsa_port,
++		};
++		return 0;
++	}
++	if (gdm == 4 && !nbq) {
++		/* AN7581 SDK HSGMII_LAN_ETH_CHNL; stock HG uses the same tuple. */
++		*out = (struct airoha_qos_egress) {
++			.ring_bank = 0, .channel = 13, .fport = 9, .nbq = 0,
++		};
++		return 0;
++	}
++	return -EOPNOTSUPP;
++}
++
++static inline u16 airoha_stag_set_priority(u16 tag, u8 priority)
++{
++	return (tag & ~AIROHA_STAG_UP) | AIROHA_STAG_FUP |
++	       FIELD_PREP(AIROHA_STAG_UP, priority & 7);
++}
++
++struct airoha_qos_profile {
++	bool dscp;
++	u8 map[64];
++};
++
++static inline void airoha_qos_default_profile(struct airoha_qos_profile *p)
++{
++	int i;
++
++	p->dscp = true;
++	for (i = 0; i < 64; i++)
++		p->map[i] = rt_tos2priority(i << 2) & 7;
++}
++
++static inline u8 airoha_qos_class(const struct airoha_qos_profile *p, u8 ds)
++{
++	return p->map[ds >> 2];
++}
++
++/* Ethernet starts at skb->data on the physical ndo_select_queue path.
++ * Read at most Ethernet + two VLANs + PPPoE + a fixed IP header. No pull,
++ * linearization, allocation, extension-header walk or transport inspection.
++ * The MTK tag either precedes EtherType or replaces a VLAN TPID.
++ */
++static inline bool airoha_qos_skb_dsfield(const struct sk_buff *skb, bool mtk,
++					u8 *ds)
++{
++	u8 buf[40];
++	const u8 *h;
++	unsigned int off = ETH_HLEN;
++	u16 proto;
++	int i;
++
++	h = skb_header_pointer(skb, 12, 2, buf);
++	if (!h)
++		return false;
++	proto = get_unaligned_be16(h);
++	if (mtk) {
++		switch ((proto >> 8) & 3) {
++		case 0:
++			h = skb_header_pointer(skb, 16, 2, buf);
++			if (!h)
++				return false;
++			proto = get_unaligned_be16(h);
++			off += 4;
++			break;
++		case 1: proto = ETH_P_8021Q; break;
++		case 2: proto = ETH_P_8021AD; break;
++		default: return false;
++		}
++	}
++	for (i = 0; i < 2 && (proto == ETH_P_8021Q || proto == ETH_P_8021AD); i++) {
++		h = skb_header_pointer(skb, off, VLAN_HLEN, buf);
++		if (!h)
++			return false;
++		proto = get_unaligned_be16(h + 2);
++		off += VLAN_HLEN;
++	}
++	if (proto == ETH_P_PPP_SES) {
++		h = skb_header_pointer(skb, off, 8, buf);
++		if (!h || h[0] != 0x11 || h[1] || get_unaligned_be16(h + 4) < 2)
++			return false;
++		proto = get_unaligned_be16(h + 6);
++		if (proto == PPP_IP)
++			proto = ETH_P_IP;
++		else if (proto == PPP_IPV6)
++			proto = ETH_P_IPV6;
++		else
++			return false;
++		off += 8;
++	}
++	if (proto == ETH_P_IP) {
++		h = skb_header_pointer(skb, off, 20, buf);
++		if (!h || h[0] >> 4 != 4 || (h[0] & 15) < 5)
++			return false;
++		*ds = h[1];
++		return true;
++	}
++	if (proto == ETH_P_IPV6) {
++		h = skb_header_pointer(skb, off, 40, buf);
++		if (!h || h[0] >> 4 != 6)
++			return false;
++		*ds = ((h[0] & 15) << 4) | (h[1] >> 4);
++		return true;
++	}
++	return false;
++}
++
++/* Hardware policy must not overwrite the software qdisc's priority metadata. */
++static inline u8 airoha_qos_cpu_class(const struct airoha_qos_profile *p,
++				     const struct sk_buff *skb, bool mtk,
++				     u8 fallback)
++{
++	u8 ds;
++
++	return airoha_qos_skb_dsfield(skb, mtk, &ds) ?
++		airoha_qos_class(p, ds) : fallback;
++}
++
++#endif
+-- 
+2.53.0
+

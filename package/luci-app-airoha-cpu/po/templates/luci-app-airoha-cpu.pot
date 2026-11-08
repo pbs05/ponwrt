@@ -1,0 +1,84 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Running policy"
+msgstr ""
+
+msgid "CPU policy status unavailable. Saved settings do not prove that the policy is active."
+msgstr ""
+
+msgid "A temporary trial is active. Finish or restore the trial before applying persistent settings."
+msgstr ""
+
+msgid "CPU policy active"
+msgstr ""
+
+msgid "CPU policy inactive"
+msgstr ""
+
+msgid "Saved settings differ from the running policy. Apply them online; no reboot is needed."
+msgstr ""
+
+msgid "Affinity entries checked: %s; mismatches: %s; exited or unavailable objects: %s."
+msgstr ""
+
+msgid "Restore failures or externally changed affinities were recorded. Inspect the controller status and system log."
+msgstr ""
+
+msgid "Refresh status"
+msgstr ""
+
+msgid "Use CPU numbers 0–3, or a list such as 0,3."
+msgstr ""
+
+msgid "WAN and LAN must use different CPUs. Other roles must exclude both of those CPUs."
+msgstr ""
+
+msgid "WAN receive and completion CPU"
+msgstr ""
+
+msgid "LAN receive and completion CPU"
+msgstr ""
+
+msgid "Special receive queues CPU"
+msgstr ""
+
+msgid "Other device interrupts CPU"
+msgstr ""
+
+msgid "Ordinary applications CPUs"
+msgstr ""
+
+msgid "Unbound workqueue CPUs"
+msgstr ""
+
+msgid "Airoha CPU scheduling"
+msgstr ""
+
+msgid "Keep ingress IRQs and threaded NAPI together. Applying changes is online and may briefly increase jitter while tasks move between CPUs."
+msgstr ""
+
+msgid "Enable CPU scheduling policy"
+msgstr ""
+
+msgid "Disabling restores affinities owned by this controller. Existing custom application affinities are preserved."
+msgstr ""
+
+msgid "Scope"
+msgstr ""
+
+msgid "WAN/LAN describe packet ingress and completion queues, not every transmit instruction. Hardware forwarding is independent. Per-CPU workers, including WireGuard crypto workers, are not confined by the unbound-workqueue setting."
+msgstr ""
+
+msgid "Settings saved. Use Save & Apply to apply them online."
+msgstr ""
+
+msgid "A temporary trial is active."
+msgstr ""
+
+msgid "Apply failed. Settings remain saved; refresh status and inspect the system log."
+msgstr ""
+
+msgid "CPU policy applied online."
+msgstr ""

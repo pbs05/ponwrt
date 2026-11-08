@@ -1,0 +1,237 @@
+#!/usr/bin/ucode
+// SPDX-License-Identifier: GPL-2.0-only
+'use strict';
+import * as fs from 'fs';
+import { cursor } from 'uci';
+import { cpumask, cpulist, taskstat, parse_map, policy_masks, make_plan, apply, restore } from '/usr/libexec/airoha-cpu/policy.uc';
+
+const dir = '/tmp/airoha-cpu';
+const journal = `${dir}/state.json`;
+let command = ARGV[0] ?? 'status';
+const uci = cursor();
+let cfg = uci.get_all('airoha_cpu', 'main') ?? {};
+let config = {};
+for (let key in ['wan_cpu', 'lan_cpu', 'special_cpu', 'other_irq_cpu', 'service_cpus', 'unbound_cpus'])
+	config[key] = cfg[key];
+
+function read(path) { return trim(fs.readfile(path) ?? ''); }
+function hex(path) {
+	let s = read(path);
+	if (!match(s, /^[0-9a-fA-F,]+$/)) return null;
+	let n = int(replace(s, /,/g, ''), 16);
+	return (n & ~15) ? null : n;
+}
+function task(tid, path) {
+	let t = taskstat(fs.readfile(`${path}/stat`));
+	if (!t || t.tid != tid) return null;
+	let status = fs.readfile(`${path}/status`);
+	let m = match(status ?? '', /\nCpus_allowed_list:\s*([^\n]+)/);
+	if (!m) return null;
+	t.mask = cpumask(trim(m[1]));
+	return t;
+}
+function tasks() {
+	let result = {};
+	for (let path in fs.glob('/proc/[0-9]*/task/[0-9]*')) {
+		let tid = int(fs.basename(path)), t = task(tid, path);
+		if (t) result[`${tid}`] = t;
+	}
+	return result;
+}
+function irqs() {
+	let result = {};
+	for (let line in split(fs.readfile('/proc/interrupts') ?? '', '\n')) {
+		let m = match(line, /^\s*(\d+):\s+\d+\s+\d+\s+\d+\s+\d+\s+GICv3\s+(\d+)\s+\S+\s+(.+)$/);
+		if (!m || int(m[2]) < 32) continue; // per-CPU timers/IPIs/child IRQ chips excluded
+		let path = `/proc/irq/${m[1]}`, mask = read(`${path}/smp_affinity_list`);
+		if (!length(mask)) continue;
+		let action = trim(m[3]);
+		let housekeeping = !!match(action, /^([0-9a-f]+\.system-controller:pinctrl|ttyS[0-9]+|[0-9a-f]+\.rng|airoha-npu-(mbox|wdt)|[0-9a-f]+\.thermal-sensor|mt7530|1fb64000\.ethernet|airoha-xpon-phy)$/);
+		result[m[1]] = { action, mask: cpumask(mask), effective: cpumask(read(`${path}/effective_affinity_list`)), housekeeping };
+	}
+	return result;
+}
+function snapshot() {
+	let maps = fs.glob('/sys/kernel/debug/airoha_eth-*/napi_map');
+	if (length(maps) != 1) die('Expected one Airoha napi_map. Driver patch and mounted debugfs are required.');
+	let queues = [], devices = {};
+	// Physical Airoha devices plus their DSA ports. Do not touch unrelated NICs,
+	// future wg/tun interfaces, or XPS. DSA queues may expose their own RPS masks.
+	for (let path in fs.glob('/sys/class/net/*')) {
+		let driver = fs.basename(fs.realpath(`${path}/device/driver`) ?? '');
+		if (driver == 'airoha_eth') devices[fs.basename(path)] = true;
+	}
+	for (let path in fs.glob('/sys/class/net/*')) {
+		for (let lower in fs.glob(`${path}/lower_*`)) {
+			let name = substr(fs.basename(lower), 6);
+			if (devices[name] && length(read(`${path}/phys_switch_id`))) devices[fs.basename(path)] = true;
+		}
+	}
+	for (let name in keys(devices)) {
+		for (let path in fs.glob(`/sys/class/net/${name}/queues/rx-*/rps_cpus`))
+			push(queues, { path, kind: 'mask', value: hex(path) });
+		for (let path in fs.glob(`/sys/class/net/${name}/queues/rx-*/rps_flow_cnt`))
+			push(queues, { path, kind: 'count', value: int(read(path)) });
+	}
+	return { board: read('/tmp/sysinfo/board_name'), online: cpumask(read('/sys/devices/system/cpu/online')),
+		rows: parse_map(fs.readfile(maps[0])), irqs: irqs(), tasks: tasks(), queues,
+		default_irq: hex('/proc/irq/default_smp_affinity'), unbound: hex('/sys/devices/virtual/workqueue/cpumask') };
+}
+function save(state) {
+	let payload = sprintf('%J\n', state);
+	if (fs.writefile(`${journal}.new`, payload) != length(payload) ||
+	    fs.readfile(`${journal}.new`) != payload || !fs.rename(`${journal}.new`, journal))
+		die('Cannot save rollback journal');
+}
+function load() {
+	let data = fs.readfile(journal);
+	if (!data) return null;
+	let state = json(data);
+	if (state.version != 1 || state.boot != read('/proc/sys/kernel/random/boot_id')) die('Stale/unsupported rollback journal');
+	return state;
+}
+const io = {
+	tasks, save,
+	read: function(op) {
+		if (op.kind == 'task') {
+			let t = task(op.tid, `/proc/${op.tid}`);
+			return t?.start == op.start ? t.mask : null;
+		}
+		if (op.kind == 'irq') {
+			let irq = irqs()[`${op.irq}`];
+			return irq?.action == op.action ? irq.mask : null;
+		}
+		if (!fs.stat(op.path)) return null;
+		return op.kind == 'mask' ? hex(op.path) : int(read(op.path));
+	},
+	write: function(op, mask) {
+		if (op.kind == 'task') {
+			if (task(op.tid, `/proc/${op.tid}`)?.start != op.start) die('PID identity changed');
+			// Numeric validated masks/TIDs only; no shell interpolation of UCI text.
+			let rc = system(`/usr/bin/taskset -p -c ${cpulist(mask)} ${op.tid} >/dev/null 2>&1`, 3000);
+			if (rc != 0 && task(op.tid, `/proc/${op.tid}`)?.start == op.start) die(`taskset failed for ${op.tid}`);
+		} else {
+			let path = op.kind == 'irq' ? `/proc/irq/${op.irq}/smp_affinity_list` : op.path;
+			let value = op.kind == 'irq' ? cpulist(mask) : op.kind == 'mask' ? sprintf('%x', mask) : `${mask}`;
+			if (fs.writefile(path, value) == null) die(`Write failed: ${path}`);
+		}
+	},
+	effective: (op) => cpumask(read(`/proc/irq/${op.irq}/effective_affinity_list`)),
+};
+function result(obj) { printf('%J\n', obj); }
+
+try {
+	if (command == 'validate') {
+		if (cfg.enabled != '0' && cfg.enabled != '1') die('Enabled must be 0 or 1');
+		result({ masks: policy_masks(config) });
+		exit(0);
+	}
+	if (command == 'trial' && ARGV[3] != null &&
+	    !match(ARGV[3], /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/))
+		die('Optional trial token must be a UUID');
+	if (command == 'plan') {
+		result(make_plan(config, snapshot(), ARGV[1] ?? 'full'));
+		exit(0);
+	}
+	fs.mkdir(dir, 0700);
+	fs.chmod(dir, 0700);
+	let lock = fs.open(`${dir}/lock`, 'we', 0600);
+	if (!lock || !lock.lock('xn')) {
+		if (command == 'watch') exit(0); // watchdog retries, never shares transaction
+		die('Another CPU policy operation is active');
+	}
+	let state = load();
+	if (command == 'reload') {
+		if (state?.active && state.trial) die('A temporary CPU trial owns the policy');
+		if (cfg.enabled != '0' && cfg.enabled != '1') die('Enabled must be 0 or 1');
+		if (cfg.enabled == '1') policy_masks(config);
+		if (state && !state.restored) {
+			let done = restore(io, state);
+			if (!done.restored) die('Previous policy restoration failed');
+		}
+		if (cfg.enabled == '0') {
+			state = state ?? { version: 1, boot: read('/proc/sys/kernel/random/boot_id'),
+				active: false, restored: true, trial: false, ops: [] };
+			state.persistent_enabled = false;
+			save(state);
+			result({ active: false, restored: true });
+			exit(0);
+		}
+		command = 'apply';
+	}
+	if (command == 'watch') {
+		if (!state || (!state.active && state.restored) || !state.trial || state.token != ARGV[1]) exit(10);
+		if (clock(true)[0] < state.deadline) exit(0);
+		result(restore(io, state));
+		exit(state.restored ? 10 : 0); // retry failed restorations on the next tick
+	}
+	if (command == 'restore') {
+		if (ARGV[1] && state?.token != ARGV[1]) die('Restore token does not own this policy');
+		result(state && !state.restored ? restore(io, state) : { restored: true, active: false });
+		exit(state && !state.restored ? 1 : 0);
+	}
+	if (command == 'renew') {
+		if (!state?.active || !state.trial || state.token != ARGV[1]) die('No matching active trial');
+		if (clock(true)[0] >= state.deadline) die('Trial already expired; let watchdog restore it');
+		state.deadline = clock(true)[0] + state.lease;
+		save(state);
+		result({ deadline: state.deadline });
+		exit(0);
+	}
+	if (command == 'status') {
+		let snap = snapshot(), actual = [];
+		for (let op in state?.ops ?? []) push(actual, { id: op.id, want: op.want, value: io.read(op),
+			effective: op.kind == 'irq' ? io.effective(op) : null });
+		result({ enabled: cfg.enabled == '1', state, actual, snapshot: snap });
+		exit(0);
+	}
+	if (command != 'apply' && command != 'trial' && command != 'sync')
+		die('Usage: airoha-cpuctl validate|plan|status|apply|reload|trial [network|services|full] [30..600 seconds]|renew TOKEN|restore');
+	// Hook exit 10 means stock steering may run. All errors use 1, so a failed
+	// owned policy can never silently fall through to a competing steering tool.
+	if (command == 'sync' && !state?.active && (!state || state.restored) &&
+	    (cfg.enabled != '1' || state?.persistent_enabled == false)) exit(10);
+	if (command == 'apply' && cfg.enabled != '1') die('Persistent apply requires enabled=1; use trial first');
+	if (command == 'trial' && state?.active) die('Restore the current policy before starting another trial');
+	if (command == 'sync' && state?.active) {
+		// New objects inherit the applied policy, never saved-but-unapplied edits.
+		config = state.config;
+	} else if (state?.active && sprintf('%J', state.config) != sprintf('%J', config)) {
+		die('Configuration changed while active; restore before applying the new policy');
+	}
+	if (state && !state.active && !state.restored) die('Previous rollback is incomplete; run restore');
+	let stage = command == 'trial' ? (ARGV[1] ?? 'full') : state?.active ? state.stage : 'full';
+	let lease = int(ARGV[2] ?? '180');
+	if (command == 'trial' && (lease < 30 || lease > 600 || `${lease}` != (ARGV[2] ?? '180')))
+		die('Trial lease must be 30..600 seconds');
+	let snap = snapshot(), plan = make_plan(config, snap, stage);
+	if (!state?.active) {
+		state = { version: 1, boot: read('/proc/sys/kernel/random/boot_id'), active: false, restored: true,
+			trial: command == 'trial', persistent_enabled: command != 'trial',
+			token: ARGV[3] ?? read('/proc/sys/kernel/random/uuid'), stage, config,
+			online: snap.online, ops: [], lease, deadline: clock(true)[0] + lease };
+		if (stage != 'network' && snap.tasks['1'].mask == snap.online) {
+			state.service_from = +taskstat(fs.readfile('/proc/self/stat')).start;
+			state.service_mask = plan.masks.service_cpus;
+			state.preexisting = {};
+			for (let id, t in snap.tasks) state.preexisting[`task:${id}:${t.start}`] = true;
+		}
+	}
+	if (state.trial && !state.active) {
+		save(state);
+		// Spawn independently of the SSH connection and acknowledge readiness
+		// before the first scheduling write. The lock is close-on-exec.
+		if (system(['/usr/libexec/airoha-cpu/guard', state.token], 3000) != 0)
+			die('Cannot start rollback watchdog');
+		let ready = false;
+		for (let i = 0; i < 30; i++) {
+			if (read(`${dir}/ready`) == state.token) { ready = true; break; }
+			sleep(100);
+		}
+		if (!ready) die('Rollback watchdog did not acknowledge readiness');
+	}
+	result({ state: apply(io, plan, state), warnings: plan.warnings });
+} catch (e) {
+	warn(`airoha-cpu: ${e}\n`);
+	exit(1);
+}

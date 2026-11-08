@@ -1,0 +1,18 @@
+#!/bin/sh /etc/rc.common
+START=24
+STOP=88
+USE_PROCD=1
+
+start_service() {
+	/usr/sbin/airoha-cpuctl reload
+}
+
+stop_service() { /usr/sbin/airoha-cpuctl restore; }
+
+reload_service() {
+	# Validate, reject competing trials, restore and apply under one lock.
+	/usr/sbin/airoha-cpuctl reload
+}
+
+# No config.change trigger: rpcd emits it even for a plain UCI commit.
+# LuCI Save must only persist; Save & Apply explicitly invokes reload.
