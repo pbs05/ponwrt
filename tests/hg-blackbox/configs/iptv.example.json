@@ -1,0 +1,62 @@
+{
+  "hg": {
+    "ssh": "hg-test-hg",
+    "arch": "aarch64",
+    "bridge": "br-lan",
+    "ingress": "hgi4000",
+    "egress": "br-lan.10",
+    "gro_device": "pon0",
+    "wire": "eth0",
+    "port": "lan4",
+    "ppe_bit": 4,
+    "rtp2httpd_binary": "/usr/bin/rtp2httpd",
+    "url": "http://192.0.2.1:5140/rtp/239.1.1.1:2000"
+  },
+  "fnos": {
+    "ssh": "hg-test-fnos",
+    "arch": "x86_64",
+    "interface": "bond1-ovs",
+    "wire": "enp1s0",
+    "address": "192.0.2.3",
+    "rtp2httpd_binary": "/vol1/@appcenter/rtp2httpd/server/rtp2httpd-x86_64",
+    "url": "http://192.0.2.3:5140/app/rtp2httpd/rtp/239.1.1.1:2000"
+  },
+  "channel": {
+    "group": "239.1.1.1",
+    "port": 2000,
+    "source": "198.51.100.10",
+    "source_port": 8046,
+    "ingress_ttl": 124,
+    "dscp": 0,
+    "ecn": 0
+  },
+  "timing": {
+    "rounds": 2,
+    "seconds": 45,
+    "warmup": 10,
+    "probe_seconds": 15,
+    "probe_warmup": 3,
+    "settle_seconds": 90
+  },
+  "thresholds": {
+    "min_mbps": 20,
+    "max_read_gap_seconds": 0.5,
+    "min_rtp_packets": 1000,
+    "max_reordered_ratio": 0.001
+  },
+  "reliability": {
+    "rounds": 3,
+    "seconds": 45,
+    "warmup": 10,
+    "join_rounds": 5,
+    "join_seconds": 15,
+    "leave_seconds": 90,
+    "first_timeout": 5,
+    "max_join_seconds": 1
+  },
+  "binaries": {
+    "hg": "bin/iptv-native-aarch64",
+    "fnos": "bin/iptv-native-x86_64",
+    "stream": "bin/iptv-stream-linux"
+  }
+}

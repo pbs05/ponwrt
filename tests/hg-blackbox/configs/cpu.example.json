@@ -1,0 +1,12 @@
+{
+  "hg": {"ssh": "hg-test-hg"},
+  "client": {"ssh": "hg-test-fnos"},
+  "seconds": 180,
+  "rounds": 3,
+  "traffic": {
+    "server": "198.51.100.10",
+    "port": 5201,
+    "source": "192.0.2.3",
+    "gateway": "192.0.2.1"
+  }
+}

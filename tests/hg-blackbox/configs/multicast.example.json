@@ -1,0 +1,53 @@
+{
+  "hg": {"ssh": "hg-test-hg"},
+  "input_device": "pon0.3964",
+  "sender": {
+    "ssh": "hg-test-iptv-source",
+    "sudo": true,
+    "interface": "eth1",
+    "address": "198.51.100.10"
+  },
+  "receivers": [
+    {
+      "name": "native",
+      "ssh": "hg-test-native-receiver",
+      "sudo": true,
+      "interface": "eth1",
+      "address": "192.0.2.10",
+      "member": true,
+      "ppe_bit": 13,
+      "expected_vlans": []
+    },
+    {
+      "name": "switch",
+      "ssh": "hg-test-switch-receiver",
+      "sudo": true,
+      "interface": "eth1",
+      "address": "192.0.2.11",
+      "member": true,
+      "ppe_bit": 4,
+      "expected_vlans": []
+    },
+    {
+      "name": "guest",
+      "ssh": "hg-test-guest-observer",
+      "sudo": true,
+      "interface": "eth1",
+      "address": "203.0.113.10",
+      "member": false
+    }
+  ],
+  "group": "239.1.1.1",
+  "alias_group": "239.129.1.1",
+  "port": 55000,
+  "source_port": 55001,
+  "dscp": 7,
+  "ecn": 2,
+  "queue": 4,
+  "ttl": 8,
+  "payload": 1400,
+  "pps": 400,
+  "count": 1200,
+  "settle_seconds": 10,
+  "require_hardware": true
+}
