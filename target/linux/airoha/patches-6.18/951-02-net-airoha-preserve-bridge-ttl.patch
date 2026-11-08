@@ -1,0 +1,21 @@
+From: Homelab maintainers <homelab@localhost>
+Subject: [PATCH] net: airoha: preserve TTL for bridge-originated PPE flows
+
+An IP 5-tuple can describe bridged as well as routed traffic. Honor the
+bridge provenance supplied by nf_flowtable instead of decrementing TTL
+for all IP entries. Native L2 bridge templates also preserve hop limits.
+Routed entries keep their existing TTL decrement bit.
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -1444,6 +1444,10 @@
+ 		return err;
+ 	}
+ 
++	/* IPv4/IPv6 5-tuples can originate from a bridge flowtable too. */
++	if (rule->is_bridge || offload_type == PPE_PKT_TYPE_BRIDGE)
++		hwe.ib1 &= ~AIROHA_FOE_IB1_BIND_TTL;
++
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
+ 		struct flow_match_ports ports;
+ 
