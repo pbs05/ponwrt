@@ -1,0 +1,364 @@
+From 35a205c48f551244e77b6cb0ebe59ffe4b46fd4d Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:22:23 +0800
+Subject: [PATCH] net: airoha: add bounded opt-in PON RX metadata sampling
+
+Port retained diagnostic interface without requiring the multicast or IFC implementations. AI assisted rebase; no new test runs.
+
+Signed-off-by: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+---
+ drivers/net/ethernet/airoha/Makefile          |   2 +-
+ drivers/net/ethernet/airoha/airoha_eth.c      |   6 +
+ drivers/net/ethernet/airoha/airoha_eth.h      |   3 +
+ .../net/ethernet/airoha/airoha_pon_rx_diag.c  | 264 ++++++++++++++++++
+ .../net/ethernet/airoha/airoha_pon_rx_diag.h  |  24 ++
+ 5 files changed, 298 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/airoha/airoha_pon_rx_diag.c
+ create mode 100644 drivers/net/ethernet/airoha/airoha_pon_rx_diag.h
+
+diff --git a/drivers/net/ethernet/airoha/Makefile b/drivers/net/ethernet/airoha/Makefile
+index a8b7b0b..bf46e08 100644
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -10,2 +10,2 @@ obj-$(CONFIG_NET_AIROHA_PRIORITY_KUNIT_TEST) += airoha_priority_test.o
+-airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
++airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o airoha_pon_rx_diag.o
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 37f53f9..03dc634 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1017,4 +1017,9 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ 			WRITE_ONCE(dev->pon_stats.last_rx_msg0, msg0);
+ 			WRITE_ONCE(dev->pon_stats.last_rx_msg1, msg1);
++			if (IS_ENABLED(CONFIG_DEBUG_FS) &&
++			    unlikely(smp_load_acquire(&eth->pon_rx_diag_active)) &&
++			    (pon_control || !q->skb))
++				airoha_pon_rx_diag_record(q, dev, desc, e->buf,
++							  len, pon_control);
+ 			if (msg0 & QDMA_ETH_RXMSG_CRC_ERR_MASK)
+ 				atomic64_inc(&dev->pon_stats.rx_crc_errors);
+@@ -5192,4 +5197,5 @@ static void airoha_napi_map_init(struct airoha_eth *eth)
+ 	debugfs_create_file("napi_map", 0400, eth->napi_debugfs, eth,
+ 			    &airoha_napi_map_fops);
++	airoha_pon_rx_diag_init(eth);
+ }
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 8702b54..c3c43f9 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -19,2 +19,3 @@
+ #include <net/dsa.h>
++#include "airoha_pon_rx_diag.h"
+ #include <net/airoha_qos.h>
+@@ -788,4 +789,6 @@ struct airoha_eth {
+ 	struct net_device *napi_dev;
+ 	struct dentry *napi_debugfs;
++	struct airoha_pon_rx_diag *pon_rx_diag;
++	bool pon_rx_diag_active;
+ 
+ 	struct airoha_qdma qdma[AIROHA_MAX_NUM_QDMA];
+diff --git a/drivers/net/ethernet/airoha/airoha_pon_rx_diag.c b/drivers/net/ethernet/airoha/airoha_pon_rx_diag.c
+new file mode 100644
+index 0000000..1ceacad
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_pon_rx_diag.c
+@@ -0,0 +1,264 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Bounded, opt-in AN7581 PON RX metadata. Never changes packet disposition. */
++#include <linux/inet.h>
++#include <linux/if_vlan.h>
++#include <linux/ip.h>
++#include <linux/ktime.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/unaligned.h>
++#include <net/ip.h>
++
++#include "airoha_eth.h"
++#include "airoha_regs.h"
++
++#define PON_RX_DIAG_MAX_SAMPLES	64
++#define PON_RX_DIAG_MAX_SECONDS	60
++
++struct pon_rx_sample {
++	u64 time_ns;
++	u32 ctrl, msg[4];
++	__be32 source, group;
++	u32 ifindex;
++	u16 tci[2], source_port, dest_port, fragment;
++	u16 len;
++	u8 qdma, ring, tags, protocol, dsfield, ttl;
++	bool control;
++};
++
++struct airoha_pon_rx_diag {
++	spinlock_t lock;
++	__be32 group;
++	unsigned long expires;
++	u32 count, limit;
++	bool control;
++	struct pon_rx_sample samples[PON_RX_DIAG_MAX_SAMPLES];
++};
++
++/* The first descriptor buffer still has its Ethernet header. Read only
++ * fixed headers, including at most two VLAN tags; no skb pulls or copies.
++ */
++static bool pon_rx_parse(const u8 *data, unsigned int len,
++			 struct pon_rx_sample *sample)
++{
++	unsigned int offset = ETH_HLEN, ihl;
++	u16 protocol;
++
++	if (len < ETH_HLEN)
++		return false;
++	protocol = get_unaligned_be16(data + 12);
++	while (protocol == ETH_P_8021Q || protocol == ETH_P_8021AD) {
++		if (sample->tags == ARRAY_SIZE(sample->tci) ||
++		    len < offset + VLAN_HLEN)
++			return false;
++		sample->tci[sample->tags++] = get_unaligned_be16(data + offset);
++		protocol = get_unaligned_be16(data + offset + 2);
++		offset += VLAN_HLEN;
++	}
++	if (protocol != ETH_P_IP || len < offset + sizeof(struct iphdr) ||
++	    data[offset] >> 4 != 4)
++		return false;
++	ihl = (data[offset] & 0xf) * 4;
++	if (ihl < sizeof(struct iphdr) || len < offset + ihl ||
++	    get_unaligned_be16(data + offset + 2) < ihl)
++		return false;
++	sample->source = get_unaligned((const __be32 *)(data + offset + 12));
++	sample->group = get_unaligned((const __be32 *)(data + offset + 16));
++	sample->dsfield = data[offset + 1];
++	sample->ttl = data[offset + 8];
++	sample->protocol = data[offset + 9];
++	sample->fragment = get_unaligned_be16(data + offset + 6);
++	if (!(sample->fragment & IP_OFFSET) &&
++	    (sample->protocol == IPPROTO_UDP || sample->protocol == IPPROTO_TCP) &&
++	    len >= offset + ihl + 4 &&
++	    get_unaligned_be16(data + offset + 2) >= ihl + 4) {
++		sample->source_port = get_unaligned_be16(data + offset + ihl);
++		sample->dest_port = get_unaligned_be16(data + offset + ihl + 2);
++	}
++	return true;
++}
++
++void airoha_pon_rx_diag_record(struct airoha_queue *q,
++			     struct airoha_gdm_dev *dev,
++			     const struct airoha_qdma_desc *desc,
++			     const void *data, unsigned int len, bool control)
++{
++	struct airoha_eth *eth = q->qdma->eth;
++	struct airoha_pon_rx_diag *diag = eth->pon_rx_diag;
++	struct pon_rx_sample sample = { .control = control };
++	unsigned long flags;
++
++	/* At most one short interval is armed. Check expiry even on nonmatches. */
++	if (time_after_eq(jiffies, READ_ONCE(diag->expires))) {
++		spin_lock_irqsave(&diag->lock, flags);
++		if (time_after_eq(jiffies, diag->expires))
++			WRITE_ONCE(eth->pon_rx_diag_active, false);
++		spin_unlock_irqrestore(&diag->lock, flags);
++		return;
++	}
++	if (control != READ_ONCE(diag->control))
++		return;
++	if (!control && (!pon_rx_parse(data, len, &sample) ||
++			 sample.group != READ_ONCE(diag->group)))
++		return;
++
++	spin_lock_irqsave(&diag->lock, flags);
++	/* Recheck the selector after a concurrent stop or rearm. */
++	if (!eth->pon_rx_diag_active || control != diag->control ||
++	    (!control && sample.group != diag->group))
++		goto unlock;
++	if (time_after_eq(jiffies, diag->expires) || diag->count == diag->limit) {
++		WRITE_ONCE(eth->pon_rx_diag_active, false);
++		goto unlock;
++	}
++	sample.time_ns = ktime_get_ns();
++	sample.ifindex = netdev_from_priv(dev)->ifindex;
++	sample.qdma = q->qdma - eth->qdma;
++	sample.ring = q - q->qdma->q_rx;
++	sample.len = len;
++	sample.ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
++	sample.msg[0] = le32_to_cpu(READ_ONCE(desc->msg0));
++	sample.msg[1] = le32_to_cpu(READ_ONCE(desc->msg1));
++	sample.msg[2] = le32_to_cpu(READ_ONCE(desc->msg2));
++	sample.msg[3] = le32_to_cpu(READ_ONCE(desc->msg3));
++	diag->samples[diag->count++] = sample;
++	if (diag->count == diag->limit)
++		WRITE_ONCE(eth->pon_rx_diag_active, false);
++unlock:
++	spin_unlock_irqrestore(&diag->lock, flags);
++}
++
++static int pon_rx_diag_show(struct seq_file *s, void *unused)
++{
++	struct airoha_eth *eth = s->private;
++	struct airoha_pon_rx_diag *diag = eth->pon_rx_diag;
++	struct pon_rx_sample *samples;
++	unsigned long flags, now;
++	u32 count, limit, remaining_ms;
++	bool control, active;
++	__be32 group;
++	unsigned int i;
++
++	samples = kmalloc_array(PON_RX_DIAG_MAX_SAMPLES, sizeof(*samples), GFP_KERNEL);
++	if (!samples)
++		return -ENOMEM;
++	spin_lock_irqsave(&diag->lock, flags);
++	count = diag->count;
++	limit = diag->limit;
++	group = diag->group;
++	control = diag->control;
++	now = jiffies;
++	active = eth->pon_rx_diag_active && time_before(now, diag->expires);
++	remaining_ms = active ? jiffies_to_msecs(diag->expires - now) : 0;
++	memcpy(samples, diag->samples, count * sizeof(*samples));
++	spin_unlock_irqrestore(&diag->lock, flags);
++
++	seq_puts(s, "# airoha-pon-rx-samples 1\n");
++	seq_puts(s, "# write: <IPv4-multicast-group|control> <1..64> <seconds:1..60>; stop; clear\n");
++	seq_puts(s, "# CPU-delivered first-buffer metadata after FE/PPE, before software GRO.\n");
++	seq_puts(s, "# pon_id_field is raw msg0[29:14], not proof of the on-wire LLID.\n");
++	seq_printf(s, "active=%u control=%u group=%pI4 count=%u limit=%u remaining_ms=%u\n",
++		   active, control, &group, count, limit, remaining_ms);
++	seq_puts(s, "# time_ns ifindex qdma ring control len ctrl msg0 msg1 msg2 msg3 channel pon_id_field no_mic oam sport reason hash src dst proto srcport dstport dsfield ttl tags tci0 tci1 frag\n");
++	for (i = 0; i < count; i++) {
++		const struct pon_rx_sample *r = &samples[i];
++		u32 msg0 = r->msg[0], msg1 = r->msg[1];
++
++		seq_printf(s, "%llu %u %u %u %u %u %08x %08x %08x %08x %08x %u %u %u %u %u %u %u %pI4 %pI4 %u %u %u %u %u %u %04x %04x %04x\n",
++			   r->time_ns, r->ifindex, r->qdma, r->ring, r->control,
++			   r->len, r->ctrl, msg0, msg1, r->msg[2], r->msg[3],
++			   (u32)FIELD_GET(QDMA_ETH_RXMSG_CHANNEL_MASK, msg0),
++			   (u32)FIELD_GET(QDMA_ETH_RXMSG_GEM_MASK, msg0),
++			   !!(msg0 & QDMA_ETH_RXMSG_NO_MIC_MASK),
++			   !!(msg0 & QDMA_ETH_RXMSG_OAM_MASK),
++			   (u32)FIELD_GET(QDMA_ETH_RXMSG_SPORT_MASK, msg1),
++			   (u32)FIELD_GET(QDMA_ETH_RXMSG_CRSN_MASK, msg1),
++			   (u32)FIELD_GET(QDMA_ETH_RXMSG_PPE_ENTRY_MASK, msg1),
++			   &r->source, &r->group, r->protocol, r->source_port,
++			   r->dest_port, r->dsfield, r->ttl, r->tags,
++			   r->tci[0], r->tci[1], r->fragment);
++	}
++	kfree(samples);
++	return 0;
++}
++
++static int pon_rx_diag_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, pon_rx_diag_show, inode->i_private);
++}
++
++static ssize_t pon_rx_diag_write(struct file *file, const char __user *buf,
++				 size_t len, loff_t *ppos)
++{
++	struct airoha_eth *eth = ((struct seq_file *)file->private_data)->private;
++	struct airoha_pon_rx_diag *diag = eth->pon_rx_diag;
++	char input[64], selector[16], extra, *command;
++	unsigned int count, seconds;
++	unsigned long flags;
++	__be32 group = 0;
++	const char *end;
++	bool control;
++
++	if (!len || len >= sizeof(input))
++		return -EINVAL;
++	if (copy_from_user(input, buf, len))
++		return -EFAULT;
++	if (memchr(input, '\0', len))
++		return -EINVAL;
++	input[len] = '\0';
++	command = strim(input);
++	if (!strcmp(command, "stop") || !strcmp(command, "clear")) {
++		spin_lock_irqsave(&diag->lock, flags);
++		WRITE_ONCE(eth->pon_rx_diag_active, false);
++		if (!strcmp(command, "clear"))
++			diag->count = 0;
++		spin_unlock_irqrestore(&diag->lock, flags);
++		return len;
++	}
++	if (sscanf(command, "%15s %u %u %c", selector, &count, &seconds, &extra) != 3 ||
++	    !count || count > PON_RX_DIAG_MAX_SAMPLES ||
++	    !seconds || seconds > PON_RX_DIAG_MAX_SECONDS)
++		return -EINVAL;
++	control = !strcmp(selector, "control");
++	if (!control && (!in4_pton(selector, -1, (u8 *)&group, -1, &end) ||
++			 *end || !ipv4_is_multicast(group)))
++		return -EINVAL;
++
++	spin_lock_irqsave(&diag->lock, flags);
++	WRITE_ONCE(diag->group, group);
++	WRITE_ONCE(diag->control, control);
++	WRITE_ONCE(diag->expires, jiffies + seconds * HZ);
++	diag->limit = count;
++	diag->count = 0;
++	smp_store_release(&eth->pon_rx_diag_active, true);
++	spin_unlock_irqrestore(&diag->lock, flags);
++	return len;
++}
++
++static const struct file_operations pon_rx_diag_fops = {
++	.owner = THIS_MODULE,
++	.open = pon_rx_diag_open,
++	.read = seq_read,
++	.write = pon_rx_diag_write,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
++void airoha_pon_rx_diag_init(struct airoha_eth *eth)
++{
++	struct airoha_pon_rx_diag *diag;
++
++	if (!airoha_is_7581(eth) || IS_ERR_OR_NULL(eth->napi_debugfs))
++		return;
++	diag = devm_kzalloc(eth->dev, sizeof(*diag), GFP_KERNEL);
++	if (!diag)
++		return;
++	spin_lock_init(&diag->lock);
++	/* Lifetime extends past NAPI shutdown; recursive debugfs removal drains
++	 * readers and writers before teardown. The fast-path flag starts false.
++	 */
++	eth->pon_rx_diag = diag;
++	debugfs_create_file("pon_rx_samples", 0600, eth->napi_debugfs, eth,
++			    &pon_rx_diag_fops);
++}
+diff --git a/drivers/net/ethernet/airoha/airoha_pon_rx_diag.h b/drivers/net/ethernet/airoha/airoha_pon_rx_diag.h
+new file mode 100644
+index 0000000..a5f3ebc
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_pon_rx_diag.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AIROHA_PON_RX_DIAG_H
++#define AIROHA_PON_RX_DIAG_H
++
++struct airoha_eth;
++struct airoha_queue;
++struct airoha_gdm_dev;
++struct airoha_qdma_desc;
++
++#if IS_ENABLED(CONFIG_DEBUG_FS)
++void airoha_pon_rx_diag_init(struct airoha_eth *eth);
++void airoha_pon_rx_diag_record(struct airoha_queue *q,
++			     struct airoha_gdm_dev *dev,
++			     const struct airoha_qdma_desc *desc,
++			     const void *data, unsigned int len, bool control);
++#else
++static inline void airoha_pon_rx_diag_init(struct airoha_eth *eth) {}
++static inline void
++airoha_pon_rx_diag_record(struct airoha_queue *q, struct airoha_gdm_dev *dev,
++			  const struct airoha_qdma_desc *desc,
++			  const void *data, unsigned int len, bool control) {}
++#endif
++
++#endif
+-- 
+2.53.0
+

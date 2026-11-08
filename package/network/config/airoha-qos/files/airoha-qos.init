@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+# Preinit has completed; PON (18/19) and netifd (20) have not started.
+START=16
+STOP=89
+
+boot() {
+	. /lib/functions.sh
+	local device mode maps preset rc=0
+	config_load airoha_qos || {
+		rc=$?
+		logger -t airoha-qos 'Cannot load profile; leaving QoS unchanged'
+		return "$rc"
+	}
+	config_get device main device lan1
+	config_get mode main mode priority
+	config_get preset main preset ppe-legacy-v1
+	config_get maps main map
+	# No eval: only whitespace-separated numeric pairs are accepted by ctl.
+	set -f
+	set -- $maps
+	/usr/sbin/airoha-qosctl validate "$mode" --preset "$preset" "$@" >/dev/null || rc=$?
+	if [ "$rc" -ne 0 ]; then
+		logger -t airoha-qos 'Invalid profile; leaving QoS unchanged'
+	elif [ "$mode" = priority ] || [ "$mode" = compat ]; then
+		logger -t airoha-qos 'Default priority policy; no DSCP hardware profile requested'
+	elif /usr/sbin/airoha-qosctl get "$device" >/dev/null; then
+		/usr/sbin/airoha-qosctl apply "$device" "$mode" --preset "$preset" "$@"
+		rc=$?
+		[ "$rc" = 0 ] || logger -t airoha-qos "Boot apply failed ($rc); inspect kernel profile; network startup continues"
+	else
+		rc=$?
+		logger -t airoha-qos "QoS device $device unavailable; leaving QoS unchanged"
+	fi
+	set +f
+	# procd advances its boot queue after this script exits, including on error.
+	return "$rc"
+}
+
+start() {
+	local message='Saved QoS changes require a device reboot; service restart does not apply them'
+	logger -t airoha-qos "$message"
+	printf '%s\n' "$message" >&2
+}
+reload() { start; }
+restart() { start; }
+stop() { :; }
