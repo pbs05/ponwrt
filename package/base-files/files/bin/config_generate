@@ -188,14 +188,7 @@ generate_network() {
 			[ "$type" = "bridge" ] && device="br-$1"
 
 			uci set network.$1.proto='dhcp'
-			[ -e /proc/sys/net/ipv6 ] && {
-				uci -q batch <<-EOF
-					delete network.${1}6
-					set network.${1}6='interface'
-					set network.${1}6.device='$device'
-					set network.${1}6.proto='dhcpv6'
-				EOF
-			}
+
 		;;
 
 		pppoe)
