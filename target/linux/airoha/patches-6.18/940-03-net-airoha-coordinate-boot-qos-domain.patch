@@ -1,0 +1,1224 @@
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Subject: [PATCH] net: airoha: coordinate boot QoS domain and failure containment
+
+Export retained coordinated FE/QDMA/MT7530 QoS setup onto current
+PonWrt. Preserve current DSA statistics fields and LRO admission logic;
+use test_bit() for the current WAN/PON/TX_QOS device flag indices.
+Apply, rollback and optional-fault containment retain their original
+scopes and ownership.
+
+---
+diff --git a/drivers/net/dsa/Kconfig b/drivers/net/dsa/Kconfig
+index e6f18ed..afc6150 100644
+--- a/drivers/net/dsa/Kconfig
++++ b/drivers/net/dsa/Kconfig
+@@ -40,6 +40,11 @@ config NET_DSA_MT7530
+ 	  MT7621ST and MT7623AI SoCs, and built-in switch in MT7988 SoC are
+ 	  supported as well.
+ 
++config NET_DSA_MT7530_KUNIT_TEST
++	bool "EN7581 QoS register tests" if !KUNIT_ALL_TESTS
++	depends on KUNIT && NET_DSA_MT7530
++	default KUNIT_ALL_TESTS
++
+ config NET_DSA_MT7530_MDIO
+ 	tristate "MediaTek MT7530 MDIO interface driver"
+ 	depends on NET_DSA_MT7530
+diff --git a/drivers/net/dsa/mt7530.c b/drivers/net/dsa/mt7530.c
+index 2bf9604..01ee98a 100644
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -24,6 +24,10 @@
+ #include <net/pkt_cls.h>
+ 
+ #include "mt7530.h"
++#include <net/airoha_qos.h>
++#if IS_ENABLED(CONFIG_NET_DSA_MT7530_KUNIT_TEST)
++#include <kunit/test.h>
++#endif
+ 
+ #define MT7530_STATS_POLL_INTERVAL	(1 * HZ)
+ #define MT7530_STATS_RATE_LIMIT		(HZ / 10)
+@@ -3341,9 +3345,232 @@ static int mt753x_setup_tc(struct dsa_switch *ds, int port,
+ 	}
+ }
+ 
++
++#define EN7581_QOS_REG_COUNT (12 + MT7530_NUM_PORTS * 16)
++struct en7581_qos_state {
++	struct net_device *conduit;
++	struct airoha_qos_profile profile;
++	u32 saved[EN7581_QOS_REG_COUNT];
++	u32 changed[EN7581_QOS_REG_COUNT];
++	u32 ports;
++	bool active, broken;
++};
++
++static u32 en7581_qos_reg(int index)
++{
++	if (!index)
++		return EN7581_UPW;
++	if (index < 5)
++		return EN7581_PEM((index - 1) * 2);
++	if (index < 12)
++		return EN7581_PIM((index - 5) * 10);
++	index -= 12;
++	return EN7581_MMSCR0(index / 16, index % 16 / 2) + (index % 2) * 4;
++}
++
++static u32 en7581_qos_reg_mask(struct mt7530_priv *priv, int index)
++{
++	if (!index)
++		return EN7581_UPW_MASK;
++	if (index < 5)
++		return GENMASK(10, 8) | GENMASK(26, 24);
++	if (index < 11)
++		return GENMASK(29, 0);
++	if (index == 11)
++		return GENMASK(11, 0); /* DSCP 60..63 only. */
++	if (!(priv->qos->ports & BIT((index - 12) / 16)))
++		return 0;
++	/* The SDK SP profile owns both complete scheduler configuration words. */
++	return U32_MAX;
++}
++
++static int en7581_qos_update(struct mt7530_priv *priv, u32 reg, u32 mask, u32 value)
++{
++	u32 readback;
++	int err = regmap_update_bits(priv->regmap, reg, mask, value);
++
++	if (err)
++		return err;
++	err = regmap_read(priv->regmap, reg, &readback);
++	return err ?: ((readback & mask) == value ? 0 : -EIO);
++}
++
++static int en7581_qos_write(struct mt7530_priv *priv, int index, u32 mask,
++			     u32 value)
++{
++	mask &= en7581_qos_reg_mask(priv, index);
++	/* A failed bus write can still have changed the device. */
++	priv->qos->changed[index] |= mask;
++	return en7581_qos_update(priv, en7581_qos_reg(index), mask, value & mask);
++}
++
++static int en7581_qos_idle(void *ctx)
++{
++	struct mt7530_priv *priv = ctx;
++	struct dsa_port *dp;
++	u32 value;
++	int err;
++
++	dsa_switch_for_each_user_port(dp, priv->ds) {
++		if (!dp->user || netif_running(dp->user) || dsa_port_bridge_dev_get(dp))
++			return -EBUSY;
++		err = regmap_read(priv->regmap, MT7530_PCR_P(dp->index), &value);
++		if (err)
++			return err;
++		if (value & PCR_MATRIX(dsa_user_ports(priv->ds)))
++			return -EBUSY;
++	}
++	return 0;
++}
++
++static int en7581_qos_save(void *ctx)
++{
++	struct mt7530_priv *priv = ctx;
++	int i, err;
++
++	memset(priv->qos->changed, 0, sizeof(priv->qos->changed));
++	for (i = 0; i < EN7581_QOS_REG_COUNT; i++) {
++		if (!en7581_qos_reg_mask(priv, i))
++			continue;
++		err = regmap_read(priv->regmap, en7581_qos_reg(i), &priv->qos->saved[i]);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
++static int en7581_qos_restore(void *ctx)
++{
++	struct mt7530_priv *priv = ctx;
++	int i, ret, err = 0;
++
++	for (i = EN7581_QOS_REG_COUNT - 1; i >= 0; i--) {
++		u32 mask = priv->qos->changed[i];
++
++		if (!mask)
++			continue;
++		ret = en7581_qos_update(priv, en7581_qos_reg(i), mask,
++					priv->qos->saved[i] & mask);
++		if (ret)
++			err = ret;
++		else
++			priv->qos->changed[i] = 0;
++	}
++	priv->qos->active = false;
++	priv->qos->broken |= !!err;
++	return err;
++}
++
++static int en7581_qos_apply(void *ctx, const struct airoha_qos_profile *profile)
++{
++	struct mt7530_priv *priv = ctx;
++	int port, q, dscp, err;
++
++	if (priv->id != ID_EN7581)
++		return -EOPNOTSUPP;
++	for (q = 0; q < 8; q++) {
++		u32 shift = EN7581_PEM_Q_SHIFT(q);
++
++		/* Wire PCP and DSCP remarking fields remain unchanged. */
++		err = en7581_qos_write(priv, 1 + q / 2, 7 << shift, q << shift);
++		if (err)
++			return err;
++	}
++	for (dscp = 0; dscp < 64; dscp++) {
++		u32 shift = EN7581_PIM_SHIFT(dscp);
++
++		err = en7581_qos_write(priv, 5 + dscp / 10, 7 << shift,
++					profile->map[dscp] << shift);
++		if (err)
++			return err;
++	}
++	err = en7581_qos_write(priv, 0, EN7581_UPW_MASK,
++				EN7581_UPW_STAG_DSCP_PCP);
++	if (err)
++		return err;
++	for (port = 0; port < MT7530_NUM_PORTS; port++) {
++		if (!(priv->qos->ports & BIT(port)))
++			continue;
++		for (q = 0; q < 8; q++) {
++			err = en7581_qos_write(priv, 12 + port * 16 + q * 2,
++						U32_MAX, EN7581_MMSCR_SP);
++			if (err)
++				return err;
++			err = en7581_qos_write(priv, 13 + port * 16 + q * 2, U32_MAX, 0);
++			if (err)
++				return err;
++		}
++	}
++	priv->qos->profile = *profile;
++	priv->qos->active = true;
++	return 0;
++}
++
++static const struct airoha_qos_ops en7581_qos_ops = {
++	.idle = en7581_qos_idle, .save = en7581_qos_save,
++	.apply = en7581_qos_apply, .restore = en7581_qos_restore,
++};
++
++static int en7581_qos_register(struct dsa_switch *ds)
++{
++	struct mt7530_priv *priv = ds->priv;
++	struct dsa_port *dp;
++	int err;
++
++	if (priv->id != ID_EN7581)
++		return 0;
++	if (priv->qos) {
++		if (!priv->qos->active)
++			return 0;
++		/* Snapshot the fresh hardware baseline, not the pre-reset state. */
++		err = en7581_qos_save(priv);
++		if (!err) {
++			err = en7581_qos_apply(priv, &priv->qos->profile);
++			if (err)
++				en7581_qos_restore(priv);
++		}
++		if (err) {
++			priv->qos->active = false;
++			priv->qos->broken = true;
++			if (priv->qos->conduit)
++				airoha_qos_switch_unregister(priv->qos->conduit, priv);
++			priv->qos->conduit = NULL;
++		}
++		return err;
++	}
++	priv->qos = devm_kzalloc(priv->dev, sizeof(*priv->qos), GFP_KERNEL);
++	if (!priv->qos)
++		return -ENOMEM;
++	dsa_switch_for_each_port(dp, ds)
++		if (!dsa_port_is_unused(dp))
++			priv->qos->ports |= BIT(dp->index);
++	dsa_switch_for_each_cpu_port(dp, ds) {
++		err = airoha_qos_switch_register(dp->conduit, &en7581_qos_ops, priv);
++		if (err == -EOPNOTSUPP)
++			continue;
++		if (err)
++			return err;
++		priv->qos->conduit = dp->conduit;
++		break;
++	}
++	return 0;
++}
++
++static void mt753x_qos_teardown(struct dsa_switch *ds)
++{
++	struct mt7530_priv *priv = ds->priv;
++
++	mt753x_teardown(ds);
++	if (priv->qos && priv->qos->conduit) {
++		airoha_qos_switch_unregister(priv->qos->conduit, priv);
++		priv->qos->conduit = NULL;
++	}
++}
++
+ static int mt7988_setup(struct dsa_switch *ds)
+ {
+ 	struct mt7530_priv *priv = ds->priv;
++	int err;
+ 
+ 	/* Reset the switch */
+ 	reset_control_assert(priv->rstc);
+@@ -3364,13 +3591,25 @@ static int mt7988_setup(struct dsa_switch *ds)
+ 	/* Reset the switch PHYs */
+ 	mt7530_write(priv, MT7530_SYS_CTRL, SYS_CTRL_PHY_RST);
+ 
+-	return mt7531_setup_common(ds);
++	err = mt7531_setup_common(ds);
++	if (err)
++		return err;
++	err = en7581_qos_register(ds);
++	if (err)
++		dev_warn(priv->dev,
++			 "Optional QoS setup failed (%d); continuing switch initialization\n",
++			 err);
++	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_DSA_MT7530_KUNIT_TEST)
++#include "mt7530_qos_test.h"
++#endif
++
+ const struct dsa_switch_ops mt7530_switch_ops = {
+ 	.get_tag_protocol	= mtk_get_tag_protocol,
+ 	.setup			= mt753x_setup,
+-	.teardown		= mt753x_teardown,
++	.teardown		= mt753x_qos_teardown,
+ 	.preferred_default_local_cpu_port = mt753x_preferred_default_local_cpu_port,
+ 	.get_strings		= mt7530_get_strings,
+ 	.get_ethtool_stats	= mt7530_get_ethtool_stats,
+diff --git a/drivers/net/dsa/mt7530.h b/drivers/net/dsa/mt7530.h
+index ca665f8..efecb6d 100644
+--- a/drivers/net/dsa/mt7530.h
++++ b/drivers/net/dsa/mt7530.h
+@@ -11,6 +11,19 @@
+ #define MT7530_NUM_FDB_RECORDS		2048
+ #define MT7530_ALL_MEMBERS		0xff
+ 
++/* EN7581 priority arbitration, classification and egress scheduler. */
++#define EN7581_UPW			0x44
++#define EN7581_UPW_MASK			0x777777
++#define EN7581_UPW_STAG_DSCP_PCP		0x126372
++#define EN7581_PEM(p)			(0x48 + ((p) / 2) * 4)
++#define EN7581_PEM_Q_SHIFT(p)		(8 + ((p) % 2) * 16)
++#define EN7581_PIM(dscp)			(0x58 + ((dscp) / 10) * 4)
++#define EN7581_PIM_SHIFT(dscp)		(((dscp) % 10) * 3)
++#define EN7581_PORT_PRIO			GENMASK(26, 24)
++#define EN7581_MMSCR0(p, q)		(0x1000 + (p) * 0x100 + (q) * 8)
++#define EN7581_MMSCR1(p, q)		(EN7581_MMSCR0(p, q) + 4)
++#define EN7581_MMSCR_SP			BIT(31)
++
+ #define MTK_HDR_LEN	4
+ #define MT7530_MAX_MTU	(15 * 1024 - ETH_HLEN - ETH_FCS_LEN - MTK_HDR_LEN)
+ 
+@@ -882,7 +895,10 @@ struct mt753x_info {
+  * @stats_work:		Delayed work for polling MIB counters on MDIO switches
+  * @stats_last:		Jiffies timestamp of last MIB counter poll
+  */
++struct en7581_qos_state;
++
+ struct mt7530_priv {
++	struct en7581_qos_state *qos;
+ 	struct device		*dev;
+ 	struct dsa_switch	*ds;
+ 	struct mii_bus		*bus;
+diff --git a/drivers/net/dsa/mt7530_qos_test.h b/drivers/net/dsa/mt7530_qos_test.h
+new file mode 100644
+index 0000000..b125c73
+--- /dev/null
++++ b/drivers/net/dsa/mt7530_qos_test.h
+@@ -0,0 +1,161 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Included so tests exercise the actual static initialization/DCB code. */
++struct en7581_test_regs {
++	u32 words[0x8000 / 4];
++	u32 fail_reg;
++	u32 fail_read_reg;
++	u32 ignore_reg;
++	u32 ports;
++};
++
++static int en7581_test_read(void *ctx, unsigned int reg, unsigned int *val)
++{
++	struct en7581_test_regs *regs = ctx;
++
++	if (reg == regs->fail_read_reg)
++		return -EIO;
++	if (reg >= 0x1000 && reg < 0x1700 &&
++	    !(regs->ports & BIT((reg - 0x1000) / 0x100)))
++		return -EIO;
++	*val = regs->words[reg / 4];
++	return 0;
++}
++
++static int en7581_test_write(void *ctx, unsigned int reg, unsigned int val)
++{
++	struct en7581_test_regs *regs = ctx;
++
++	if (reg == regs->fail_reg)
++		return -EIO;
++	if (reg == regs->ignore_reg)
++		return 0;
++	regs->words[reg / 4] = val;
++	return 0;
++}
++
++static void en7581_test_regmap_exit(void *map)
++{
++	regmap_exit(map);
++}
++
++static void en7581_qos_register_test(struct kunit *test)
++{
++	static const struct regmap_bus bus = {
++		.reg_read = en7581_test_read,
++		.reg_write = en7581_test_write,
++	};
++	static const struct regmap_config config = {
++		.reg_bits = 32, .val_bits = 32, .reg_stride = 4,
++		.max_register = 0x7ffc,
++	};
++	struct en7581_test_regs *regs;
++	struct mt7530_priv *priv;
++	struct dsa_switch *ds;
++	struct dsa_switch_tree dst = {};
++	struct dsa_port user = {}, cpu = {};
++	int dscp, port, queue;
++	struct airoha_qos_profile profile;
++
++	regs = kunit_kzalloc(test, sizeof(*regs), GFP_KERNEL);
++	priv = kunit_kzalloc(test, sizeof(*priv), GFP_KERNEL);
++	ds = kunit_kzalloc(test, sizeof(*ds), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, regs);
++	KUNIT_ASSERT_NOT_NULL(test, priv);
++	KUNIT_ASSERT_NOT_NULL(test, ds);
++	regs->fail_reg = U32_MAX;
++	regs->fail_read_reg = U32_MAX;
++	regs->ignore_reg = U32_MAX;
++	regs->ports = GENMASK(4, 2) | BIT(5);
++	priv->regmap = regmap_init(NULL, &bus, regs, &config);
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, priv->regmap);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
++			       en7581_test_regmap_exit, priv->regmap), 0);
++	priv->id = ID_EN7581;
++	priv->qos = kunit_kzalloc(test, sizeof(*priv->qos), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, priv->qos);
++	priv->qos->ports = regs->ports;
++	airoha_qos_default_profile(&profile);
++	ds->priv = priv;
++	for (queue = 0; queue < 4; queue++)
++		regs->words[EN7581_PEM(queue * 2) / 4] = 0x383f383f;
++	KUNIT_ASSERT_EQ(test, en7581_qos_save(priv), 0);
++	KUNIT_ASSERT_EQ(test, en7581_qos_apply(priv, &profile), 0);
++	for (queue = 0; queue < 8; queue++) {
++		u32 value = regs->words[EN7581_PEM(queue) / 4];
++
++		KUNIT_EXPECT_EQ(test, (value >> EN7581_PEM_Q_SHIFT(queue)) & 7,
++				(u32)queue);
++		KUNIT_EXPECT_EQ(test, value & 0x383f383f, (u32)0x383f383f);
++	}
++	for (dscp = 0; dscp < 64; dscp++)
++		KUNIT_EXPECT_EQ(test, (regs->words[EN7581_PIM(dscp) / 4] >> EN7581_PIM_SHIFT(dscp)) & 7,
++				(u32)profile.map[dscp]);
++	for (port = 0; port < MT7530_NUM_PORTS; port++) {
++		if (!(regs->ports & BIT(port)))
++			continue;
++		for (queue = 0; queue < 8; queue++) {
++			KUNIT_EXPECT_EQ(test, regs->words[EN7581_MMSCR0(port, queue) / 4],
++					(u32)EN7581_MMSCR_SP);
++			KUNIT_EXPECT_EQ(test, regs->words[EN7581_MMSCR1(port, queue) / 4], 0);
++		}
++	}
++	KUNIT_EXPECT_EQ(test, en7581_qos_restore(priv), 0);
++	for (queue = 0; queue < 4; queue++)
++		KUNIT_EXPECT_EQ(test, regs->words[EN7581_PEM(queue * 2) / 4],
++				(u32)0x383f383f);
++	regs->fail_reg = EN7581_PIM(63);
++	KUNIT_EXPECT_EQ(test, en7581_qos_apply(priv, &profile), -EIO);
++	regs->fail_reg = U32_MAX;
++	/* Failure before UPW/scheduler writes must not read or restore them. */
++	regs->fail_read_reg = EN7581_UPW;
++	/* Unowned/reserved bits may change independently after the snapshot. */
++	regs->words[EN7581_PIM(63) / 4] |= BIT(31);
++	regs->words[EN7581_PEM(0) / 4] ^= BIT(0);
++	KUNIT_ASSERT_EQ(test, en7581_qos_restore(priv), 0);
++	KUNIT_EXPECT_EQ(test, regs->words[EN7581_PIM(63) / 4] & BIT(31), BIT(31));
++	KUNIT_EXPECT_EQ(test, regs->words[EN7581_PEM(0) / 4] & BIT(0), 0);
++	regs->fail_read_reg = U32_MAX;
++	regs->ignore_reg = EN7581_PIM(7);
++	KUNIT_EXPECT_EQ(test, en7581_qos_apply(priv, &profile), -EIO);
++	regs->ignore_reg = U32_MAX;
++	KUNIT_ASSERT_EQ(test, en7581_qos_apply(priv, &profile), 0);
++	/* Same stored profile can restore all mappings after a reset. */
++	memset(regs->words, 0, sizeof(regs->words));
++	KUNIT_EXPECT_EQ(test, en7581_qos_apply(priv, &priv->qos->profile), 0);
++	priv->id = ID_MT7530;
++	KUNIT_EXPECT_EQ(test, en7581_qos_apply(priv, &profile), -EOPNOTSUPP);
++	KUNIT_EXPECT_TRUE(test, !mt7530_switch_ops.port_get_dscp_prio);
++
++	/* A failed QoS rollback must not disable ordinary DSA port opening. */
++	priv->id = ID_EN7581;
++	priv->ds = ds;
++	priv->qos->broken = true;
++	mutex_init(&priv->reg_mutex);
++	ds->dst = &dst;
++	INIT_LIST_HEAD(&dst.ports);
++	user.ds = cpu.ds = ds;
++	user.index = 2;
++	user.type = DSA_PORT_TYPE_USER;
++	user.cpu_dp = &cpu;
++	cpu.index = 5;
++	cpu.type = DSA_PORT_TYPE_CPU;
++	list_add_tail(&user.list, &dst.ports);
++	list_add_tail(&cpu.list, &dst.ports);
++	KUNIT_EXPECT_EQ(test, mt7530_port_enable(ds, 2, NULL), 0);
++	KUNIT_EXPECT_TRUE(test, priv->ports[2].enable);
++	KUNIT_EXPECT_EQ(test,
++		regs->words[MT7530_PCR_P(2) / 4] & PCR_MATRIX_MASK,
++		(u32)PCR_MATRIX(BIT(5)));
++}
++
++static struct kunit_case en7581_qos_cases[] = {
++	KUNIT_CASE(en7581_qos_register_test),
++	{}
++};
++
++static struct kunit_suite en7581_qos_suite = {
++	.name = "en7581-qos-registers",
++	.test_cases = en7581_qos_cases,
++};
++
++kunit_test_suite(en7581_qos_suite);
+diff --git a/drivers/net/ethernet/airoha/Kconfig b/drivers/net/ethernet/airoha/Kconfig
+index acc4404..00cb856 100644
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -14,9 +14,14 @@ config NET_AIROHA_PRIORITY_KUNIT_TEST
+ 
+ if NET_VENDOR_AIROHA
+ 
++config NET_AIROHA_QOS
++	tristate
++	depends on INET
++
+ config NET_AIROHA_QOS_KUNIT_TEST
+ 	tristate "Airoha QoS metadata tests" if !KUNIT_ALL_TESTS
+ 	depends on KUNIT && INET
++	select NET_AIROHA_QOS
+ 	default KUNIT_ALL_TESTS
+ 	help
+ 	  Test hardware channel/ring separation and QoS metadata without hardware.
+@@ -32,6 +37,7 @@ config NET_AIROHA_NPU
+ config NET_AIROHA
+ 	tristate "Airoha SoC Gigabit Ethernet support"
+ 	depends on NET_DSA || !NET_DSA
++	select NET_AIROHA_QOS
+ 	select NET_AIROHA_NPU
+ 	select PAGE_POOL
+ 	select PCS_AIROHA
+diff --git a/drivers/net/ethernet/airoha/Makefile b/drivers/net/ethernet/airoha/Makefile
+index 1ddf258..a8b7b0b 100644
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -10,3 +10,4 @@ airoha-eth-y := airoha_eth.o airoha_ppe.o
+ airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
+ obj-$(CONFIG_NET_AIROHA_QOS_KUNIT_TEST) += airoha_qos_test.o
++obj-$(CONFIG_NET_AIROHA_QOS) += airoha_qos.o
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index c763386..d5bb47a 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1793,9 +1793,48 @@ static void airoha_qdma_init_qos_stats(struct airoha_qdma *qdma)
+ 	}
+ }
+ 
++static int airoha_qdma_qos_set(struct airoha_qdma *qdma, int r, u32 value)
++{
++	value &= CHAN_QOS_MODE_ALL_MASK;
++	airoha_qdma_rmw(qdma, REG_CHAN_QOS_MODE(r), CHAN_QOS_MODE_ALL_MASK, value);
++	return (airoha_qdma_rr(qdma, REG_CHAN_QOS_MODE(r)) & CHAN_QOS_MODE_ALL_MASK) ==
++		value ? 0 : -EIO;
++}
++
++static int airoha_qdma_qos_init(struct airoha_qdma *qdma)
++{
++	int r, err;
++
++	for (r = 0; r < 4; r++) {
++		err = airoha_qdma_qos_set(qdma, r, 0x11111111 * TC_SCH_SP);
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
+ static int airoha_qdma_hw_init(struct airoha_qdma *qdma)
+ {
+-	int i;
++	int i, err;
++
++	/* An external ETS profile is not replayed by the fixed DSCP domain. */
++	for (i = 0; i < AIROHA_NUM_QOS_CHANNELS; i++) {
++		if (!qdma->ets_owner[i].netdev)
++			continue;
++		qdma->ets_owner[i].broken = true;
++		WRITE_ONCE(qdma->eth->qos.broken, true);
++		dev_warn(qdma->eth->dev, "QDMA reset invalidated external ETS scheduling\n");
++	}
++
++	if (READ_ONCE(qdma->eth->qos.active)) {
++		err = airoha_qdma_qos_init(qdma);
++		if (err) {
++			WRITE_ONCE(qdma->eth->qos.broken, true);
++			dev_warn(qdma->eth->dev,
++				 "QoS scheduler readback failed (%d); continuing DMA initialization\n",
++				 err);
++		}
++	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->irq_banks); i++) {
+ 		/* clear pending irqs */
+@@ -2353,6 +2392,8 @@ static int airoha_dev_open(struct net_device *netdev)
+ 	struct airoha_qdma *qdma;
+ 	int qdma_id, err;
+ 
++	/* QoS faults must not prevent the management/data interfaces opening. */
++
+ 	/* LRO is configured on the QDMA and it is shared between all
+ 	 * the devices using it. Refuse to open a second device on the
+ 	 * same QDMA if LRO is enabled on any device sharing it or if
+@@ -2753,18 +2794,18 @@ static u16 airoha_dev_select_queue(struct net_device *netdev,
+ 	 */
+ 	queue = airoha_is_7581(dev->eth) ? airoha_priority_queue(skb->priority) :
+ 		skb->priority % AIROHA_NUM_QOS_QUEUES;
+-	if (READ_ONCE(dev->eth->qos_dscp)) {
++	if (READ_ONCE(dev->eth->qos.active)) {
+ 		bool mtk = false;
+ 
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ 		if (netdev_uses_dsa(netdev))
+ 			mtk = netdev->dsa_ptr->tag_ops->proto == DSA_TAG_PROTO_MTK;
+ #endif
+-		queue = airoha_qos_cpu_class(&dev->eth->qos_profile, skb, mtk, queue);
++		queue = airoha_qos_cpu_class(&dev->eth->qos.profile, skb, mtk, queue);
+ 	}
+ 	channel = netdev_uses_dsa(netdev) ? skb_get_queue_mapping(skb) : port->id;
+ 	channel = channel % AIROHA_NUM_QOS_CHANNELS;
+-	if (READ_ONCE(dev->eth->qos_dscp) && airoha_is_lan_gdm_dev(dev)) {
++	if (READ_ONCE(dev->eth->qos.active) && airoha_is_lan_gdm_dev(dev)) {
+ 		struct airoha_qos_egress e;
+ 		int dsa = netdev_uses_dsa(netdev) ? skb_get_queue_mapping(skb) : -1;
+ 
+@@ -3007,7 +3048,7 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 		if (airoha_get_dsa_tag(skb, owner_netdev, &tag))
+ 			goto error_unlock;
+ 		nboq = dev->nbq;
+-		if (READ_ONCE(dev->eth->qos_dscp) && airoha_is_lan_gdm_dev(dev)) {
++		if (READ_ONCE(dev->eth->qos.active) && airoha_is_lan_gdm_dev(dev)) {
+ 			struct airoha_qos_egress e;
+ 			int dsa = -1;
+ 
+@@ -3467,7 +3508,10 @@ static int airoha_ets_restore(struct net_device *netdev, int channel,
+ 	int err = airoha_qdma_set_tx_prio_sched(netdev, channel);
+ 
+ 	if (err) {
++		struct airoha_gdm_dev *dev = netdev_priv(netdev);
++
+ 		owner->broken = true;
++		WRITE_ONCE(dev->eth->qos.broken, true);
+ 		netdev_err(netdev, "ETS channel %d SP restore failed: %d\n", channel, err);
+ 	} else {
+ 		memset(owner, 0, sizeof(*owner));
+@@ -4239,7 +4283,7 @@ static int airoha_dev_tc_setup(struct net_device *dev,
+ {
+ 	struct airoha_gdm_dev *gdm = netdev_priv(dev);
+ 
+-	if (READ_ONCE(gdm->eth->qos_dscp) &&
++	if (READ_ONCE(gdm->eth->qos.active) &&
+ 	    (type == TC_SETUP_QDISC_HTB || type == TC_SETUP_QDISC_ETS))
+ 		return -EOPNOTSUPP;
+ 
+@@ -4890,6 +4934,136 @@ static int airoha_register_gdm_devices(struct airoha_eth *eth)
+ 	return 0;
+ }
+ 
++
++static bool airoha_qos_owns(void *priv, const struct net_device *netdev)
++{
++	struct airoha_eth *eth = priv;
++	int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
++		struct airoha_gdm_port *port = eth->ports[i];
++
++		if (!port)
++			continue;
++		for (j = 0; j < ARRAY_SIZE(port->devs); j++)
++			if (port->devs[j] && netdev_from_priv(port->devs[j]) == netdev)
++				return true;
++	}
++	return false;
++}
++
++static int airoha_qos_idle(void *priv)
++{
++	struct airoha_eth *eth = priv;
++	int i, j;
++
++	ASSERT_RTNL();
++	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
++		struct airoha_gdm_port *port = eth->ports[i];
++
++		if (!port)
++			continue;
++		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
++			struct airoha_gdm_dev *dev = port->devs[j];
++
++			if (!dev)
++				continue;
++			if (netif_running(netdev_from_priv(dev)) ||
++			    test_bit(AIROHA_DEV_F_TX_QOS, &dev->flags))
++				return -EBUSY;
++			if (!test_bit(AIROHA_DEV_F_PON, &dev->flags) &&
++			    (test_bit(AIROHA_DEV_F_WAN, &dev->flags) ||
++			     (port->id != 1 && (port->id != 4 || dev->nbq))))
++				return -EOPNOTSUPP;
++		}
++	}
++	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
++		struct airoha_qdma *qdma = &eth->qdma[i];
++
++		if (!bitmap_empty(qdma->qos_channel_map, AIROHA_NUM_QOS_CHANNELS))
++			return -EBUSY;
++		for (j = 0; j < AIROHA_NUM_QOS_CHANNELS; j++)
++			if (qdma->ets_owner[j].netdev || qdma->ets_owner[j].broken)
++				return -EBUSY;
++		for (j = 0; j < ARRAY_SIZE(qdma->q_tx); j++) {
++			struct airoha_queue *q = &qdma->q_tx[j];
++			bool busy;
++
++			spin_lock_bh(&q->lock);
++			busy = q->queued;
++			spin_unlock_bh(&q->lock);
++			if (busy)
++				return -EBUSY;
++		}
++	}
++	return airoha_ppe_qos_idle(eth);
++}
++
++static int airoha_qos_save(void *priv)
++{
++	struct airoha_eth *eth = priv;
++	int i, r;
++
++	memset(eth->qos_changed, 0, sizeof(eth->qos_changed));
++	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
++		for (r = 0; r < 4; r++)
++			eth->qos_saved[i][r] = airoha_qdma_rr(&eth->qdma[i],
++							  REG_CHAN_QOS_MODE(r));
++	return 0;
++}
++
++static int airoha_qos_apply(void *priv, const struct airoha_qos_profile *p)
++{
++	struct airoha_eth *eth = priv;
++	int i, r, err;
++
++	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
++		for (r = 0; r < 4; r++) {
++			eth->qos_changed[i] |= BIT(r);
++			err = airoha_qdma_qos_set(&eth->qdma[i], r,
++						 0x11111111 * TC_SCH_SP);
++			if (err)
++				return err;
++		}
++	return 0;
++}
++
++static int airoha_qos_restore(void *priv)
++{
++	struct airoha_eth *eth = priv;
++	int i, r, ret, err = 0;
++
++	for (i = ARRAY_SIZE(eth->qdma) - 1; i >= 0; i--)
++		for (r = 3; r >= 0; r--) {
++			if (!(eth->qos_changed[i] & BIT(r)))
++				continue;
++			ret = airoha_qdma_qos_set(&eth->qdma[i], r,
++						eth->qos_saved[i][r]);
++			if (ret)
++				err = ret;
++			else
++				eth->qos_changed[i] &= ~BIT(r);
++		}
++	return err;
++}
++
++static void airoha_qos_lock(void *priv)
++{
++	mutex_lock(&flow_offload_mutex);
++}
++
++static void airoha_qos_unlock(void *priv)
++{
++	mutex_unlock(&flow_offload_mutex);
++}
++
++static const struct airoha_qos_ops airoha_eth_qos_ops = {
++	.lock = airoha_qos_lock, .unlock = airoha_qos_unlock,
++	.owns = airoha_qos_owns, .idle = airoha_qos_idle,
++	.save = airoha_qos_save, .apply = airoha_qos_apply,
++	.restore = airoha_qos_restore,
++};
++
+ static int airoha_probe(struct platform_device *pdev)
+ {
+ 	struct reset_control_bulk_data *xsi_rsts;
+@@ -4981,9 +5155,14 @@ static int airoha_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	if (airoha_is_7581(eth))
++		airoha_qos_register(&eth->qos, &airoha_eth_qos_ops, eth);
+ 	err = airoha_register_gdm_devices(eth);
+-	if (err)
++	if (err) {
++		if (airoha_is_7581(eth))
++			airoha_qos_unregister(&eth->qos);
+ 		goto error_napi_stop;
++	}
+ 
+ 	return 0;
+ 
+@@ -5029,6 +5208,9 @@ static void airoha_remove(struct platform_device *pdev)
+ 	struct airoha_eth *eth = platform_get_drvdata(pdev);
+ 	int i;
+ 
++	if (airoha_is_7581(eth))
++		airoha_qos_unregister(&eth->qos);
++
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
+ 		airoha_qdma_stop_napi(&eth->qdma[i]);
+ 		airoha_qdma_tx_cleanup(&eth->qdma[i]);
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index bdb99ed..82d9e83 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -761,8 +761,9 @@ struct airoha_eth_soc_data {
+ 
+ struct airoha_eth {
+ 	/* Enabled only by the coordinated boot profile. */
+-	bool qos_dscp;
+-	struct airoha_qos_profile qos_profile;
++	struct airoha_qos_domain qos;
++	u32 qos_saved[AIROHA_MAX_NUM_QDMA][4];
++	u8 qos_changed[AIROHA_MAX_NUM_QDMA];
+ 	struct device *dev;
+ 
+ 	const struct airoha_eth_soc_data *soc;
+@@ -851,6 +852,7 @@ bool airoha_is_valid_gdm_dev(struct airoha_eth *eth,
+ 			     struct airoha_gdm_dev *dev);
+ 
+ extern struct mutex flow_offload_mutex;
++int airoha_ppe_qos_idle(struct airoha_eth *eth);
+ 
+ static inline struct airoha_qdma *
+ airoha_qdma_deref(struct airoha_gdm_dev *dev)
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index e7d57ed..118bfb8 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -486,7 +486,7 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 					return err;
+ 				channel = FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK,
+ 						    pon_tag);
+-			} else if (READ_ONCE(eth->qos_dscp) && airoha_is_lan_gdm_dev(dev)) {
++			} else if (READ_ONCE(eth->qos.active) && airoha_is_lan_gdm_dev(dev)) {
+ 				struct airoha_qos_egress e;
+ 
+ 				err = airoha_qos_resolve_egress(port->id, dev->nbq,
+@@ -500,8 +500,8 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 				channel %= AIROHA_NUM_QOS_CHANNELS;
+ 			}
+ 			priority = rt_tos2priority(dsfield);
+-			priority = READ_ONCE(eth->qos_dscp) ?
+-				airoha_qos_class(&eth->qos_profile, dsfield) :
++			priority = READ_ONCE(eth->qos.active) ?
++				airoha_qos_class(&eth->qos.profile, dsfield) :
+ 				airoha_is_7581(eth) ? airoha_priority_queue(priority) :
+ 				priority % AIROHA_NUM_QOS_QUEUES;
+ 			qdata |= FIELD_PREP(AIROHA_FOE_CHANNEL, channel) |
+@@ -584,9 +584,9 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 	} else if (dsa_port >= 0) {
+ 		l2->etype = BIT(dsa_port);
+ 		l2->etype |= !data->vlan.num ? BIT(15) : 0;
+-		if (READ_ONCE(eth->qos_dscp))
++		if (READ_ONCE(eth->qos.active))
+ 			l2->etype = airoha_stag_set_priority(l2->etype,
+-				airoha_qos_class(&eth->qos_profile, dsfield));
++				airoha_qos_class(&eth->qos.profile, dsfield));
+ 	} else if (pon_tag & AIROHA_PON_QDMA_VALID) {
+ 		/* PON MAC interprets FOE etype as GPON GEM Port-ID. EPON selects LLID
+ 		 * through channel and leaves special tag zero. IB1_PPPOE and pppoe_id
+@@ -1797,6 +1797,31 @@ void airoha_ppe_put_dev(struct airoha_ppe_dev *dev)
+ }
+ EXPORT_SYMBOL_GPL(airoha_ppe_put_dev);
+ 
++
++int airoha_ppe_qos_idle(struct airoha_eth *eth)
++{
++	struct airoha_ppe *ppe = eth->ppe;
++	int i, err = 0;
++
++	lockdep_assert_held(&flow_offload_mutex);
++	if (!ppe)
++		return -ENODEV;
++	if (atomic_read(&eth->flow_table.nelems))
++		return -EBUSY;
++	spin_lock_bh(&ppe_lock);
++	for (i = 0; i < airoha_ppe_get_total_num_entries(ppe); i++) {
++		struct airoha_foe_entry *e = ppe->foe + i * sizeof(*e);
++
++		if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, READ_ONCE(e->ib1)) ==
++		    AIROHA_FOE_STATE_BIND || !hlist_empty(&ppe->foe_flow[i])) {
++			err = -EBUSY;
++			break;
++		}
++	}
++	spin_unlock_bh(&ppe_lock);
++	return err;
++}
++
+ int airoha_ppe_init(struct airoha_eth *eth)
+ {
+ 	int foe_size, err, ppe_num_stats_entries;
+diff --git a/drivers/net/ethernet/airoha/airoha_qos.c b/drivers/net/ethernet/airoha/airoha_qos.c
+new file mode 100644
+index 0000000..dacb5d0
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_qos.c
+@@ -0,0 +1,78 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/module.h>
++#include <linux/rtnetlink.h>
++#include <net/airoha_qos.h>
++
++static LIST_HEAD(airoha_qos_domains);
++
++void airoha_qos_register(struct airoha_qos_domain *d,
++			 const struct airoha_qos_ops *ops, void *priv)
++{
++	rtnl_lock();
++	d->ops[0] = ops;
++	d->priv[0] = priv;
++	airoha_qos_default_profile(&d->profile);
++	d->profile.dscp = false;
++	list_add_tail(&d->list, &airoha_qos_domains);
++	rtnl_unlock();
++}
++EXPORT_SYMBOL_GPL(airoha_qos_register);
++
++void airoha_qos_unregister(struct airoha_qos_domain *d)
++{
++	rtnl_lock();
++	list_del(&d->list);
++	rtnl_unlock();
++}
++EXPORT_SYMBOL_GPL(airoha_qos_unregister);
++
++static struct airoha_qos_domain *airoha_qos_find(struct net_device *dev)
++{
++	struct airoha_qos_domain *d;
++
++	ASSERT_RTNL();
++	list_for_each_entry(d, &airoha_qos_domains, list)
++		if (d->ops[0]->owns(d->priv[0], dev))
++			return d;
++	return NULL;
++}
++
++int airoha_qos_switch_register(struct net_device *conduit,
++			      const struct airoha_qos_ops *ops, void *priv)
++{
++	struct airoha_qos_domain *d;
++	int err = 0;
++
++	rtnl_lock();
++	d = airoha_qos_find(conduit);
++	if (!d)
++		err = -EOPNOTSUPP;
++	else if (d->ops[1] || d->frozen)
++		err = -EBUSY;
++	else {
++		d->ops[1] = ops;
++		d->priv[1] = priv;
++	}
++	rtnl_unlock();
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_qos_switch_register);
++
++void airoha_qos_switch_unregister(struct net_device *conduit, void *priv)
++{
++	struct airoha_qos_domain *d;
++
++	rtnl_lock();
++	d = airoha_qos_find(conduit);
++	if (d && d->priv[1] == priv) {
++		/* An active domain cannot silently lose its switch participant. */
++		d->broken |= d->active;
++		d->ops[1] = NULL;
++		d->priv[1] = NULL;
++	}
++	rtnl_unlock();
++}
++EXPORT_SYMBOL_GPL(airoha_qos_switch_unregister);
++
++MODULE_DESCRIPTION("Airoha coordinated boot QoS domain");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/net/ethernet/airoha/airoha_qos_test.c b/drivers/net/ethernet/airoha/airoha_qos_test.c
+index 69d6564..a634411 100644
+--- a/drivers/net/ethernet/airoha/airoha_qos_test.c
++++ b/drivers/net/ethernet/airoha/airoha_qos_test.c
+@@ -172,10 +172,104 @@ static void airoha_parser_reject_test(struct kunit *test)
+ 	kfree_skb(skb);
+ }
+ 
++
++struct airoha_mock {
++	int idle, save, apply, restore, writes, restores;
++};
++static int mock_idle(void *p) { return ((struct airoha_mock *)p)->idle; }
++static int mock_save(void *p) { return ((struct airoha_mock *)p)->save; }
++static int mock_apply(void *p, const struct airoha_qos_profile *profile)
++{
++	struct airoha_mock *m = p;
++
++	m->writes++;
++	return m->apply;
++}
++static int mock_restore(void *p)
++{
++	struct airoha_mock *m = p;
++
++	m->restores++;
++	return m->restore;
++}
++static const struct airoha_qos_ops mock_ops = {
++	.idle = mock_idle, .save = mock_save,
++	.apply = mock_apply, .restore = mock_restore,
++};
++static void airoha_transaction_test(struct kunit *test)
++{
++	struct airoha_mock cpu = {}, sw = {};
++	struct airoha_qos_domain d = { .ops = { &mock_ops, &mock_ops },
++		.priv = { &cpu, &sw } };
++	struct airoha_qos_profile p;
++
++	airoha_qos_default_profile(&p);
++	/* preinit use does not freeze: once down, application may succeed. */
++	cpu.idle = -EBUSY;
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EBUSY);
++	KUNIT_EXPECT_FALSE(test, d.frozen);
++	KUNIT_EXPECT_EQ(test, cpu.writes, 0);
++	cpu.idle = 0;
++	sw.save = -EIO;
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EIO);
++	KUNIT_EXPECT_EQ(test, cpu.writes, 0);
++	sw.save = 0;
++	sw.apply = -EIO;
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EIO);
++	KUNIT_EXPECT_EQ(test, cpu.restores, 1);
++	KUNIT_EXPECT_EQ(test, sw.restores, 1);
++	KUNIT_EXPECT_FALSE(test, d.active);
++	KUNIT_EXPECT_FALSE(test, d.broken);
++	sw.apply = 0;
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), 0);
++	KUNIT_EXPECT_TRUE(test, d.active);
++	KUNIT_EXPECT_TRUE(test, d.frozen);
++	KUNIT_EXPECT_MEMEQ(test, d.profile.map, p.map, 64);
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EPERM);
++	d.frozen = d.active = false;
++	sw.apply = -EIO;
++	cpu.restore = -EIO;
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EIO);
++	KUNIT_EXPECT_TRUE(test, d.broken);
++	KUNIT_EXPECT_FALSE(test, d.active);
++	KUNIT_EXPECT_FALSE(test, d.profile.dscp);
++	KUNIT_EXPECT_TRUE(test, d.frozen);
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EIO);
++}
++
++static void airoha_transaction_validation_test(struct kunit *test)
++{
++	struct airoha_mock cpu = {}, sw = {};
++	struct airoha_qos_domain d = { .ops = { &mock_ops, NULL },
++		.priv = { &cpu, &sw } };
++	struct airoha_qos_profile p;
++
++	airoha_qos_default_profile(&p);
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -ENODEV);
++	d.ops[1] = &mock_ops;
++	p.map[63] = 8;
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EINVAL);
++	KUNIT_EXPECT_EQ(test, cpu.writes, 0);
++	p.map[63] = 0;
++	sw.idle = -EBUSY;
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EBUSY);
++	KUNIT_EXPECT_EQ(test, cpu.writes, 0);
++	sw.idle = 0;
++	p.dscp = false;
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), 0);
++	KUNIT_EXPECT_FALSE(test, d.active);
++	KUNIT_EXPECT_TRUE(test, d.frozen);
++	KUNIT_EXPECT_EQ(test, cpu.writes, 0);
++	KUNIT_EXPECT_EQ(test, sw.writes, 0);
++	KUNIT_EXPECT_EQ(test, airoha_qos_commit(&d, &p), -EPERM);
++}
++
+ static struct kunit_case airoha_qos_cases[] = {
+ 	KUNIT_CASE(airoha_egress_test),
+ 	KUNIT_CASE(airoha_cpu_priority_preserved_test),
+ 	KUNIT_CASE(airoha_profile_test),
++	KUNIT_CASE(airoha_transaction_test),
++	KUNIT_CASE(airoha_transaction_validation_test),
+ 	KUNIT_CASE(airoha_parser_test),
+ 	KUNIT_CASE(airoha_parser_reject_test),
+ 	KUNIT_CASE(airoha_stag_test),
+diff --git a/drivers/net/ethernet/airoha/airoha_regs.h b/drivers/net/ethernet/airoha/airoha_regs.h
+index f0915b8..1a91221 100644
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -852,7 +852,8 @@
+ #define PSE_BUF_ESTIMATE_EN_MASK	BIT(29)
+ 
+ #define REG_CHAN_QOS_MODE(_n)		(0x1040 + ((_n) << 2))
+-#define CHAN_QOS_MODE_MASK(_n)		GENMASK(2 + ((_n) << 2), (_n) << 2)
++#define CHAN_QOS_MODE_ALL_MASK		0x77777777
++#define CHAN_QOS_MODE_MASK(_n)		GENMASK(2 + (((_n) & 7) << 2), (((_n) & 7) << 2))
+ 
+ #define REG_GLB_TRTCM_CFG		0x1080
+ #define GLB_TRTCM_EN_MASK		BIT(31)
+diff --git a/include/net/airoha_qos.h b/include/net/airoha_qos.h
+index 34ea238..7e9dd2b 100644
+--- a/include/net/airoha_qos.h
++++ b/include/net/airoha_qos.h
+@@ -162,5 +162,103 @@ static inline u8 airoha_qos_cpu_class(const struct airoha_qos_profile *p,
+ 	return airoha_qos_skb_dsfield(skb, mtk, &ds) ?
+ 		airoha_qos_class(p, ds) : fallback;
+ }
++/* One profile per FE/QDMA/switch domain. RTNL serializes registration and
++ * application; no packet-path locks or dynamic updates are needed. */
++struct airoha_qos_ops {
++	void (*lock)(void *priv);
++	void (*unlock)(void *priv);
++	bool (*owns)(void *priv, const struct net_device *dev);
++	int (*idle)(void *priv);
++	int (*save)(void *priv);
++	int (*apply)(void *priv, const struct airoha_qos_profile *profile);
++	int (*restore)(void *priv);
++};
++
++struct airoha_qos_domain {
++	struct list_head list;
++	struct airoha_qos_profile profile;
++	const struct airoha_qos_ops *ops[2];
++	void *priv[2];
++	/* broken rejects new QoS transactions, never basic interface opens. */
++	bool active, frozen, broken;
++};
++
++static inline int airoha_qos_commit(struct airoha_qos_domain *d,
++				   const struct airoha_qos_profile *p)
++{
++	int i, err, restore_err = 0;
++
++	if (d->broken)
++		return -EIO;
++	if (d->frozen)
++		return -EPERM;
++	for (i = 0; i < 64; i++)
++		if (p->map[i] > 7)
++			return -EINVAL;
++	if (!d->ops[0] || (p->dscp && !d->ops[1]))
++		return -ENODEV;
++	if (d->ops[0]->lock)
++		d->ops[0]->lock(d->priv[0]);
++	for (i = 0; i < 2; i++) {
++		if (!d->ops[i])
++			continue;
++		err = d->ops[i]->idle(d->priv[i]);
++		if (err)
++			goto out;
++	}
++	if (!p->dscp)
++		goto commit;
++	for (i = 0; i < 2; i++) {
++		err = d->ops[i]->save(d->priv[i]);
++		if (err)
++			goto out;
++	}
++	for (i = 0; i < 2; i++) {
++		err = d->ops[i]->apply(d->priv[i], p);
++		if (err)
++			goto rollback;
++	}
++commit:
++	d->profile = *p;
++	/* Interfaces are down under RTNL. Publish only after all readbacks. */
++	WRITE_ONCE(d->active, p->dscp);
++	d->frozen = true;
++	err = 0;
++	goto out;
++rollback:
++	for (; i >= 0; i--)
++		restore_err |= d->ops[i]->restore(d->priv[i]);
++	/* No data interface has opened and no active map was published. A
++	 * partial QoS rollback must not disable the management network. These
++	 * transactions never own port state, VLAN membership or forwarding ACLs.
++	 */
++	d->profile.dscp = false;
++	WRITE_ONCE(d->active, false);
++	if (restore_err) {
++		d->broken = true;
++		d->frozen = true;
++	}
++out:
++	if (d->ops[0]->unlock)
++		d->ops[0]->unlock(d->priv[0]);
++	return err;
++}
++
++#if IS_REACHABLE(CONFIG_NET_AIROHA_QOS)
++void airoha_qos_register(struct airoha_qos_domain *d,
++			 const struct airoha_qos_ops *ops, void *priv);
++void airoha_qos_unregister(struct airoha_qos_domain *d);
++int airoha_qos_switch_register(struct net_device *conduit,
++			      const struct airoha_qos_ops *ops, void *priv);
++void airoha_qos_switch_unregister(struct net_device *conduit, void *priv);
++#else
++static inline int airoha_qos_switch_register(struct net_device *conduit,
++			 const struct airoha_qos_ops *ops, void *priv)
++{
++	return -EOPNOTSUPP;
++}
++static inline void airoha_qos_switch_unregister(struct net_device *conduit,
++					       void *priv) {}
++#endif
+ 
+ #endif

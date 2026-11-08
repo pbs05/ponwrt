@@ -1,0 +1,145 @@
+From 0fd902943a4da1ec98146a0720b5606a71f868ec Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:20:33 +0800
+Subject: [PATCH] net: airoha: keep small-frame copybreak opt-in on the current
+ RX path
+
+Preserve current scatter assembly, LRO and PON control handling. AI assisted rebase; no new validation runs.
+
+Signed-off-by: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 81 +++++++++++++++++++++---
+ drivers/net/ethernet/airoha/airoha_eth.h |  4 ++
+ 2 files changed, 77 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 4c37696..9a3bc8d 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -10,6 +10,7 @@
+ #include <linux/pcs/pcs.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/sizes.h>
+ #include <linux/seq_file.h>
+ #include <linux/tcp.h>
+ #include <linux/u64_stats_sync.h>
+@@ -26,3 +27,9 @@
++/* Opt-in: copy complete small frames out of oversized RX buffers. */
++static unsigned int rx_copybreak;
++module_param(rx_copybreak, uint, 0644);
++MODULE_PARM_DESC(rx_copybreak,
++		"Copy unaggregated single-buffer RX frames up to this size (max 2048, 0 disables)");
++
+ static const struct net_device_ops airoha_netdev_ops;
+ 
+ u32 airoha_rr(void __iomem *base, u32 offset)
+@@ -1052,14 +1059,35 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ 		}
+ 
+ 		if (!q->skb) { /* first buffer */
+-			q->skb = napi_build_skb(e->buf - AIROHA_RX_HEADROOM,
+-						q->buf_size);
+-			if (!q->skb)
+-				goto free_frag;
+-
+-			skb_reserve(q->skb, AIROHA_RX_HEADROOM);
+-			__skb_put(q->skb, len);
+-			skb_mark_for_recycle(q->skb);
++			/* PON control was handled above. Preserve scatter/LRO geometry
++			 * and keep the page-backed fallback on allocation failure.
++			 */
++			if (!(desc_ctrl & QDMA_DESC_MORE_MASK) &&
++			    q->buf_size > SZ_2K &&
++			    len <= min_t(u32, READ_ONCE(rx_copybreak), SZ_2K) &&
++			    (!airoha_qdma_is_lro_queue(q) ||
++			     FIELD_GET(QDMA_ETH_RXMSG_AGG_COUNT_MASK,
++				       le32_to_cpu(READ_ONCE(desc->msg2))) <= 1)) {
++				q->skb = napi_alloc_skb(&q->napi, len);
++				if (q->skb) {
++					skb_put_data(q->skb, e->buf, len);
++					page_pool_put_full_page(q->page_pool, page, true);
++					q->rx_copybreak_packets++;
++					q->rx_copybreak_bytes += len;
++				} else {
++					q->rx_copybreak_alloc_fail++;
++				}
++			}
++			if (!q->skb) {
++				q->skb = napi_build_skb(e->buf - AIROHA_RX_HEADROOM,
++							q->buf_size);
++				if (!q->skb)
++					goto free_frag;
++
++				skb_reserve(q->skb, AIROHA_RX_HEADROOM);
++				__skb_put(q->skb, len);
++				skb_mark_for_recycle(q->skb);
++			}
+ 			q->skb->dev = netdev;
+ 			q->skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 			skb_record_rx_queue(q->skb, qid);
+@@ -5231,6 +5259,41 @@ static int airoha_napi_map_show(struct seq_file *s, void *unused)
+ }
+ DEFINE_SHOW_ATTRIBUTE(airoha_napi_map);
+ 
++/* One NAPI writer per ring; counters are diagnostics, not an atomic snapshot. */
++static int airoha_datapath_stats_show(struct seq_file *s, void *unused)
++{
++	struct airoha_eth *eth = s->private;
++	int d, i;
++
++	seq_printf(s, "rx_copybreak %u (effective max %u)\n",
++		   READ_ONCE(rx_copybreak), SZ_2K);
++	seq_puts(s, "# rx: qdma ring copied_packets copied_bytes alloc_fallback\n");
++	seq_puts(s, "# tx: qdma irq completed_packets bql_calls\n");
++	for (d = 0; d < ARRAY_SIZE(eth->qdma); d++) {
++		struct airoha_qdma *qdma = &eth->qdma[d];
++
++		for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
++			struct airoha_queue *q = &qdma->q_rx[i];
++
++			if (!q->ndesc)
++				continue;
++			seq_printf(s, "rx %d %d %llu %llu %llu\n", d, i,
++				   READ_ONCE(q->rx_copybreak_packets),
++				   READ_ONCE(q->rx_copybreak_bytes),
++				   READ_ONCE(q->rx_copybreak_alloc_fail));
++		}
++		for (i = 0; i < ARRAY_SIZE(qdma->q_tx_irq); i++) {
++			struct airoha_tx_irq_queue *q = &qdma->q_tx_irq[i];
++
++			seq_printf(s, "tx %d %d %llu %llu\n", d, i,
++				   READ_ONCE(q->bql_packets),
++				   READ_ONCE(q->bql_calls));
++		}
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_datapath_stats);
++
+ static void airoha_napi_map_init(struct airoha_eth *eth)
+ {
+ 	const char *name;
+@@ -5244,3 +5307,5 @@ static void airoha_napi_map_init(struct airoha_eth *eth)
+ 			    &airoha_qdma_irq_errors_fops);
++	debugfs_create_file("datapath_stats", 0400, eth->napi_debugfs, eth,
++			    &airoha_datapath_stats_fops);
+ 	debugfs_create_file("napi_map", 0400, eth->napi_debugfs, eth,
+ 			    &airoha_napi_map_fops);
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index e62815b..9171f49 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -229,6 +229,10 @@ struct airoha_queue {
+ 	struct page_pool *page_pool;
+ 	struct sk_buff *skb;
+ 
++	u64 rx_copybreak_packets;
++	u64 rx_copybreak_bytes;
++	u64 rx_copybreak_alloc_fail;
++
+ 	struct list_head tx_list;
+ };
+ 
+-- 
+2.53.0
