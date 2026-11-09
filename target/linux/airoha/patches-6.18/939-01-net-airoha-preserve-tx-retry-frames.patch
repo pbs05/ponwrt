@@ -1,0 +1,161 @@
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Subject: [PATCH] net: airoha: preserve TX frames on BUSY and handle DSA preparation errors
+
+Reserve hardware ring capacity before changing DSA/TSO headers so qdisc
+retry cannot operate on a partially transformed frame. Propagate DSA
+pull/COW failures to the existing TX failure path. Recompute fragments
+after header preparation. Retain the current upstream DMA owner selection.
+
+This exports the retained 939-01 repair on the current PonWrt driver;
+upstream has moved dma_dev initialization to the declaration and added
+a blank line after the QDMA ring lock. No BQL policy is changed here.
+
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 79367c3..5fe8abc 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2759,21 +2759,23 @@ static u16 airoha_dev_select_queue(struct net_device *netdev,
+ 	return queue < netdev->num_tx_queues ? queue : 0;
+ }
+ 
+-static u32 airoha_get_dsa_tag(struct sk_buff *skb, struct net_device *dev)
++static int airoha_get_dsa_tag(struct sk_buff *skb, struct net_device *dev,
++			    u32 *result)
+ {
+ #if IS_ENABLED(CONFIG_NET_DSA)
+ 	struct ethhdr *ehdr;
+ 	u8 xmit_tpid;
+ 	u16 tag;
+ 
++	*result = 0;
+ 	if (!netdev_uses_dsa(dev))
+ 		return 0;
+ 
+ 	if (dev->dsa_ptr->tag_ops->proto != DSA_TAG_PROTO_MTK)
+ 		return 0;
+ 
+-	if (skb_cow_head(skb, 0))
+-		return 0;
++	if (!pskb_may_pull(skb, ETH_HLEN + MTK_HDR_LEN) || skb_cow_head(skb, 0))
++		return -ENOMEM;
+ 
+ 	ehdr = (struct ethhdr *)skb->data;
+ 	tag = be16_to_cpu(ehdr->h_proto);
+@@ -2797,10 +2799,11 @@ static u32 airoha_get_dsa_tag(struct sk_buff *skb, struct net_device *dev)
+ 		break;
+ 	}
+ 
+-	return tag;
++	*result = tag;
+ #else
+-	return 0;
++	*result = 0;
+ #endif
++	return 0;
+ }
+ 
+ int airoha_get_fe_port(struct airoha_gdm_dev *dev)
+@@ -2911,6 +2914,35 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 	qdma = rcu_dereference(dev->qdma);
+ 	qid = airoha_qdma_get_txq(qdma, skb_get_queue_mapping(skb));
+ 
++	/* Reserve ring space before changing skb headers: BUSY must leave
++	 * the DSA tag intact for qdisc retry. Pull/COW can only reduce the
++	 * fragment count; recompute it before populating descriptors.
++	 */
++	q = &qdma->q_tx[qid];
++	if (WARN_ON_ONCE(!q->ndesc))
++		goto error;
++
++	spin_lock_bh(&q->lock);
++	if (q->flushing)
++		goto error_unlock;
++
++	/* skb->dev identifies the pon, omci, or oam netdev owning the BQL queue. */
++	skb->dev = owner_netdev;
++	txq = skb_get_tx_queue(owner_netdev, skb);
++	nr_frags = 1 + skb_shinfo(skb)->nr_frags;
++
++	if (q->queued + nr_frags >= q->ndesc) {
++		/* not enough space in the queue */
++		if (pon_data)
++			atomic64_inc(&dev->pon_stats.tx_busy);
++		netif_tx_stop_queue(txq);
++		q->txq_stopped = true;
++		spin_unlock_bh(&q->lock);
++		rcu_read_unlock();
++
++		return NETDEV_TX_BUSY;
++	}
++
+ 	pon_tag = READ_ONCE(dev->pon_qdma_tag);
+ 	if (ctrl) {
+ 		/* Control frames use dedicated OAM and OMCC descriptor mappings. */
+@@ -2935,7 +2967,7 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 			pon_tag = airoha_pon_select_flow(dev, skb);
+ 		if (!(pon_tag & AIROHA_PON_QDMA_VALID)) {
+ 			atomic64_inc(&dev->pon_stats.tx_no_mapping);
+-			goto error;
++			goto error_unlock;
+ 		}
+ 		channel = FIELD_GET(AIROHA_PON_QDMA_TCONT_MASK, pon_tag);
+ 		msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK,
+@@ -2953,7 +2985,8 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 		 */
+ 		nboq = channel;
+ 	} else {
+-		tag = airoha_get_dsa_tag(skb, owner_netdev);
++		if (airoha_get_dsa_tag(skb, owner_netdev, &tag))
++			goto error_unlock;
+ 		msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK,
+ 				  qid / AIROHA_NUM_QOS_QUEUES) |
+ 		       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
+@@ -2969,7 +3002,7 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 	/* TSO: fill MSS info in tcp checksum field */
+ 	if (!ctrl && skb_is_gso(skb)) {
+ 		if (skb_cow_head(skb, 0))
+-			goto error;
++			goto error_unlock;
+ 
+ 		if (skb_shinfo(skb)->gso_type & (SKB_GSO_TCPV4 |
+ 						 SKB_GSO_TCPV6)) {
+@@ -2997,37 +3030,14 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 		if (skb_put_padto(skb, ETH_ZLEN)) {
+ 			atomic64_inc(&dev->pon_stats.tx_dropped);
+ 			owner_netdev->stats.tx_dropped++;
++			spin_unlock_bh(&q->lock);
+ 			rcu_read_unlock();
+ 			return NETDEV_TX_OK;
+ 		}
+ 	}
+ 
+-	q = &qdma->q_tx[qid];
+-	if (WARN_ON_ONCE(!q->ndesc))
+-		goto error;
+-
+-	spin_lock_bh(&q->lock);
+-
+-	if (q->flushing)
+-		goto error_unlock;
+-
+-	/* skb->dev identifies the pon, omci, or oam netdev owning the BQL queue. */
+-	skb->dev = owner_netdev;
+-	txq = skb_get_tx_queue(owner_netdev, skb);
+ 	nr_frags = 1 + skb_shinfo(skb)->nr_frags;
+ 
+-	if (q->queued + nr_frags >= q->ndesc) {
+-		/* not enough space in the queue */
+-		if (pon_data)
+-			atomic64_inc(&dev->pon_stats.tx_busy);
+-		netif_tx_stop_queue(txq);
+-		q->txq_stopped = true;
+-		spin_unlock_bh(&q->lock);
+-		rcu_read_unlock();
+-
+-		return NETDEV_TX_BUSY;
+-	}
+-
+ 	e = list_first_entry(&q->tx_list, struct airoha_queue_entry,
+ 			     list);
+ 	len = skb_headlen(skb);

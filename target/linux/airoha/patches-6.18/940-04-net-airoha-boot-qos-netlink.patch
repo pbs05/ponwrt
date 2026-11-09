@@ -1,0 +1,170 @@
+From 1f2d5a9e78933c7fa3e08343f7e708489cbe442b Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:34:22 +0800
+Subject: [PATCH] net: airoha: expose default priority policy and its read-only
+ mapping
+
+---
+ drivers/net/ethernet/airoha/airoha_qos.c | 108 +++++++++++++++++++++++
+ include/uapi/linux/airoha_qos.h          |  24 +++++
+ 2 files changed, 132 insertions(+)
+ create mode 100644 include/uapi/linux/airoha_qos.h
+
+diff --git a/drivers/net/ethernet/airoha/airoha_qos.c b/drivers/net/ethernet/airoha/airoha_qos.c
+index dacb5d0fc..e44d6a08f 100644
+--- a/drivers/net/ethernet/airoha/airoha_qos.c
++++ b/drivers/net/ethernet/airoha/airoha_qos.c
+@@ -2,6 +2,11 @@
+ #include <linux/module.h>
+ #include <linux/rtnetlink.h>
+ #include <net/airoha_qos.h>
++#include <net/airoha_priority.h>
++#include <linux/airoha_qos.h>
++#include <net/genetlink.h>
++#include <net/net_namespace.h>
++
+ 
+ static LIST_HEAD(airoha_qos_domains);
+ 
+@@ -74,5 +79,108 @@ void airoha_qos_switch_unregister(struct net_device *conduit, void *priv)
+ }
+ EXPORT_SYMBOL_GPL(airoha_qos_switch_unregister);
+ 
++
++static struct genl_family airoha_qos_family;
++
++static const struct nla_policy airoha_qos_policy[AIROHA_QOS_A_MAX + 1] = {
++	[AIROHA_QOS_A_IFINDEX] = { .type = NLA_U32 },
++	[AIROHA_QOS_A_MODE] = NLA_POLICY_MAX(NLA_U8, 1),
++	[AIROHA_QOS_A_MAP] = NLA_POLICY_EXACT_LEN(64),
++	[AIROHA_QOS_A_FROZEN] = { .type = NLA_REJECT },
++	[AIROHA_QOS_A_BROKEN] = { .type = NLA_REJECT },
++	[AIROHA_QOS_A_PRIORITY_MAP] = { .type = NLA_REJECT },
++};
++
++static int airoha_qos_request(struct sk_buff *skb, struct genl_info *info)
++{
++	struct airoha_qos_domain *d;
++	struct net_device *netdev;
++	struct sk_buff *reply;
++	void *hdr;
++	u32 index;
++	int err;
++
++	if (!net_eq(genl_info_net(info), &init_net))
++		return -EOPNOTSUPP;
++	if (!info->attrs[AIROHA_QOS_A_IFINDEX])
++		return -EINVAL;
++	index = nla_get_u32(info->attrs[AIROHA_QOS_A_IFINDEX]);
++	rtnl_lock();
++	netdev = __dev_get_by_index(&init_net, index);
++	d = netdev ? airoha_qos_find(netdev) : NULL;
++	if (!d) {
++		err = -ENODEV;
++		goto out;
++	}
++	if (info->genlhdr->cmd == AIROHA_QOS_CMD_APPLY) {
++		struct airoha_qos_profile p;
++
++		if (!info->attrs[AIROHA_QOS_A_MODE] || !info->attrs[AIROHA_QOS_A_MAP]) {
++			err = -EINVAL;
++			goto out;
++		}
++		p.dscp = nla_get_u8(info->attrs[AIROHA_QOS_A_MODE]);
++		memcpy(p.map, nla_data(info->attrs[AIROHA_QOS_A_MAP]), sizeof(p.map));
++		err = airoha_qos_commit(d, &p);
++		if (err) {
++			netdev_warn(netdev,
++				    "QoS apply failed (%d), active=%d broken=%d; base networking remains enabled\n",
++				    err, d->active, d->broken);
++			goto out;
++		}
++	}
++	reply = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++	if (!reply) {
++		err = -ENOMEM;
++		goto out;
++	}
++	hdr = genlmsg_put_reply(reply, info, &airoha_qos_family, 0,
++				info->genlhdr->cmd);
++	if (!hdr || nla_put_u32(reply, AIROHA_QOS_A_IFINDEX, index) ||
++	    nla_put_u8(reply, AIROHA_QOS_A_MODE, d->active) ||
++	    nla_put(reply, AIROHA_QOS_A_MAP, 64, d->profile.map) ||
++	    nla_put(reply, AIROHA_QOS_A_PRIORITY_MAP, sizeof(airoha_priority_map),
++		    airoha_priority_map) ||
++	    nla_put_u8(reply, AIROHA_QOS_A_FROZEN, d->frozen) ||
++	    nla_put_u8(reply, AIROHA_QOS_A_BROKEN, d->broken)) {
++		kfree_skb(reply);
++		err = -EMSGSIZE;
++		goto out;
++	}
++	genlmsg_end(reply, hdr);
++	err = genlmsg_reply(reply, info);
++out:
++	rtnl_unlock();
++	return err;
++}
++
++static const struct genl_small_ops airoha_qos_genl_ops[] = {
++	{ .cmd = AIROHA_QOS_CMD_GET, .flags = GENL_ADMIN_PERM,
++	  .doit = airoha_qos_request },
++	{ .cmd = AIROHA_QOS_CMD_APPLY, .flags = GENL_ADMIN_PERM,
++	  .doit = airoha_qos_request },
++};
++static struct genl_family airoha_qos_family = {
++	.name = AIROHA_QOS_FAMILY,
++	.version = AIROHA_QOS_VERSION,
++	.maxattr = AIROHA_QOS_A_MAX,
++	.policy = airoha_qos_policy,
++	.module = THIS_MODULE,
++	.netnsok = false,
++	.small_ops = airoha_qos_genl_ops,
++	.n_small_ops = ARRAY_SIZE(airoha_qos_genl_ops),
++	.resv_start_op = AIROHA_QOS_CMD_APPLY + 1,
++};
++static int __init airoha_qos_init(void)
++{
++	return genl_register_family(&airoha_qos_family);
++}
++static void __exit airoha_qos_exit(void)
++{
++	genl_unregister_family(&airoha_qos_family);
++}
++module_init(airoha_qos_init);
++module_exit(airoha_qos_exit);
++
+ MODULE_DESCRIPTION("Airoha coordinated boot QoS domain");
+ MODULE_LICENSE("GPL");
+diff --git a/include/uapi/linux/airoha_qos.h b/include/uapi/linux/airoha_qos.h
+new file mode 100644
+index 000000000..2b50a62b8
+--- /dev/null
++++ b/include/uapi/linux/airoha_qos.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_AIROHA_QOS_H
++#define _UAPI_LINUX_AIROHA_QOS_H
++
++#define AIROHA_QOS_FAMILY "airoha_qos"
++#define AIROHA_QOS_VERSION 1
++
++enum {
++	AIROHA_QOS_CMD_UNSPEC,
++	AIROHA_QOS_CMD_GET,
++	AIROHA_QOS_CMD_APPLY,
++};
++enum {
++	AIROHA_QOS_A_UNSPEC,
++	AIROHA_QOS_A_IFINDEX, /* u32: an AN7581 physical GDM interface */
++	AIROHA_QOS_A_MODE,    /* u8: 0 default priority policy, 1 DSCP */
++	AIROHA_QOS_A_MAP,     /* exactly 64 bytes, each 0..7 */
++	AIROHA_QOS_A_FROZEN,  /* u8, read-only */
++	AIROHA_QOS_A_BROKEN,  /* u8, read-only */
++	AIROHA_QOS_A_PRIORITY_MAP, /* 16 bytes, read-only; absent on old kernels */
++	__AIROHA_QOS_A_MAX,
++};
++#define AIROHA_QOS_A_MAX (__AIROHA_QOS_A_MAX - 1)
++#endif
+-- 
+2.53.0
+

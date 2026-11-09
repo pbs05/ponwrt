@@ -1,0 +1,166 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: zh_Hans\n"
+
+msgid "Unknown mode"
+msgstr "未知模式"
+
+msgid "Use DSCP:QUEUE, with DSCP 0–63 and queue 0–7."
+msgstr "请使用 DSCP:队列 格式，DSCP 为 0～63，队列为 0～7。"
+
+msgid "Each DSCP may appear only once."
+msgstr "每个 DSCP 只能设置一次。"
+
+msgid "Running policy"
+msgstr "当前运行策略"
+
+msgid "Driver status is unavailable. The saved configuration does not prove that a hardware policy is active."
+msgstr "无法读取驱动状态。已保存配置不代表硬件策略已经生效。"
+
+msgid "Traditional priority"
+msgstr "传统优先级"
+
+msgid "DSCP"
+msgstr "DSCP"
+
+msgid "Legacy kernel: default mapping unknown"
+msgstr "旧内核：默认映射未知"
+
+msgid "The driver reports a QoS fault. Hardware policy is not confirmed. Base networking remains enabled."
+msgstr "驱动报告 QoS 异常，无法确认硬件策略；基础网络仍允许启动。"
+
+msgid "The running policy is locked until the next boot."
+msgstr "运行策略已锁定，下次启动时可重新应用。"
+
+msgid "Saved policy differs from the running policy; reboot to apply it."
+msgstr "已保存策略与运行策略不同，重启后生效。"
+
+msgid "Saved and running policies match."
+msgstr "已保存策略与运行策略一致。"
+
+msgid "Default priority → queue (priority 0–15):"
+msgstr "默认 priority → 队列（priority 0～15）："
+
+msgid "This kernel does not report the revised default priority map."
+msgstr "此内核没有报告修订后的默认优先级映射。"
+
+msgid "Configured DSCP queue"
+msgstr "配置的 DSCP 队列"
+
+msgid "Running DSCP queue"
+msgstr "运行中的 DSCP 队列"
+
+msgid "Inactive or unknown"
+msgstr "未启用或未知"
+
+msgid "Complete DSCP table"
+msgstr "完整 DSCP 映射表"
+
+msgid "Refresh status"
+msgstr "刷新状态"
+
+msgid "Airoha QoS"
+msgstr "Airoha QoS"
+
+msgid "One policy covers the shared FE/QDMA/switch hardware. Save changes for the next boot. This page does not restart networking."
+msgstr "此策略统一作用于共享的 FE、QDMA 和交换机硬件。保存的修改在下次启动时生效，本页面不会重启网络。"
+
+msgid "Classification mode"
+msgstr "分类模式"
+
+msgid "Traditional priority (default)"
+msgstr "传统优先级（默认）"
+
+msgid "DSCP determines hardware queues"
+msgstr "DSCP 决定硬件队列"
+
+msgid "Traditional mode maps Linux priority to three QDMA classes: interactive/control, ordinary, and bulk/filler. PPE retains its existing TOS input; different forwarding paths may classify differently."
+msgstr "传统模式按 Linux priority 分为交互/控制、普通、批量/填充三档 QDMA 队列。PPE 沿用原有 TOS 分类输入，不同转发路径仍可能得到不同分类。"
+
+msgid "DSCP mode"
+msgstr "DSCP 模式"
+
+msgid "DSCP directly selects Q0–Q7 across CPU, PPE and switch paths. This avoids legacy TOS classification, stale skb priority and software-flowtable differences. The original skb priority is preserved, but does not choose the hardware queue for parsed IP packets. Mark traffic consistently in both directions before offload; established PPE flows do not follow per-packet DSCP changes."
+msgstr "DSCP 直接决定 CPU、PPE 和交换机路径的 Q0～Q7 队列，避免旧 TOS 分类、未同步的 skb priority 和软件 flowtable 路径差异影响队列选择。保留原 skb priority 字段，但可解析 IP 报文的硬件队列由 DSCP 决定。卸载前须完成双向一致标记；已经建立的 PPE 流不会逐包跟随 DSCP 变化。"
+
+msgid "DSCP → queue overrides"
+msgstr "DSCP → 队列覆盖项"
+
+msgid "Format DSCP:QUEUE. Unspecified values retain the original PPE numeric map; this is not a standard DiffServ/WMM mapping. Q0 is valid. With default strict scheduling, Q7 is highest and Q0 lowest; no minimum bandwidth is guaranteed."
+msgstr "格式为 DSCP:队列。未指定值沿用原 PPE 数值映射，该表不是标准 DiffServ/WMM 映射。Q0 是有效值。默认严格优先级调度下 Q7 最高、Q0 最低，不保证最低带宽。"
+
+msgid "QoS configuration saved. Changes take effect on reboot."
+msgstr "QoS 配置已保存，修改在重启后生效。"
+
+msgid "The base mapping is unavailable. Update the QoS controller and refresh this page."
+msgstr "无法读取基础映射。请更新 QoS 控制工具后刷新页面。"
+
+msgid "Unknown base mapping: %s"
+msgstr "未知基础映射：%s"
+
+msgid "Base mapping: original PPE compatibility map (ppe-legacy-v1). Empty overrides still use all 64 entries below. This is not a standard DiffServ or WMM mapping."
+msgstr "基础映射：原版 PPE 兼容映射（ppe-legacy-v1）。未填写覆盖项时仍使用下方完整的 64 项映射。这不是标准 DiffServ 或 WMM 映射。"
+
+msgid "This older configuration inherits ppe-legacy-v1. Saving makes the preset explicit without changing its mapping."
+msgstr "旧配置隐式使用 ppe-legacy-v1。保存后将明确记录此预设，映射效果保持一致。"
+
+msgid "Base queue"
+msgstr "基础队列"
+
+msgid "Override"
+msgstr "自定义覆盖"
+
+msgid "Base DSCP mapping"
+msgstr "DSCP 基础映射"
+
+msgid "Original PPE compatibility map (v1)"
+msgstr "原版 PPE 兼容映射（v1）"
+
+msgid "The named preset fixes the meaning of unspecified DSCP values across upgrades. Overrides below only replace selected entries."
+msgstr "具名预设明确固定未指定 DSCP 的映射规则。下方覆盖项只替换选中的条目。"
+
+msgid "Restore base mapping"
+msgstr "恢复基础映射"
+
+msgid "Clear overrides"
+msgstr "清除覆盖项"
+
+msgid "Clears the edits in this form. Save to use the base mapping at the next boot."
+msgstr "清除表单中的覆盖项。保存后在下次启动时使用基础映射。"
+
+msgid "Reboot required"
+msgstr "需要重启设备"
+
+msgid "Saved policy differs from the running policy. Reboot the device to apply it and rebuild the flow offload entries."
+msgstr "已保存策略与当前运行策略不同。请重启设备以应用配置，并重新建立流量卸载表项。"
+
+msgid "Open reboot page"
+msgstr "打开重启页面"
+
+msgid "Saved and running hardware mappings match. This does not verify external traffic marking rules."
+msgstr "已保存的硬件映射与运行映射一致。此状态不代表外部流量标记规则已经核验。"
+
+msgid "Applying policy changes"
+msgstr "配置生效方式"
+
+msgid "Save stores the hardware mode and queue mapping for the next device boot. Restarting the QoS service or the firewall does not apply this hardware profile."
+msgstr "保存的硬件模式和队列映射将在设备下次启动时应用。仅重启 QoS 服务或防火墙不能使该硬件配置生效。"
+
+msgid "Traffic marking rules"
+msgstr "业务流量标记规则"
+
+msgid "Traffic to DSCP classification is configured in the firewall or another marking tool. After changing those rules, reboot the device so software and hardware offloaded flows learn the new marks. This page only defers its own hardware settings; an external rule editor may apply changes immediately."
+msgstr "业务流量到 DSCP 的分类由防火墙或其他标记工具配置。修改这些规则后，请重启设备，让软件和硬件卸载流重新学习标记。本页面仅将自身的硬件设置延后生效；外部规则编辑器可能立即应用修改。"
+
+msgid "QoS configuration saved for the next device boot. Use System → Reboot when ready to apply it."
+msgstr "QoS 配置已保存，将在设备下次启动时生效。准备应用时，请前往“系统 → 重启”。"
+
+msgid "Configure traffic-to-DSCP rules in Firewall → Traffic Rules and describe their purpose in each rule name. A full firewall reload rebuilds its software and hardware flowtables. Updating a separate nft marking table alone does not retire old flows. Supported multicast firmware also retires its own cache through the firewall include. None of these actions applies a pending hardware mode or queue-map change."
+msgstr "在“防火墙 → 通信规则”配置业务到 DSCP 的映射，并用规则名称说明用途。完整重载防火墙会重建其软件及硬件流表；单独更新其他 nft 标记表不会撤销旧流。支持在线刷新的组播固件还会通过防火墙包含脚本清理自己的缓存。这些操作均不会应用待重启的硬件模式或队列映射。"
+
+msgid "Business classification"
+msgstr "业务分类"
+
+msgid "Open firewall traffic rules"
+msgstr "打开防火墙通信规则"

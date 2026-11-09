@@ -1,0 +1,155 @@
+From: HG maintainers
+Subject: [PATCH] net: airoha: expose QDMA queue IRQ and NAPI thread identities
+
+Register the real RX/TX-completion IRQ associations. The shared internal
+dummy netdev is invisible to netdev-genl, so add a read-only debugfs map.
+No CPU policy, packet-path work or thread renaming is added.
+
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -11,6 +11,7 @@
+ #include <linux/pcs/pcs.h>
+ #include <linux/platform_device.h>
+ #include <linux/slab.h>
++#include <linux/seq_file.h>
+ #include <linux/tcp.h>
+ #include <linux/u64_stats_sync.h>
+ #include <net/dst_metadata.h>
+@@ -1149,6 +1150,17 @@
+ 	return done;
+ }
+ 
++static int airoha_rx_irq_bank(int qid)
++{
++	int bank;
++
++	for (bank = 0; bank < AIROHA_MAX_NUM_IRQ_BANKS; bank++)
++		if (RX_IRQ_BANK_PIN_MASK(bank) & BIT(qid))
++			return bank;
++
++	return -1;
++}
++
+ static int airoha_qdma_init_rx_queue(struct airoha_queue *q,
+ 				     struct airoha_qdma *qdma, int ndesc)
+ {
+@@ -1161,7 +1173,7 @@
+ 		.napi = &q->napi,
+ 	};
+ 	struct airoha_eth *eth = qdma->eth;
+-	int qid = q - &qdma->q_rx[0], thr;
++	int qid = q - &qdma->q_rx[0], thr, bank;
+ 	dma_addr_t dma_addr;
+ 	bool lro_q;
+ 
+@@ -1192,6 +1204,9 @@
+ 	q->buf_size = lro_q ? pp_params.max_len : pp_params.max_len / 2;
+ 	q->ndesc = ndesc;
+ 	netif_napi_add(eth->napi_dev, &q->napi, airoha_qdma_rx_napi_poll);
++	bank = airoha_rx_irq_bank(qid);
++	if (bank >= 0)
++		netif_napi_set_irq(&q->napi, qdma->irq_banks[bank].irq);
+ 
+ 	airoha_qdma_wr(qdma, REG_RX_RING_BASE(qid), dma_addr);
+ 	airoha_qdma_rmw(qdma, REG_RX_RING_SIZE(qid),
+@@ -1542,6 +1557,7 @@
+ 
+ 	netif_napi_add_tx(eth->napi_dev, &irq_q->napi,
+ 			  airoha_qdma_tx_napi_poll);
++	netif_napi_set_irq(&irq_q->napi, qdma->irq_banks[0].irq);
+ 
+ 	airoha_qdma_wr(qdma, REG_TX_IRQ_BASE(id), dma_addr);
+ 	airoha_qdma_rmw(qdma, REG_TX_IRQ_CFG(id), TX_IRQ_DEPTH_MASK,
+@@ -5053,6 +5069,61 @@
+ 	.restore = airoha_qos_restore,
+ };
+ 
++/* The internal dummy netdev is not enumerable through netdev-genl.
++ * Export hardware identities, including unrouted preallocated rings, so
++ * userspace never guesses thread order or truncated task names.
++ */
++static int airoha_napi_map_show(struct seq_file *s, void *unused)
++{
++	struct airoha_eth *eth = s->private;
++	int id, qid;
++
++	seq_puts(s, "# airoha-napi-map 1\n");
++	seq_puts(s, "# qdma kind queue bank irq pid descriptors buffer_bytes queued\n");
++	netdev_lock(eth->napi_dev);
++	for (id = 0; id < ARRAY_SIZE(eth->qdma); id++) {
++		struct airoha_qdma *qdma = &eth->qdma[id];
++
++		for (qid = 0; qid < ARRAY_SIZE(qdma->q_rx); qid++) {
++			struct airoha_queue *q = &qdma->q_rx[qid];
++			int bank = airoha_rx_irq_bank(qid);
++
++			if (!q->ndesc)
++				continue;
++			seq_printf(s, "%d rx %d %d %d %d %u %u %u\n",
++				   id, qid, bank, q->napi.irq,
++				   q->napi.thread ? task_pid_nr(q->napi.thread) : 0,
++				   q->ndesc, q->buf_size, READ_ONCE(q->queued));
++		}
++		for (qid = 0; qid < ARRAY_SIZE(qdma->q_tx_irq); qid++) {
++			struct airoha_tx_irq_queue *q = &qdma->q_tx_irq[qid];
++
++			if (!q->size)
++				continue;
++			seq_printf(s, "%d tx %d 0 %d %d %u 0 0\n", id, qid,
++				   q->napi.irq,
++				   q->napi.thread ? task_pid_nr(q->napi.thread) : 0,
++				   q->size);
++		}
++	}
++	netdev_unlock(eth->napi_dev);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_napi_map);
++
++static void airoha_napi_map_init(struct airoha_eth *eth)
++{
++	const char *name;
++
++	name = devm_kasprintf(eth->dev, GFP_KERNEL, "airoha_eth-%s",
++			      dev_name(eth->dev));
++	if (!name)
++		return;
++	eth->napi_debugfs = debugfs_create_dir(name, NULL);
++	debugfs_create_file("napi_map", 0400, eth->napi_debugfs, eth,
++			    &airoha_napi_map_fops);
++}
++
+ static int airoha_probe(struct platform_device *pdev)
+ {
+ 	struct reset_control_bulk_data *xsi_rsts;
+@@ -5153,6 +5224,7 @@
+ 		goto error_napi_stop;
+ 	}
+ 
++	airoha_napi_map_init(eth);
+ 	return 0;
+ 
+ error_napi_stop:
+@@ -5196,6 +5268,9 @@
+ {
+ 	struct airoha_eth *eth = platform_get_drvdata(pdev);
+ 	int i;
++
++	/* Drain readers before destroying any referenced NAPI/thread. */
++	debugfs_remove_recursive(eth->napi_debugfs);
+ 
+ 	if (airoha_is_7581(eth))
+ 		airoha_qos_unregister(&eth->qos);
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -774,6 +774,7 @@
+ 	struct reset_control_bulk_data *xsi_rsts;
+ 
+ 	struct net_device *napi_dev;
++	struct dentry *napi_debugfs;
+ 
+ 	struct airoha_qdma qdma[AIROHA_MAX_NUM_QDMA];
+ 	struct airoha_gdm_port *ports[AIROHA_MAX_NUM_GDM_PORTS];
