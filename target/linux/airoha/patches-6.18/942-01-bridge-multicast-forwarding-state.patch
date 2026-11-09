@@ -1,0 +1,652 @@
+From f5fe097c098595defe11097d485d493d29a9ab61 Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:27:38 +0800
+Subject: [PATCH] bridge: expose source-aware multicast forwarding state
+
+Consolidate retained multicast implementation and follow-up fixes.
+---
+ include/linux/if_bridge.h      |  34 ++++++
+ net/bridge/Kconfig             |  10 ++
+ net/bridge/br_mcast_fwd_test.h | 183 ++++++++++++++++++++++++++++++++
+ net/bridge/br_mdb.c            |   4 +-
+ net/bridge/br_multicast.c      | 184 ++++++++++++++++++++++++++++++++-
+ net/bridge/br_netlink.c        |   3 +
+ net/bridge/br_private.h        |   3 +
+ 7 files changed, 418 insertions(+), 3 deletions(-)
+ create mode 100644 net/bridge/br_mcast_fwd_test.h
+
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index 3daa3f6..7a58d27 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -36,6 +36,36 @@ struct br_ip_list {
+ 	struct br_ip addr;
+ };
+ 
++/* A source-specific forwarding snapshot, valid under the caller's RCU lock.
++ * Drivers must invalidate their hardware state synchronously on notification
++ * and re-read a snapshot before rebinding. This API does not mark a MAC MDB
++ * entry offloaded: IPv4 group aliases and source filters remain distinct.
++ * Notifications cover multicast membership/configuration, not netdevice,
++ * VLAN membership, port flags or STP changes. Consumers must subscribe to
++ * those separately, exclude the ingress port when forwarding RX, and
++ * serialize binding against notification using the snapshot generation.
++ * local_receive describes bridge RX (br_handle_frame_finish). A routed or
++ * locally originated packet uses br_dev_xmit and is NOT delivered to the
++ * bridge host again. Its local copy is decided by the L3 ingress route.
++ * Callbacks run with multicast_lock held and must not call snapshot again.
++ */
++#define BR_MCAST_FWD_MAX_PORTS 16
++struct br_mcast_fwd {
++	u64 generation;
++	unsigned int num_ports;
++	bool local_receive;
++	struct {
++		struct net_device *dev;
++		u16 vlan_flags;
++	} ports[BR_MCAST_FWD_MAX_PORTS];
++};
++
++struct br_mcast_event {
++	struct net_device *br_dev;
++	const struct br_ip *group; /* NULL for a router/configuration change */
++	u64 generation;
++};
++
+ #define BR_HAIRPIN_MODE		BIT(0)
+ #define BR_BPDU_GUARD		BIT(1)
+ #define BR_ROOT_BLOCK		BIT(2)
+@@ -71,6 +101,10 @@ void brioctl_set(int (*hook)(struct net *net, unsigned int cmd,
+ int br_ioctl_call(struct net *net, unsigned int cmd, void __user *uarg);
+ 
+ #if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_BRIDGE_IGMP_SNOOPING)
++int br_multicast_register_notifier(struct notifier_block *nb);
++int br_multicast_unregister_notifier(struct notifier_block *nb);
++int br_multicast_ipv4_snapshot(struct net_device *br_dev, __be32 source,
++			       __be32 group, u16 vid, struct br_mcast_fwd *fwd);
+ int br_multicast_list_adjacent(struct net_device *dev,
+ 			       struct list_head *br_ip_list);
+ bool br_multicast_has_querier_anywhere(struct net_device *dev, int proto);
+diff --git a/net/bridge/Kconfig b/net/bridge/Kconfig
+index 3c8ded7..1929055 100644
+--- a/net/bridge/Kconfig
++++ b/net/bridge/Kconfig
+@@ -48,6 +48,16 @@ config BRIDGE_IGMP_SNOOPING
+ 
+ 	  If unsure, say Y.
+ 
++config BRIDGE_MCAST_FWD_KUNIT_TEST
++	bool "Bridge multicast forwarding snapshot tests" if !KUNIT_ALL_TESTS
++	depends on KUNIT && BRIDGE_IGMP_SNOOPING
++	default KUNIT_ALL_TESTS
++	help
++	  Test source-specific IPv4 bridge multicast membership snapshots.
++	  Cover IGMP include/block state, group MAC aliases, local delivery,
++	  querier absence and synchronous configuration invalidation.
++	  No physical ports or userspace multicast daemon are required.
++
+ config BRIDGE_VLAN_FILTERING
+ 	bool "VLAN filtering"
+ 	depends on BRIDGE
+diff --git a/net/bridge/br_mcast_fwd_test.h b/net/bridge/br_mcast_fwd_test.h
+new file mode 100644
+index 0000000..9917c67
+--- /dev/null
++++ b/net/bridge/br_mcast_fwd_test.h
+@@ -0,0 +1,183 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#include <kunit/test.h>
++
++static void br_mcast_test_free_dev(void *dev)
++{
++	free_netdev(dev);
++}
++
++static void br_mcast_test_free_hash(void *hash)
++{
++	rhashtable_destroy(hash);
++}
++
++static void br_mcast_test_free_ctx(void *ctx)
++{
++	br_multicast_ctx_deinit(ctx);
++}
++
++static void br_mcast_snapshot_test(struct kunit *test)
++{
++	struct net_bridge_mdb_entry *mp;
++	struct net_bridge_port_group *pg;
++	struct net_bridge_port *port;
++	struct br_mcast_fwd fwd;
++	struct net_device *dev;
++	struct net_bridge *br;
++	__be32 source = htonl(0xc0000201), group = htonl(0xef010101);
++	int err;
++
++	dev = alloc_netdev(sizeof(*br), "brkt%d", NET_NAME_UNKNOWN, ether_setup);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, br_mcast_test_free_dev, dev), 0);
++	dev->priv_flags |= IFF_EBRIDGE;
++	br = netdev_priv(dev);
++	br->dev = dev;
++	br_multicast_ctx_init(br, NULL, &br->multicast_ctx);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, br_mcast_test_free_ctx,
++						      &br->multicast_ctx), 0);
++	br->multicast_ctx.multicast_igmp_version = 3;
++	br->multicast_ctx.multicast_querier = 1;
++	spin_lock_init(&br->multicast_lock);
++	br_opt_toggle(br, BROPT_MULTICAST_ENABLED, true);
++	KUNIT_ASSERT_EQ(test, rhashtable_init(&br->mdb_hash_tbl, &br_mdb_rht_params), 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, br_mcast_test_free_hash,
++						      &br->mdb_hash_tbl), 0);
++	mp = kunit_kzalloc(test, sizeof(*mp), GFP_KERNEL);
++	pg = kunit_kzalloc(test, sizeof(*pg), GFP_KERNEL);
++	port = kunit_kzalloc(test, sizeof(*port), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, mp);
++	KUNIT_ASSERT_NOT_NULL(test, pg);
++	KUNIT_ASSERT_NOT_NULL(test, port);
++	mp->addr.proto = htons(ETH_P_IP);
++	mp->addr.dst.ip4 = group;
++	port->dev = dev; /* Only identity is inspected by the unfiltered snapshot. */
++	port->state = BR_STATE_FORWARDING;
++	pg->key.port = port;
++	pg->filter_mode = MCAST_EXCLUDE;
++	rcu_assign_pointer(mp->ports, pg);
++	KUNIT_ASSERT_EQ(test, rhashtable_insert_fast(&br->mdb_hash_tbl,
++			&mp->rhnode, br_mdb_rht_params), 0);
++	rcu_read_lock();
++	err = br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd);
++	KUNIT_EXPECT_EQ(test, err, 0);
++	KUNIT_EXPECT_EQ(test, fwd.num_ports, 1);
++	KUNIT_EXPECT_FALSE(test, fwd.local_receive);
++	mp->host_joined = true;
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd), 0);
++	KUNIT_EXPECT_TRUE(test, fwd.local_receive);
++	mp->host_joined = false;
++	dev->flags |= IFF_ALLMULTI;
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd), 0);
++	KUNIT_EXPECT_TRUE(test, fwd.local_receive);
++	dev->flags &= ~IFF_ALLMULTI;
++	br->multicast_ctx.multicast_router = MDB_RTR_TYPE_PERM;
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd), 0);
++	KUNIT_EXPECT_TRUE(test, fwd.local_receive);
++	br->multicast_ctx.multicast_router = MDB_RTR_TYPE_DISABLED;
++	br->multicast_ctx.multicast_querier = 0;
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd),
++			-EOPNOTSUPP);
++	/* An external querier is enough; never require the local querier knob. */
++	mod_timer(&br->multicast_ctx.ip4_other_query.timer, jiffies + 60 * HZ);
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd), 0);
++	timer_delete(&br->multicast_ctx.ip4_other_query.timer);
++	br->multicast_ctx.multicast_querier = 1;
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, 0, group, 0, &fwd), -EINVAL);
++	/* This different IPv4 group has exactly the same Ethernet MAC. */
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source,
++			       htonl(0xef810101), 0, &fwd), -ENOENT);
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group,
++			       20, &fwd), -ENOENT);
++	pg->filter_mode = MCAST_INCLUDE;
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd), 0);
++	KUNIT_EXPECT_EQ(test, fwd.num_ports, 0);
++	rcu_read_unlock();
++	rhashtable_remove_fast(&br->mdb_hash_tbl, &mp->rhnode, br_mdb_rht_params);
++	synchronize_rcu();
++	mp->addr.src.ip4 = source;
++	KUNIT_ASSERT_EQ(test, rhashtable_insert_fast(&br->mdb_hash_tbl,
++			&mp->rhnode, br_mdb_rht_params), 0);
++	rcu_read_lock();
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd), 0);
++	KUNIT_EXPECT_EQ(test, fwd.num_ports, 1);
++	pg->flags = MDB_PG_FLAGS_BLOCKED;
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd), 0);
++	KUNIT_EXPECT_EQ(test, fwd.num_ports, 0);
++	pg->flags = 0;
++	port->flags = BR_MULTICAST_TO_UNICAST;
++	KUNIT_EXPECT_EQ(test, br_multicast_ipv4_snapshot(dev, source, group, 0, &fwd), -EOPNOTSUPP);
++	rcu_read_unlock();
++	rhashtable_remove_fast(&br->mdb_hash_tbl, &mp->rhnode, br_mdb_rht_params);
++	synchronize_rcu();
++}
++
++struct br_mcast_test_listener {
++	struct notifier_block nb;
++	struct net_device *dev;
++	u64 generation;
++	unsigned int calls;
++};
++
++static int br_mcast_test_notify(struct notifier_block *nb,
++			       unsigned long action, void *data)
++{
++	struct br_mcast_test_listener *listener =
++		container_of(nb, struct br_mcast_test_listener, nb);
++	struct br_mcast_event *event = data;
++
++	if (event->br_dev == listener->dev) {
++		listener->generation = event->generation;
++		listener->calls++;
++	}
++	return NOTIFY_DONE;
++}
++
++static void br_mcast_test_unregister(void *nb)
++{
++	br_multicast_unregister_notifier(nb);
++}
++
++static void br_mcast_notify_test(struct kunit *test)
++{
++	struct br_mcast_test_listener *listener;
++	struct net_device *dev;
++	struct net_bridge *br;
++
++	dev = alloc_netdev(sizeof(*br), "brkt%d", NET_NAME_UNKNOWN, ether_setup);
++	KUNIT_ASSERT_NOT_NULL(test, dev);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, br_mcast_test_free_dev, dev), 0);
++	br = netdev_priv(dev);
++	br->dev = dev;
++	spin_lock_init(&br->multicast_lock);
++	br_multicast_ctx_init(br, NULL, &br->multicast_ctx);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, br_mcast_test_free_ctx,
++						      &br->multicast_ctx), 0);
++	listener = kunit_kzalloc(test, sizeof(*listener), GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, listener);
++	listener->dev = dev;
++	listener->nb.notifier_call = br_mcast_test_notify;
++	KUNIT_ASSERT_EQ(test, br_multicast_register_notifier(&listener->nb), 0);
++	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, br_mcast_test_unregister,
++						      &listener->nb), 0);
++	KUNIT_EXPECT_EQ(test, br_multicast_set_igmp_version(&br->multicast_ctx, 3), 0);
++	KUNIT_EXPECT_EQ(test, listener->calls, 1);
++	KUNIT_EXPECT_EQ(test, listener->generation, 1);
++	KUNIT_EXPECT_EQ(test, br_multicast_set_igmp_version(&br->multicast_ctx, 1), -EINVAL);
++	KUNIT_EXPECT_EQ(test, listener->calls, 1);
++	KUNIT_EXPECT_EQ(test, br_multicast_set_igmp_version(&br->multicast_ctx, 2), 0);
++	KUNIT_EXPECT_EQ(test, listener->generation, 2);
++}
++
++static struct kunit_case br_mcast_fwd_cases[] = {
++	KUNIT_CASE(br_mcast_snapshot_test),
++	KUNIT_CASE(br_mcast_notify_test),
++	{}
++};
++
++static struct kunit_suite br_mcast_fwd_suite = {
++	.name = "bridge-mcast-fwd",
++	.test_cases = br_mcast_fwd_cases,
++};
++
++kunit_test_suite(br_mcast_fwd_suite);
+diff --git a/net/bridge/br_mdb.c b/net/bridge/br_mdb.c
+index a80ec51..571cc5c 100644
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@ -528,8 +528,10 @@ static void __br_mdb_notify(struct net_device *dev,
+ 	struct sk_buff *skb;
+ 	int err = -ENOBUFS;
+ 
+-	if (notify_switchdev)
++	if (notify_switchdev) {
++		br_multicast_offload_notify(netdev_priv(dev), &mp->addr);
+ 		br_switchdev_mdb_notify(dev, mp, pg, type);
++	}
+ 
+ 	skb = nlmsg_new(rtnl_mdb_nlmsg_size(pg), GFP_ATOMIC);
+ 	if (!skb)
+diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
+index fda1f89..66af279 100644
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@ -116,6 +116,151 @@ struct net_bridge_mdb_entry *br_mdb_ip_get(struct net_bridge *br,
+ 	return ent;
+ }
+ 
++static ATOMIC_NOTIFIER_HEAD(br_multicast_chain);
++
++int br_multicast_register_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&br_multicast_chain, nb);
++}
++EXPORT_SYMBOL_GPL(br_multicast_register_notifier);
++
++int br_multicast_unregister_notifier(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_unregister(&br_multicast_chain, nb);
++}
++EXPORT_SYMBOL_GPL(br_multicast_unregister_notifier);
++
++void br_multicast_offload_notify(struct net_bridge *br, const struct br_ip *group)
++{
++	struct br_mcast_event event = {
++		.br_dev = br->dev,
++		.group = group,
++		.generation = ++br->multicast_generation,
++	};
++
++	lockdep_assert_held(&br->multicast_lock);
++	atomic_notifier_call_chain(&br_multicast_chain, 0, &event);
++}
++
++/* Port flags, STP and VLAN changes can arrive under a different bridge
++ * lock. Consumers must invalidate on this event, without reading a snapshot
++ * from the callback. generation=0 denotes an external configuration event.
++ */
++void br_multicast_config_notify(const struct net_bridge *br)
++{
++	struct br_mcast_event event = { .br_dev = br->dev };
++
++	atomic_notifier_call_chain(&br_multicast_chain, 0, &event);
++}
++
++static int br_multicast_snapshot_add(struct net_bridge *br,
++				      struct net_bridge_port *port, u16 vid,
++				      struct br_mcast_fwd *fwd)
++{
++	struct bridge_vlan_info vinfo = {};
++	unsigned int i;
++
++	if (port->state != BR_STATE_FORWARDING)
++		return 0;
++	if (port->flags & (BR_MULTICAST_TO_UNICAST | BR_ISOLATED | BR_HAIRPIN_MODE |
++			   BR_PORT_LOCKED | BR_VLAN_TUNNEL))
++		return -EOPNOTSUPP;
++	if (br_vlan_enabled(br->dev) &&
++	    br_vlan_get_info_rcu(port->dev, vid, &vinfo))
++		return 0;
++	for (i = 0; i < fwd->num_ports; i++)
++		if (fwd->ports[i].dev == port->dev)
++			return 0;
++	if (i == BR_MCAST_FWD_MAX_PORTS)
++		return -E2BIG;
++	fwd->ports[i].dev = port->dev;
++	fwd->ports[i].vlan_flags = vinfo.flags;
++	fwd->num_ports++;
++	return 0;
++}
++
++int br_multicast_ipv4_snapshot(struct net_device *br_dev, __be32 source,
++			       __be32 group, u16 vid, struct br_mcast_fwd *fwd)
++{
++	struct br_ip key = { .proto = htons(ETH_P_IP), .vid = vid };
++	struct net_bridge_mcast_port *router;
++	struct net_bridge_port_group *pg;
++	struct net_bridge_mdb_entry *mp;
++	struct net_bridge_mcast *ctx;
++	struct net_bridge *br;
++	bool star_g = true;
++	int err = -ENOENT;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "multicast snapshot without RCU");
++	if (!netif_is_bridge_master(br_dev) || !ipv4_is_multicast(group) ||
++	    ipv4_is_local_multicast(group) || ipv4_is_zeronet(source) ||
++	    ipv4_is_multicast(source) || ipv4_is_lbcast(source))
++		return -EINVAL;
++	br = netdev_priv(br_dev);
++	ctx = &br->multicast_ctx;
++	memset(fwd, 0, sizeof(*fwd));
++	spin_lock_bh(&br->multicast_lock);
++	if (!br_opt_get(br, BROPT_MULTICAST_ENABLED) || br_mst_enabled(br_dev))
++		goto out;
++	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED)) {
++		struct net_bridge_vlan *vlan = br_vlan_find(br_vlan_group(br), vid);
++
++		if (!vlan)
++			goto out;
++		ctx = &vlan->br_mcast_ctx;
++	}
++	if (br_multicast_ctx_vlan_global_disabled(ctx))
++		goto out;
++	/* Without a querier the bridge floods, even if an MDB entry exists. */
++	if (!__br_multicast_querier_exists(ctx, &ctx->ip4_other_query, false)) {
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++	key.dst.ip4 = group;
++	mp = NULL;
++	if (ctx->multicast_igmp_version == 3) {
++		key.src.ip4 = source;
++		mp = br_mdb_ip_get(br, &key);
++		star_g = !mp;
++	}
++	if (!mp) {
++		key.src.ip4 = 0;
++		mp = br_mdb_ip_get(br, &key);
++	}
++	if (!mp)
++		goto out;
++	fwd->local_receive = mp->host_joined ||
++		ctx->multicast_router == MDB_RTR_TYPE_PERM ||
++		(ctx->multicast_router == MDB_RTR_TYPE_TEMP_QUERY &&
++		 br_ip4_multicast_is_router(ctx)) ||
++		(br_dev->flags & (IFF_ALLMULTI | IFF_PROMISC));
++	fwd->generation = br->multicast_generation;
++	for (pg = mlock_dereference(mp->ports, br); pg;
++	     pg = mlock_dereference(pg->next, br)) {
++		if ((pg->flags & MDB_PG_FLAGS_BLOCKED) ||
++		    (star_g && ctx->multicast_igmp_version == 3 &&
++		     pg->filter_mode == MCAST_INCLUDE))
++			continue;
++		err = br_multicast_snapshot_add(br, pg->key.port, vid, fwd);
++		if (err)
++			goto out;
++	}
++	hlist_for_each_entry(router, &ctx->ip4_mc_router_list, ip4_rlist) {
++		err = br_multicast_snapshot_add(br, router->port, vid, fwd);
++		if (err)
++			goto out;
++	}
++	err = 0;
++out:
++	spin_unlock_bh(&br->multicast_lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(br_multicast_ipv4_snapshot);
++
++#if IS_ENABLED(CONFIG_BRIDGE_MCAST_FWD_KUNIT_TEST)
++#include "br_mcast_fwd_test.h"
++#endif
++
+ static struct net_bridge_mdb_entry *br_mdb_ip4_get(struct net_bridge *br,
+ 						   __be32 dst, __u16 vid)
+ {
+@@ -1287,6 +1432,7 @@ struct net_bridge_mdb_entry *br_multicast_new_group(struct net_bridge *br,
+ 		trace_br_mdb_full(br->dev, group);
+ 		br_mc_disabled_update(br->dev, false, NULL);
+ 		br_opt_toggle(br, BROPT_MULTICAST_ENABLED, false);
++		br_multicast_offload_notify(br, NULL);
+ 		return ERR_PTR(-E2BIG);
+ 	}
+ 
+@@ -1699,6 +1845,7 @@ static void br_multicast_local_router_expired(struct net_bridge_mcast *brmctx,
+ 					      struct timer_list *timer)
+ {
+ 	spin_lock(&brmctx->br->multicast_lock);
++	br_multicast_offload_notify(brmctx->br, NULL);
+ 	if (brmctx->multicast_router == MDB_RTR_TYPE_DISABLED ||
+ 	    brmctx->multicast_router == MDB_RTR_TYPE_PERM ||
+ 	    br_ip4_multicast_is_router(brmctx) ||
+@@ -1732,6 +1879,7 @@ static void br_multicast_querier_expired(struct net_bridge_mcast *brmctx,
+ 					 struct bridge_mcast_own_query *query)
+ {
+ 	spin_lock(&brmctx->br->multicast_lock);
++	br_multicast_offload_notify(brmctx->br, NULL);
+ 	if (!netif_running(brmctx->br->dev) ||
+ 	    br_multicast_ctx_vlan_global_disabled(brmctx) ||
+ 	    !br_opt_get(brmctx->br, BROPT_MULTICAST_ENABLED))
+@@ -1761,9 +1909,21 @@ static void br_ip6_multicast_querier_expired(struct timer_list *t)
+ }
+ #endif
+ 
++#if IS_ENABLED(CONFIG_IPV6)
+ static void br_multicast_query_delay_expired(struct timer_list *t)
+ {
+ }
++#endif
++
++static void br_ip4_multicast_query_delay_expired(struct timer_list *t)
++{
++	struct net_bridge_mcast *brmctx = timer_container_of(brmctx, t,
++							     ip4_other_query.delay_timer);
++
++	spin_lock(&brmctx->br->multicast_lock);
++	br_multicast_offload_notify(brmctx->br, NULL);
++	spin_unlock(&brmctx->br->multicast_lock);
++}
+ 
+ static void br_multicast_select_own_querier(struct net_bridge_mcast *brmctx,
+ 					    struct br_ip *ip,
+@@ -3262,8 +3422,10 @@ br_multicast_update_query_timer(struct net_bridge_mcast *brmctx,
+ 				struct bridge_mcast_other_query *query,
+ 				unsigned long max_delay)
+ {
+-	if (!timer_pending(&query->timer))
++	if (!timer_pending(&query->timer)) {
+ 		mod_timer(&query->delay_timer, jiffies + max_delay);
++		br_multicast_offload_notify(brmctx->br, NULL);
++	}
+ 
+ 	mod_timer(&query->timer, jiffies + brmctx->multicast_querier_interval);
+ }
+@@ -3355,6 +3517,7 @@ static void br_multicast_add_router(struct net_bridge_mcast *brmctx,
+ 		hlist_add_behind_rcu(rlist, slot);
+ 	else
+ 		hlist_add_head_rcu(rlist, mc_router_list);
++	br_multicast_offload_notify(brmctx->br, NULL);
+ 
+ 	/* For backwards compatibility for now, only notify if we
+ 	 * switched from no IPv4/IPv6 multicast router to a new
+@@ -3403,6 +3566,8 @@ static void br_multicast_mark_router(struct net_bridge_mcast *brmctx,
+ 
+ 	if (!pmctx) {
+ 		if (brmctx->multicast_router == MDB_RTR_TYPE_TEMP_QUERY) {
++			if (!timer_pending(timer))
++				br_multicast_offload_notify(brmctx->br, NULL);
+ 			if (!br_ip4_multicast_is_router(brmctx) &&
+ 			    !br_ip6_multicast_is_router(brmctx))
+ 				br_mc_router_state_change(brmctx->br, true);
+@@ -4118,7 +4283,7 @@ void br_multicast_ctx_init(struct net_bridge *br,
+ 	timer_setup(&brmctx->ip4_other_query.timer,
+ 		    br_ip4_multicast_querier_expired, 0);
+ 	timer_setup(&brmctx->ip4_other_query.delay_timer,
+-		    br_multicast_query_delay_expired, 0);
++		    br_ip4_multicast_query_delay_expired, 0);
+ 	timer_setup(&brmctx->ip4_own_query.timer,
+ 		    br_ip4_multicast_query_expired, 0);
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -4319,6 +4484,7 @@ void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on)
+ 
+ 		spin_lock_bh(&br->multicast_lock);
+ 		vlan->priv_flags ^= BR_VLFLAG_MCAST_ENABLED;
++		br_multicast_offload_notify(br, NULL);
+ 		spin_unlock_bh(&br->multicast_lock);
+ 
+ 		if (on)
+@@ -4335,6 +4501,7 @@ void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on)
+ 		br = vlan->port->br;
+ 		spin_lock_bh(&br->multicast_lock);
+ 		vlan->priv_flags ^= BR_VLFLAG_MCAST_ENABLED;
++		br_multicast_offload_notify(br, NULL);
+ 		if (on)
+ 			__br_multicast_enable_port_ctx(&vlan->port_mcast_ctx);
+ 		else
+@@ -4382,7 +4549,10 @@ int br_multicast_toggle_vlan_snooping(struct net_bridge *br, bool on,
+ 	if (!vg)
+ 		return 0;
+ 
++	spin_lock_bh(&br->multicast_lock);
+ 	br_opt_toggle(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED, on);
++	br_multicast_offload_notify(br, NULL);
++	spin_unlock_bh(&br->multicast_lock);
+ 
+ 	/* disable/enable non-vlan mcast contexts based on vlan snooping */
+ 	if (on)
+@@ -4413,6 +4583,9 @@ bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan, bool on)
+ 		return false;
+ 
+ 	vlan->priv_flags ^= BR_VLFLAG_GLOBAL_MCAST_ENABLED;
++	spin_lock_bh(&vlan->br->multicast_lock);
++	br_multicast_offload_notify(vlan->br, NULL);
++	spin_unlock_bh(&vlan->br->multicast_lock);
+ 	br_multicast_toggle_vlan(vlan, on);
+ 
+ 	return true;
+@@ -4484,6 +4657,8 @@ int br_multicast_set_router(struct net_bridge_mcast *brmctx, unsigned long val)
+ 		break;
+ 	}
+ 
++	if (!err)
++		br_multicast_offload_notify(brmctx->br, NULL);
+ 	spin_unlock_bh(&brmctx->br->multicast_lock);
+ 
+ 	return err;
+@@ -4494,6 +4669,8 @@ br_multicast_rport_del_notify(struct net_bridge_mcast_port *pmctx, bool deleted)
+ {
+ 	if (!deleted)
+ 		return;
++	/* Unlike the legacy rtnetlink event, each protocol matters here. */
++	br_multicast_offload_notify(pmctx->port->br, NULL);
+ 
+ 	/* For backwards compatibility for now, only notify if there is
+ 	 * no multicast router anymore for both IPv4 and IPv6.
+@@ -4679,6 +4856,7 @@ int br_multicast_toggle(struct net_bridge *br, unsigned long val,
+ 		goto unlock;
+ 
+ 	br_opt_toggle(br, BROPT_MULTICAST_ENABLED, !!val);
++	br_multicast_offload_notify(br, NULL);
+ 	if (!br_opt_get(br, BROPT_MULTICAST_ENABLED)) {
+ 		change_snoopers = true;
+ 		br_multicast_disable_all_ports(br);
+@@ -4749,6 +4927,7 @@ int br_multicast_set_querier(struct net_bridge_mcast *brmctx, unsigned long val)
+ 		goto unlock;
+ 
+ 	WRITE_ONCE(brmctx->multicast_querier, val);
++	br_multicast_offload_notify(brmctx->br, NULL);
+ 	if (!val)
+ 		goto unlock;
+ 
+@@ -4788,6 +4967,7 @@ int br_multicast_set_igmp_version(struct net_bridge_mcast *brmctx,
+ 
+ 	spin_lock_bh(&brmctx->br->multicast_lock);
+ 	brmctx->multicast_igmp_version = val;
++	br_multicast_offload_notify(brmctx->br, NULL);
+ 	spin_unlock_bh(&brmctx->br->multicast_lock);
+ 
+ 	return 0;
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 5efcc72..b253019 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -669,6 +669,9 @@ void br_ifinfo_notify(int event, const struct net_bridge *br,
+ {
+ 	u32 filter = RTEXT_FILTER_BRVLAN_COMPRESSED;
+ 
++#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++	br_multicast_config_notify(br ? br : port->br);
++#endif
+ 	br_info_notify(event, br, port, filter);
+ }
+ 
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 6a1c9ca..4f7e11e 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -542,6 +542,7 @@ struct net_bridge {
+ 	} stp_enabled;
+ 
+ 	struct net_bridge_mcast		multicast_ctx;
++	u64				multicast_generation;
+ 
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
+ 	struct bridge_mcast_stats	__percpu *mcast_stats;
+@@ -953,6 +954,8 @@ int br_ioctl_stub(struct net *net, unsigned int cmd, void __user *uarg);
+ 
+ /* br_multicast.c */
+ #ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++void br_multicast_config_notify(const struct net_bridge *br);
++void br_multicast_offload_notify(struct net_bridge *br, const struct br_ip *group);
+ int br_multicast_rcv(struct net_bridge_mcast **brmctx,
+ 		     struct net_bridge_mcast_port **pmctx,
+ 		     struct net_bridge_vlan *vlan,
+-- 
+2.53.0
+

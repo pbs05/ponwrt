@@ -1,0 +1,379 @@
+From 250b632748567ee4d7bb7e678fba152142522f45 Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 20:34:23 +0800
+Subject: [PATCH] udp: propagate fraglist DS fields with an unchanged-batch
+ fast return
+
+---
+ net/ipv4/Kconfig             |  10 ++
+ net/ipv4/udp_fraglist_test.h | 186 +++++++++++++++++++++++++++++++++++
+ net/ipv4/udp_offload.c       |  87 ++++++++++++++--
+ 3 files changed, 276 insertions(+), 7 deletions(-)
+ create mode 100644 net/ipv4/udp_fraglist_test.h
+
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+index cae285a1a..5b7bef60f 100644
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -2,6 +2,16 @@
+ #
+ # IP configuration
+ #
++config UDP_FRAGLIST_KUNIT_TEST
++	bool "UDP fraglist segmentation tests" if !KUNIT_ALL_TESTS
++	depends on KUNIT && IPV6=y
++	default KUNIT_ALL_TESTS
++	help
++	  Test DSCP/ECN propagation, checksums and copy-on-write after GRO.
++	  Exercise the real UDP fraglist segmentation path for IPv4 and IPv6,
++	  with and without NAT, including all ECN states and shared headers.
++	  No packets are sent to a network interface.
++
+ config IP_MULTICAST
+ 	bool "IP: multicasting"
+ 	help
+diff --git a/net/ipv4/udp_fraglist_test.h b/net/ipv4/udp_fraglist_test.h
+new file mode 100644
+index 000000000..709aa3af9
+--- /dev/null
++++ b/net/ipv4/udp_fraglist_test.h
+@@ -0,0 +1,186 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++static struct sk_buff *udp_fraglist_test_packet(bool ipv6, u8 dsfield, int payload)
++{
++	unsigned int iplen = ipv6 ? sizeof(struct ipv6hdr) : sizeof(struct iphdr);
++	unsigned int len = ETH_HLEN + iplen + sizeof(struct udphdr) + payload;
++	struct sk_buff *skb = alloc_skb(len + NET_SKB_PAD, GFP_KERNEL);
++	struct udphdr *uh;
++
++	if (!skb)
++		return NULL;
++	skb_reserve(skb, NET_SKB_PAD);
++	skb_put_zero(skb, len);
++	skb_reset_mac_header(skb);
++	skb_set_network_header(skb, ETH_HLEN);
++	skb_set_transport_header(skb, ETH_HLEN + iplen);
++	skb->mac_len = ETH_HLEN;
++	uh = udp_hdr(skb);
++	uh->source = htons(1000);
++	uh->dest = htons(2000);
++	uh->len = htons(sizeof(*uh) + payload);
++	if (ipv6) {
++		struct ipv6hdr *iph = ipv6_hdr(skb);
++
++		ip6_flow_hdr(iph, dsfield, htonl(0x12345));
++		iph->nexthdr = IPPROTO_UDP;
++		iph->payload_len = uh->len;
++		iph->saddr.s6_addr32[3] = htonl(1);
++		iph->daddr.s6_addr32[3] = htonl(2);
++		uh->check = csum_ipv6_magic(&iph->saddr, &iph->daddr, ntohs(uh->len),
++					    IPPROTO_UDP, csum_partial(uh, ntohs(uh->len), 0));
++	} else {
++		struct iphdr *iph = ip_hdr(skb);
++
++		iph->version = 4;
++		iph->ihl = 5;
++		iph->tos = dsfield;
++		iph->tot_len = htons(iplen + ntohs(uh->len));
++		iph->protocol = IPPROTO_UDP;
++		iph->saddr = htonl(1);
++		iph->daddr = htonl(2);
++		iph->check = ip_fast_csum(iph, iph->ihl);
++		uh->check = csum_tcpudp_magic(iph->saddr, iph->daddr, ntohs(uh->len),
++					      IPPROTO_UDP, csum_partial(uh, ntohs(uh->len), 0));
++	}
++	return skb;
++}
++
++static void udp_fraglist_case(struct kunit *test, bool v6, u8 ds,
++			      bool nat, bool cloned, int payload, int fail)
++{
++	struct sk_buff *head = udp_fraglist_test_packet(v6, ds, payload);
++	struct sk_buff *tails[3], *clones[3] = {}, *segs, *seg;
++	int i, count = 0;
++
++	KUNIT_ASSERT_NOT_NULL(test, head);
++	for (i = 0; i < 3; i++) {
++		tails[i] = udp_fraglist_test_packet(v6, 0, payload);
++		KUNIT_ASSERT_NOT_NULL(test, tails[i]);
++		if (cloned) {
++			clones[i] = skb_clone(tails[i], GFP_KERNEL);
++			KUNIT_ASSERT_NOT_NULL(test, clones[i]);
++		}
++		skb_pull(tails[i], skb_transport_offset(tails[i]));
++		if (i)
++			tails[i - 1]->next = tails[i];
++	}
++	if (nat) {
++		if (v6) {
++			struct in6_addr addr = ipv6_hdr(head)->daddr;
++
++			addr.s6_addr32[3] = htonl(3);
++			__udpv6_gso_segment_csum(head, &ipv6_hdr(head)->daddr, &addr,
++						 &udp_hdr(head)->dest, htons(3000));
++		} else {
++			__be32 addr = htonl(3);
++			__be16 port = htons(3000);
++
++			__udpv4_gso_segment_csum(head, &ip_hdr(head)->daddr, &addr,
++						 &udp_hdr(head)->dest, &port);
++		}
++	}
++	skb_pull(head, skb_transport_offset(head));
++	skb_shinfo(head)->frag_list = tails[0];
++	head->data_len = 3 * tails[0]->len;
++	head->len += head->data_len;
++	skb_shinfo(head)->gso_size = payload;
++	skb_shinfo(head)->gso_type = SKB_GSO_FRAGLIST | SKB_GSO_UDP_L4;
++	udp_fraglist_test_writes = 0;
++	udp_fraglist_test_fail_after = fail;
++	segs = __udp_gso_segment_list(head, NETIF_F_SG, v6);
++	udp_fraglist_test_fail_after = -1;
++	if (fail >= 0) {
++		KUNIT_EXPECT_EQ(test, PTR_ERR(segs), -ENOMEM);
++		goto done;
++	}
++	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, segs);
++	KUNIT_EXPECT_EQ(test, udp_fraglist_test_writes, ds || nat ? 3 : 0);
++	for (seg = segs->next; seg; seg = seg->next) {
++		struct udphdr *uh = udp_hdr(seg);
++
++		if (v6) {
++			struct ipv6hdr *iph = ipv6_hdr(seg);
++
++			KUNIT_EXPECT_EQ(test, ipv6_get_dsfield(iph), ds);
++			KUNIT_EXPECT_EQ(test, ntohl(ip6_flowlabel(iph)), (u32)0x12345);
++			KUNIT_EXPECT_EQ(test, csum_ipv6_magic(&iph->saddr, &iph->daddr,
++				ntohs(uh->len), IPPROTO_UDP,
++				csum_partial(uh, ntohs(uh->len), 0)), 0);
++		} else {
++			struct iphdr *iph = ip_hdr(seg);
++
++			KUNIT_EXPECT_EQ(test, iph->tos, ds);
++			KUNIT_EXPECT_EQ(test, ip_fast_csum(iph, iph->ihl), 0);
++			KUNIT_EXPECT_EQ(test, csum_tcpudp_magic(iph->saddr, iph->daddr,
++				ntohs(uh->len), IPPROTO_UDP,
++				csum_partial(uh, ntohs(uh->len), 0)), 0);
++		}
++		KUNIT_EXPECT_EQ(test, uh->dest, htons(nat ? 3000 : 2000));
++		count++;
++	}
++	KUNIT_EXPECT_EQ(test, count, 3);
++	kfree_skb_list(segs);
++done:
++	for (i = 0; i < 3; i++) {
++		if (clones[i]) {
++			KUNIT_EXPECT_EQ(test, v6 ? ipv6_get_dsfield(ipv6_hdr(clones[i])) :
++					ip_hdr(clones[i])->tos, 0);
++			consume_skb(clones[i]);
++		}
++	}
++	consume_skb(head);
++}
++
++static void udp_fraglist_dsfield_test(struct kunit *test)
++{
++	int v6, ds, nat, clone;
++
++	for (v6 = 0; v6 < 2; v6++)
++	for (ds = 0; ds < 256; ds++)
++	for (nat = 0; nat < 2; nat++)
++	for (clone = 0; clone < 2; clone++)
++		udp_fraglist_case(test, v6, ds, nat, clone, ds & 1 ? 1400 : 128, -1);
++}
++
++static void udp_fraglist_failure_test(struct kunit *test)
++{
++	int v6, fail;
++
++	for (v6 = 0; v6 < 2; v6++)
++	for (fail = 0; fail < 3; fail++)
++		udp_fraglist_case(test, v6, 28, true, true, 1400, fail);
++}
++
++/* Exercise the actual helpers called by UDP GRO before list aggregation. */
++static void udp_fraglist_homogeneity_test(struct kunit *test)
++{
++	struct sk_buff *skb = alloc_skb(0, GFP_KERNEL);
++	struct iphdr a = { .version = 4, .ihl = 5, .ttl = 64 }, b = a;
++	struct ipv6hdr a6 = { .hop_limit = 64 }, b6 = a6;
++	int ds, other;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	for (ds = 0; ds < 256; ds++)
++	for (other = 0; other < 256; other++) {
++		memset(NAPI_GRO_CB(skb), 0, sizeof(*NAPI_GRO_CB(skb)));
++		NAPI_GRO_CB(skb)->count = 1;
++		a.tos = ds;
++		b.tos = other;
++		ip6_flow_hdr(&a6, ds, 0);
++		ip6_flow_hdr(&b6, other, 0);
++		KUNIT_EXPECT_EQ(test, !!inet_gro_flush(&a, &b, skb, false), ds != other);
++		KUNIT_EXPECT_EQ(test, !!ipv6_gro_flush(&a6, &b6), ds != other);
++	}
++	consume_skb(skb);
++}
++
++static struct kunit_case udp_fraglist_cases[] = {
++	KUNIT_CASE(udp_fraglist_dsfield_test),
++	KUNIT_CASE(udp_fraglist_failure_test),
++	KUNIT_CASE(udp_fraglist_homogeneity_test),
++	{}
++};
++static struct kunit_suite udp_fraglist_suite = {
++	.name = "udp-fraglist-dsfield", .test_cases = udp_fraglist_cases,
++};
++kunit_test_suite(udp_fraglist_suite);
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index 4f7ae02df..af7bac44f 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -13,6 +13,11 @@
+ #include <net/protocol.h>
+ #include <net/inet_common.h>
+ #include <net/udp_tunnel.h>
++#include <net/dsfield.h>
++
++#if IS_ENABLED(CONFIG_UDP_FRAGLIST_KUNIT_TEST)
++#include <kunit/test.h>
++#endif
+ 
+ #if IS_ENABLED(CONFIG_NET_UDP_TUNNEL)
+ 
+@@ -374,6 +379,23 @@ static void __udpv4_gso_segment_csum(struct sk_buff *seg,
+ 	*oldip = *newip;
+ }
+ 
++#if IS_ENABLED(CONFIG_UDP_FRAGLIST_KUNIT_TEST)
++static int udp_fraglist_test_writes;
++static int udp_fraglist_test_fail_after = -1;
++#endif
++
++static inline int udp_fraglist_make_writable(struct sk_buff *skb, unsigned int len)
++{
++#if IS_ENABLED(CONFIG_UDP_FRAGLIST_KUNIT_TEST)
++	udp_fraglist_test_writes++;
++	if (udp_fraglist_test_fail_after == 0)
++		return -ENOMEM;
++	if (udp_fraglist_test_fail_after > 0)
++		udp_fraglist_test_fail_after--;
++#endif
++	return skb_ensure_writable(skb, len);
++}
++
+ static struct sk_buff *__udpv4_gso_segment_list_csum(struct sk_buff *segs)
+ {
+ 	struct sk_buff *seg;
+@@ -384,15 +406,36 @@ static struct sk_buff *__udpv4_gso_segment_list_csum(struct sk_buff *segs)
+ 	uh = udp_hdr(seg);
+ 	iph = ip_hdr(seg);
+ 
+-	if ((udp_hdr(seg)->dest == udp_hdr(seg->next)->dest) &&
+-	    (udp_hdr(seg)->source == udp_hdr(seg->next)->source) &&
+-	    (ip_hdr(seg)->daddr == ip_hdr(seg->next)->daddr) &&
+-	    (ip_hdr(seg)->saddr == ip_hdr(seg->next)->saddr))
++	/* GRO requires a homogeneous tuple and full DS field for all members.
++	 * Only the aggregate header can subsequently be changed by NAT/QoS.
++	 * As in the existing NAT fast path, one unchanged child proves the
++	 * whole batch unchanged: no extra per-child walk or COW check.
++	 */
++	if (!seg->next)
++		return segs;
++	uh2 = udp_hdr(seg->next);
++	iph2 = ip_hdr(seg->next);
++	if (uh2->dest == uh->dest && uh2->source == uh->source &&
++	    iph2->daddr == iph->daddr && iph2->saddr == iph->saddr &&
++	    iph2->tos == iph->tos)
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+ 		uh2 = udp_hdr(seg);
+ 		iph2 = ip_hdr(seg);
++		if (uh2->dest == uh->dest && uh2->source == uh->source &&
++		    iph2->daddr == iph->daddr && iph2->saddr == iph->saddr &&
++		    iph2->tos == iph->tos)
++			continue;
++
++		if (udp_fraglist_make_writable(seg, skb_transport_offset(seg) + sizeof(*uh2)))
++			goto err;
++		uh2 = udp_hdr(seg);
++		iph2 = ip_hdr(seg);
++		/* GRO only merges equal DS fields. Propagate later DSCP/ECN
++		 * changes on the aggregate, even when no NAT took place.
++		 */
++		ipv4_change_dsfield(iph2, 0, iph->tos);
+ 
+ 		__udpv4_gso_segment_csum(seg,
+ 					 &iph2->saddr, &iph->saddr,
+@@ -403,6 +446,12 @@ static struct sk_buff *__udpv4_gso_segment_list_csum(struct sk_buff *segs)
+ 	}
+ 
+ 	return segs;
++
++err:
++	kfree_skb_list(segs->next);
++	segs->next = NULL;
++	consume_skb(segs);
++	return ERR_PTR(-ENOMEM);
+ }
+ 
+ static void __udpv6_gso_segment_csum(struct sk_buff *seg,
+@@ -440,17 +489,31 @@ static struct sk_buff *__udpv6_gso_segment_list_csum(struct sk_buff *segs)
+ 	seg = segs;
+ 	uh = udp_hdr(seg);
+ 	iph = ipv6_hdr(seg);
++	/* The same GRO homogeneity invariant permits an O(1) fast return. */
++	if (!seg->next)
++		return segs;
+ 	uh2 = udp_hdr(seg->next);
+ 	iph2 = ipv6_hdr(seg->next);
+-
+-	if (!(*(const u32 *)&uh->source ^ *(const u32 *)&uh2->source) &&
++	if (uh2->dest == uh->dest && uh2->source == uh->source &&
+ 	    ipv6_addr_equal(&iph->saddr, &iph2->saddr) &&
+-	    ipv6_addr_equal(&iph->daddr, &iph2->daddr))
++	    ipv6_addr_equal(&iph->daddr, &iph2->daddr) &&
++	    ipv6_get_dsfield(iph2) == ipv6_get_dsfield(iph))
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+ 		uh2 = udp_hdr(seg);
+ 		iph2 = ipv6_hdr(seg);
++		if (uh2->dest == uh->dest && uh2->source == uh->source &&
++		    ipv6_addr_equal(&iph->saddr, &iph2->saddr) &&
++		    ipv6_addr_equal(&iph->daddr, &iph2->daddr) &&
++		    ipv6_get_dsfield(iph2) == ipv6_get_dsfield(iph))
++			continue;
++
++		if (udp_fraglist_make_writable(seg, skb_transport_offset(seg) + sizeof(*uh2)))
++			goto err;
++		uh2 = udp_hdr(seg);
++		iph2 = ipv6_hdr(seg);
++		ipv6_change_dsfield(iph2, 0, ipv6_get_dsfield(iph));
+ 
+ 		__udpv6_gso_segment_csum(seg, &iph2->saddr, &iph->saddr,
+ 					 &uh2->source, uh->source);
+@@ -459,6 +522,12 @@ static struct sk_buff *__udpv6_gso_segment_list_csum(struct sk_buff *segs)
+ 	}
+ 
+ 	return segs;
++
++err:
++	kfree_skb_list(segs->next);
++	segs->next = NULL;
++	consume_skb(segs);
++	return ERR_PTR(-ENOMEM);
+ }
+ 
+ static struct sk_buff *__udp_gso_segment_list(struct sk_buff *skb,
+@@ -997,3 +1066,7 @@ int __init udpv4_offload_init(void)
+ 
+ 	return inet_add_offload(&net_hotdata.udpv4_offload, IPPROTO_UDP);
+ }
++
++#if IS_ENABLED(CONFIG_UDP_FRAGLIST_KUNIT_TEST)
++#include "udp_fraglist_test.h"
++#endif
+-- 
+2.53.0
+

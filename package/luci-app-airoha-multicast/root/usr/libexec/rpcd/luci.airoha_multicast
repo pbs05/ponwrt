@@ -1,0 +1,33 @@
+#!/bin/sh
+case "$1:$2" in
+	list:*) printf '{"getStatus":{},"apply":{}}\n' ;;
+	call:getStatus)
+		. /usr/share/libubox/jshn.sh
+		json_init
+		result=$(/usr/sbin/airoha-mcastctl get 2>/dev/null) && json_load "$result" || {
+			printf '{"error":"status_unavailable"}\n'; exit 0;
+		}
+		if [ -r /var/run/airoha-multicast/policy ]; then
+			read -r enabled upstream downstream < /var/run/airoha-multicast/policy
+			json_add_string applied_enabled "$enabled"
+			json_add_string applied_upstream "$upstream"
+			json_add_string applied_downstream "$downstream"
+		fi
+		json_dump
+		;;
+	call:apply)
+		result=$(/usr/sbin/airoha-mcastctl get 2>/dev/null) || {
+			printf '{"error":"status_unavailable"}\n'; exit 0;
+		}
+		if [ "$(printf '%s' "$result" | jsonfilter -e '@.live_apply')" != true ]; then
+			printf '{"error":"reboot_required"}\n'; exit 0
+		fi
+		if result=$(/etc/init.d/airoha-multicast reload 2>&1); then
+			printf '{"ok":true}\n'
+		else
+			printf '%.1024s\n' "$result" | logger -t airoha-multicast
+			printf '{"error":"apply_failed"}\n'
+		fi
+		;;
+	*) exit 1 ;;
+esac

@@ -1,0 +1,105 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Running policy"
+msgstr ""
+
+msgid "Multicast status unavailable. Saved settings do not prove that hardware offload is active."
+msgstr ""
+
+msgid "Hardware fault; reboot is required for recovery. Delivery may be interrupted."
+msgstr ""
+
+msgid "Interface was recreated. Waiting for interface recovery; Apply can rebind the configured scope online."
+msgstr ""
+
+msgid "Interface was removed. This older kernel requires a reboot."
+msgstr ""
+
+msgid "Waiting for the configured interfaces and policy."
+msgstr ""
+
+msgid "Offload disabled; multicast uses software forwarding."
+msgstr ""
+
+msgid "Temporarily paused by a diagnostic tool."
+msgstr ""
+
+msgid "Policy accepted; waiting for hardware initialization."
+msgstr ""
+
+msgid "Offload ready; active hardware flows: %s."
+msgstr ""
+
+msgid "Saved settings differ from the accepted policy. Use Save & Apply; no reboot is needed."
+msgstr ""
+
+msgid "This kernel only accepts policy at boot. Save settings and reboot to apply them."
+msgstr ""
+
+msgid "Accepted scope: %s → %s; interface indices: %s → %s; VLAN IDs: %s → %s."
+msgstr ""
+
+msgid "Pending flows: %s; invalidated: %s; errors: %s."
+msgstr ""
+
+msgid "Open reboot page"
+msgstr ""
+
+msgid "Refresh status"
+msgstr ""
+
+msgid "Multicast offload"
+msgstr ""
+
+msgid "Accelerate supported IPv4 multicast forwarding from the PON interface to a LAN bridge. Multicast routing and firewall permissions must already be configured."
+msgstr ""
+
+msgid "Enable multicast hardware offload"
+msgstr ""
+
+msgid "Disabling offload keeps software multicast routing available. This switch does not disable IPTV or filter unsolicited multicast."
+msgstr ""
+
+msgid "Upstream logical interface"
+msgstr ""
+
+msgid "Downstream logical interface"
+msgstr ""
+
+msgid "Select the PON IPoE interface, optionally with one VLAN. PPPoE and QinQ are not supported by this backend."
+msgstr ""
+
+msgid "Select the LAN bridge or its VLAN interface. Subscriptions determine the actual output ports."
+msgstr ""
+
+msgid "Select an existing logical interface."
+msgstr ""
+
+msgid "Upstream and downstream must differ."
+msgstr ""
+
+msgid "Applying changes"
+msgstr ""
+
+msgid "On a kernel with online-policy support, Save & Apply withdraws old multicast flows and relearns them in the new scope. Brief software forwarding and playback jitter are possible. WAN and LAN interfaces are not restarted. Save alone stores settings without changing the running policy."
+msgstr ""
+
+msgid "Interface recovery"
+msgstr ""
+
+msgid "When an applied logical interface is recreated, its ifup event revalidates the PON/bridge devices and restores offload. Saved-but-unapplied edits are not used by this recovery. Hardware invalidation faults still require a reboot."
+msgstr ""
+
+msgid "Settings saved; the running multicast policy was not changed."
+msgstr ""
+
+msgid "This kernel requires a reboot. Settings have been saved."
+msgstr ""
+
+msgid "Apply failed. Check interface availability, driver status and the system log."
+msgstr ""
+
+msgid "Policy accepted online. Refresh status to confirm hardware readiness."
+msgstr ""

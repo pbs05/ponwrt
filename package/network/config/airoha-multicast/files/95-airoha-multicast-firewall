@@ -1,0 +1,13 @@
+#!/bin/sh
+# Optional fw4 integration; no firewall rules or forwarding permissions added.
+[ -x /sbin/fw4 ] && [ -f /etc/config/firewall ] || exit 0
+old=$(uci -q get firewall.airoha_multicast_refresh.path)
+case "$old" in ''|/usr/libexec/airoha-multicast-firewall) ;; *) exit 1 ;; esac
+uci -q batch <<'EOF'
+set firewall.airoha_multicast_refresh=include
+set firewall.airoha_multicast_refresh.type='script'
+set firewall.airoha_multicast_refresh.path='/usr/libexec/airoha-multicast-firewall'
+set firewall.airoha_multicast_refresh.fw4_compatible='1'
+set firewall.airoha_multicast_refresh.enabled='1'
+commit firewall
+EOF

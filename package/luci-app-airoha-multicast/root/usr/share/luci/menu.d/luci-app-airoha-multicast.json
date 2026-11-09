@@ -1,0 +1,8 @@
+{
+	"admin/network/airoha-multicast": {
+		"title": "Multicast offload",
+		"order": 66,
+		"action": { "type": "view", "path": "airoha_multicast/settings" },
+		"depends": { "acl": [ "luci-app-airoha-multicast" ] }
+	}
+}

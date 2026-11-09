@@ -1,0 +1,9 @@
+config profile 'main'
+	option device 'lan1'
+	option mode 'priority'
+	option preset 'ppe-legacy-v1'
+	# Opt in with mode 'dscp' after basic management access is established.
+	# DSCP mode retains the original PPE numeric map, not a DiffServ/WMM standard.
+	# Optional DSCP:QUEUE overrides (DSCP 0..63, queue 0..7).
+	# Optional overrides, applied together at the next boot:
+	# list map '7:4'
