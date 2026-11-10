@@ -1,0 +1,450 @@
+From: HG maintainers <hg@localhost>
+Subject: [PATCH] net: pcs: airoha: recover AN7581 Ethernet HSGMII RX lock
+
+PHY/out-of-band mode does not run the phylink PCS polling timer. Add a
+lane-local sleepable health worker for AN7581 Ethernet 2500Base-X only.
+Use the SDK six/four signal sampling and 700/100 us CDR sequence, confirm
+transient faults, serialize with configuration and cancel before teardown.
+Three failed attempts enter a thirty-second cooldown. Healthy checks only
+read three registers once per second. Keep PHY, MAC and shared resets,
+PON, rate-adaptation, fragmentation and packet forwarding policy intact.
+
+SDK reference: lotusmomo/airoha_sdk at
+32b5aa356c2406edef8806aaf75451ff0a5286f2,
+linux/arch/arm64/mach-econet/sgmii/air_eth_xsgmii.c,
+TMR_SGMII_LINKDN_CB, RX_SigDet_Flag and RX_CDR_RST.
+
+Signed-off-by: HG maintainers <hg@localhost>
+---
+--- a/drivers/net/pcs/airoha/Makefile
++++ b/drivers/net/pcs/airoha/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+ obj-$(CONFIG_PCS_AIROHA)	:= pcs-airoha.o
+-pcs-airoha-objs			:= pcs-airoha-common.o
++pcs-airoha-objs			:= pcs-airoha-common.o pcs-airoha-recovery.o
+ ifdef CONFIG_PCS_AIROHA_AN7581
+ pcs-airoha-objs			+= pcs-an7581.o
+ endif
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -5,10 +5,12 @@
+  */
+ 
+ #include <linux/bitfield.h>
++#include <linux/mutex.h>
+ #include <linux/phylink.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
++#include <linux/workqueue.h>
+ 
+ /* SCU*/
+ #define AIROHA_SCU_PDIDR			0x5c
+@@ -1683,11 +1685,27 @@
+ 	u8 pon_eo_peaking;
+ };
+ 
++struct airoha_pcs_recovery {
++	bool enabled;
++	bool configured;
++	bool link_requested;
++	bool suspect;
++	bool verifying;
++	bool waiting;
++	unsigned int attempts;
++	unsigned long retry_at;
++	int last_error;
++};
++
+ struct airoha_pcs_port {
+ 	struct airoha_pcs_priv *priv;
+ 	phy_interface_t interface;
+ 	int index;
+ 	int config_error;
++	/* Serializes health recovery with configuration and link callbacks. */
++	struct mutex lock;
++	struct delayed_work health_work;
++	struct airoha_pcs_recovery recovery;
+ 
+ 	struct phylink_pcs pcs;
+ };
+@@ -1700,6 +1718,7 @@
+ 	bool usxgmii_ber_time_fixup;
+ 	bool usxgmii_rx_gb_out_vld_tweak;
+ 	bool usxgmii_xfi_mode_sel;
++	bool hsgmii_rx_recovery;
+ 
+ 	int (*init)(struct airoha_pcs_priv *priv);
+ 	int (*alloc_regmap_fields)(struct airoha_pcs_priv *priv);
+@@ -1715,6 +1734,10 @@
+ };
+ 
+ #define to_airoha_pcs_port(n) container_of(n, struct airoha_pcs_port, pcs)
++
++int airoha_pcs_recovery_init(struct airoha_pcs_port *port);
++void airoha_pcs_recovery_stop(struct airoha_pcs_port *port, bool disable);
++void airoha_pcs_recovery_arm(struct airoha_pcs_port *port);
+ 
+ #if IS_ENABLED(CONFIG_PCS_AIROHA_AN7581)
+ int an7581_pcs_alloc_regmap_fields(struct airoha_pcs_priv *priv);
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -776,6 +776,7 @@
+ 	u32 rate_adapt;
+ 	int ret;
+ 
++	guard(mutex)(&port->lock);
+ 	if (port->config_error)
+ 		return port->config_error;
+ 
+@@ -979,6 +980,10 @@
+ 				AIROHA_PCS_XFI_TX_FC_EN | AIROHA_PCS_XFI_RX_FC_EN :
+ 				0);
+ 
++	port->recovery.configured = data->hsgmii_rx_recovery &&
++		interface == PHY_INTERFACE_MODE_2500BASEX &&
++		neg_mode != PHYLINK_PCS_NEG_INBAND_ENABLED;
++
+ 	return 0;
+ }
+ 
+@@ -1020,6 +1025,7 @@
+ 	const struct airoha_pcs_match_data *data;
+ 	struct airoha_pcs_maps *maps;
+ 
++	guard(mutex)(&port->lock);
+ 	if (port->config_error)
+ 		return;
+ 
+@@ -1173,6 +1179,8 @@
+ 			  AIROHA_PCS_XFI_RXMBI_STOP |
+ 			  AIROHA_PCS_XFI_TXMPI_STOP |
+ 			  AIROHA_PCS_XFI_TXMBI_STOP);
++
++	airoha_pcs_recovery_arm(port);
+ }
+ 
+ static void airoha_pcs_link_down(struct phylink_pcs *pcs)
+@@ -1181,6 +1189,9 @@
+ 	struct airoha_pcs_priv *priv = port->priv;
+ 	struct airoha_pcs_maps *maps;
+ 
++	guard(mutex)(&port->lock);
++	port->recovery.link_requested = false;
++	cancel_delayed_work(&port->health_work);
+ 	maps = &priv->maps[port->index];
+ 
+ 	/* MPI MBI disable */
+@@ -1199,6 +1210,8 @@
+ 	struct airoha_pcs_maps *maps;
+ 	int ret;
+ 
++	airoha_pcs_recovery_stop(port, false);
++	guard(mutex)(&port->lock);
+ 	maps = &priv->maps[port->index];
+ 	port->config_error = 0;
+ 
+@@ -1246,6 +1259,7 @@
+ 	struct airoha_pcs_maps *maps;
+ 	int ret;
+ 
++	guard(mutex)(&port->lock);
+ 	if (port->config_error)
+ 		return port->config_error;
+ 
+@@ -1282,7 +1296,25 @@
+ 	return LINK_INBAND_ENABLE | LINK_INBAND_DISABLE;
+ }
+ 
++static int airoha_pcs_enable(struct phylink_pcs *pcs)
++{
++	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
++
++	guard(mutex)(&port->lock);
++	if (port->config_error)
++		return port->config_error;
++	port->recovery.enabled = true;
++	return 0;
++}
++
++static void airoha_pcs_disable(struct phylink_pcs *pcs)
++{
++	airoha_pcs_recovery_stop(to_airoha_pcs_port(pcs), true);
++}
++
+ static const struct phylink_pcs_ops airoha_pcs_ops = {
++	.pcs_enable = airoha_pcs_enable,
++	.pcs_disable = airoha_pcs_disable,
+ 	.pcs_inband_caps = airoha_pcs_inband_caps,
+ 	.pcs_pre_config = airoha_pcs_pre_config,
+ 	.pcs_post_config = airoha_pcs_post_config,
+@@ -1657,6 +1689,9 @@
+ 		port->index = index;
+ 		port->pcs.poll = true;
+ 		port->pcs.ops = &airoha_pcs_ops;
++		ret = airoha_pcs_recovery_init(port);
++		if (ret)
++			return ret;
+ 
+ 		switch (data->port_type) {
+ 		case AIROHA_PCS_ETH:
+@@ -1691,6 +1726,7 @@
+ static const struct airoha_pcs_match_data an7581_pcs_eth = {
+ 	.num_port = 1,
+ 	.port_type = AIROHA_PCS_ETH,
++	.hsgmii_rx_recovery = true,
+ 	.hibernation_workaround = true,
+ 	.usxgmii_ber_time_fixup = true,
+ 	.alloc_regmap_fields = an7581_pcs_alloc_regmap_fields,
+--- /dev/null
++++ b/drivers/net/pcs/airoha/pcs-airoha-recovery.c
+@@ -0,0 +1,247 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Bounded AN7581 Ethernet HSGMII recovery; never runs in the packet path. */
++#include <linux/delay.h>
++#include <linux/jiffies.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
++
++#include "pcs-airoha.h"
++
++#define AIROHA_PCS_HEALTH_MS	1000
++#define AIROHA_PCS_CONFIRM_MS	100
++#define AIROHA_PCS_COOLDOWN_MS	30000
++#define AIROHA_PCS_RECOVERY_TRIES	3
++#define AIROHA_PCS_SIGDET_MUX	GENMASK(31, 16)
++
++/* The caller holds port->lock, including when temporarily using the mux. */
++static int airoha_pcs_hsgmii_signal(struct airoha_pcs_port *port, bool *present)
++{
++	struct regmap *pma = port->priv->pcs_pma[port->index];
++	u32 saved, val;
++	int ret, restore, count = 0, i;
++
++	ret = regmap_read(pma, AIROHA_PCS_PMA_DIG_RESERVE_0, &saved);
++	if (ret)
++		return ret;
++	ret = regmap_update_bits(pma, AIROHA_PCS_PMA_DIG_RESERVE_0,
++				 AIROHA_PCS_SIGDET_MUX,
++				 FIELD_PREP(AIROHA_PCS_SIGDET_MUX, 3));
++	if (ret)
++		goto restore;
++
++	/* Same six samples / four positives as the SDK, only after a fault. */
++	for (i = 0; i < AIROHA_PCS_MAX_RX_SIGDET_TRY; i++) {
++		ret = regmap_read(pma, AIROHA_PCS_PMA_DIG_RO_RESERVE_2, &val);
++		if (ret)
++			break;
++		count += !!(val & AIROHA_PCS_RX_SIGDET);
++	}
++
++restore:
++	restore = regmap_update_bits(pma, AIROHA_PCS_PMA_DIG_RESERVE_0,
++				     AIROHA_PCS_SIGDET_MUX, saved);
++	if (ret || restore)
++		return ret ? ret : restore;
++
++	*present = count >= AIROHA_PCS_MAX_RX_SIGDET_PRESENCE_CNT;
++	return 0;
++}
++
++static int airoha_pcs_hsgmii_relock(struct airoha_pcs_port *port)
++{
++	struct regmap *pma = port->priv->pcs_pma[port->index];
++	u32 l2d = AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA |
++		  AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_LCK2DATA;
++	u32 rst = AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_RSTB |
++		  AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_RSTB;
++	u32 reg = AIROHA_PCS_PMA_PXP_CDR_LPF_LCK_2DATA;
++	u32 saved;
++	int ret;
++
++	ret = regmap_read(pma, reg, &saved);
++	if (ret)
++		return ret;
++	/* Do not override an intentional, externally forced PMA state. */
++	if (saved & (AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_RSTB |
++		     AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA))
++		return -EBUSY;
++
++	ret = regmap_update_bits(pma, reg, l2d,
++				 AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA);
++	if (ret)
++		goto restore;
++	ret = regmap_update_bits(pma, reg, rst,
++				 AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_RSTB);
++	if (ret)
++		goto restore;
++	usleep_range(700, 1000);
++	ret = regmap_set_bits(pma, reg, AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_RSTB);
++	if (ret)
++		goto restore;
++	usleep_range(100, 200);
++	ret = regmap_set_bits(pma, reg, AIROHA_PCS_PMA_FORCE_DA_CDR_LPF_LCK2DATA);
++	if (ret)
++		goto restore;
++	ret = regmap_clear_bits(pma, reg, AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_RSTB);
++	if (ret)
++		goto restore;
++	ret = regmap_clear_bits(pma, reg, AIROHA_PCS_PMA_FORCE_SEL_DA_CDR_LPF_LCK2DATA);
++	if (!ret)
++		return 0;
++
++restore:
++	/* Preserve the original error even if best-effort cleanup also fails. */
++	regmap_update_bits(pma, reg, l2d | rst, saved);
++	return ret;
++}
++
++static unsigned int airoha_pcs_recovery_backoff(struct airoha_pcs_port *port)
++{
++	struct airoha_pcs_recovery *r = &port->recovery;
++	unsigned int delay;
++
++	if (r->attempts >= AIROHA_PCS_RECOVERY_TRIES) {
++		delay = AIROHA_PCS_COOLDOWN_MS;
++		r->attempts = 0;
++	} else {
++		delay = AIROHA_PCS_HEALTH_MS << (r->attempts - 1);
++	}
++	r->retry_at = jiffies + msecs_to_jiffies(delay);
++	r->waiting = true;
++	return AIROHA_PCS_HEALTH_MS;
++}
++
++/* Returns the next check interval, or zero when this port must not be polled. */
++static unsigned int airoha_pcs_recovery_step(struct airoha_pcs_port *port)
++{
++	struct airoha_pcs_priv *priv = port->priv;
++	struct airoha_pcs_maps *maps = &priv->maps[port->index];
++	struct airoha_pcs_recovery *r = &port->recovery;
++	bool signal;
++	u32 sync = 0, freq = 0, status = 0;
++	int ret;
++
++	if (!r->enabled || !r->configured || !r->link_requested ||
++	    port->config_error)
++		return 0;
++
++	ret = regmap_read(maps->hsgmii_pcs, ARIOHA_PCS_HSGMII_PCS_STATE_2, &sync);
++	if (ret)
++		goto error;
++	ret = regmap_read(priv->pcs_pma[port->index], AIROHA_PCS_PMA_RX_FREQDET, &freq);
++	if (ret)
++		goto error;
++	ret = regmap_read(maps->multi_sgmii, AIROHA_PCS_MULTI_SGMII_MSG_RX_STS_15,
++			  &status);
++	if (ret)
++		goto error;
++
++	if ((sync & AIROHA_PCS_HSGMII_PCS_RX_SYNC) &&
++	    (freq & AIROHA_PCS_PMA_FBCK_LOCK)) {
++		r->last_error = 0;
++		if (r->suspect && r->verifying)
++			dev_info(priv->dev, "PCS %d HSGMII CDR recovered\n", port->index);
++		r->suspect = false;
++		r->verifying = false;
++		r->attempts = 0;
++		r->retry_at = 0;
++		r->waiting = false;
++		return AIROHA_PCS_HEALTH_MS;
++	}
++
++	if (!r->suspect) {
++		r->suspect = true;
++		return AIROHA_PCS_CONFIRM_MS;
++	}
++	if (r->verifying) {
++		r->verifying = false;
++		return airoha_pcs_recovery_backoff(port);
++	}
++	if (r->waiting && time_before(jiffies, r->retry_at))
++		return AIROHA_PCS_HEALTH_MS;
++	r->waiting = false;
++
++	/* Internal port status is diagnostic, not sufficient to justify a reset. */
++	if (sync & AIROHA_PCS_HSGMII_PCS_RX_SYNC)
++		return AIROHA_PCS_HEALTH_MS;
++	ret = airoha_pcs_hsgmii_signal(port, &signal);
++	if (ret)
++		goto error;
++	r->last_error = 0;
++	if (!signal)
++		return AIROHA_PCS_HEALTH_MS;
++
++	r->attempts++;
++	ret = airoha_pcs_hsgmii_relock(port);
++	dev_warn_ratelimited(priv->dev,
++			     "PCS %d HSGMII CDR attempt %u: sync=%#x freq=%#x port=%#x error=%d\n",
++			     port->index, r->attempts, sync, freq, status, ret);
++	if (ret)
++		return airoha_pcs_recovery_backoff(port);
++	r->verifying = true;
++	return AIROHA_PCS_CONFIRM_MS;
++
++error:
++	if (r->last_error != ret)
++		dev_warn_ratelimited(priv->dev, "PCS %d HSGMII health read failed: %d\n",
++				     port->index, ret);
++	r->last_error = ret;
++	return AIROHA_PCS_HEALTH_MS;
++}
++
++static void airoha_pcs_recovery_work(struct work_struct *work)
++{
++	struct airoha_pcs_port *port = container_of(to_delayed_work(work),
++						 struct airoha_pcs_port, health_work);
++	unsigned int delay;
++
++	guard(mutex)(&port->lock);
++	delay = airoha_pcs_recovery_step(port);
++	if (delay)
++		queue_delayed_work(system_power_efficient_wq, &port->health_work,
++				   msecs_to_jiffies(delay));
++}
++
++void airoha_pcs_recovery_stop(struct airoha_pcs_port *port, bool disable)
++{
++	/* The worker never takes RTNL, PHY or phylink locks. */
++	mutex_lock(&port->lock);
++	port->recovery.configured = false;
++	port->recovery.link_requested = false;
++	if (disable)
++		port->recovery.enabled = false;
++	mutex_unlock(&port->lock);
++	/* Never wait for a worker while holding its mutex. */
++	cancel_delayed_work_sync(&port->health_work);
++}
++
++/* Called with port->lock held, only after a successful link-up. */
++void airoha_pcs_recovery_arm(struct airoha_pcs_port *port)
++{
++	struct airoha_pcs_recovery *r = &port->recovery;
++
++	if (!r->enabled || !r->configured || port->config_error)
++		return;
++	r->link_requested = true;
++	r->suspect = false;
++	r->verifying = false;
++	r->attempts = 0;
++	r->retry_at = 0;
++	r->waiting = false;
++	r->last_error = 0;
++	mod_delayed_work(system_power_efficient_wq, &port->health_work,
++			 msecs_to_jiffies(AIROHA_PCS_CONFIRM_MS));
++}
++
++static void airoha_pcs_recovery_release(void *data)
++{
++	airoha_pcs_recovery_stop(data, true);
++}
++
++int airoha_pcs_recovery_init(struct airoha_pcs_port *port)
++{
++	mutex_init(&port->lock);
++	INIT_DELAYED_WORK(&port->health_work, airoha_pcs_recovery_work);
++	return devm_add_action_or_reset(port->priv->dev,
++					airoha_pcs_recovery_release, port);
++}
