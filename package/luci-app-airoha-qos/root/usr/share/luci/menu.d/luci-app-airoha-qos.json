@@ -1,0 +1,8 @@
+{
+	"admin/network/airoha-qos": {
+		"title": "Airoha QoS",
+		"order": 65,
+		"action": { "type": "view", "path": "airoha_qos/settings" },
+		"depends": { "acl": [ "luci-app-airoha-qos" ] }
+	}
+}
