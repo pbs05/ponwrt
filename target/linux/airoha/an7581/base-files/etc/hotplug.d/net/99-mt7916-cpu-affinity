@@ -1,0 +1,11 @@
+#!/bin/sh
+
+[ "$ACTION" = "add" ] || exit 0
+
+case "$DEVICENAME" in
+	phy*-ap0)
+		[ -x /usr/libexec/mt7916-cpu-affinity.sh ] && /usr/libexec/mt7916-cpu-affinity.sh
+		;;
+esac
+
+exit 0
