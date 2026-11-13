@@ -1,0 +1,28 @@
+#!/bin/sh
+# Read cached driver policy through the bounded netlink controller, not devmem.
+case "$1" in
+	list)
+		printf '{"getStatus":{},"getDefaults":{}}\n'
+		;;
+	call)
+		if [ "$2" = getDefaults ]; then
+			if result=$(/usr/sbin/airoha-qosctl validate dscp --preset ppe-legacy-v1 2>/dev/null); then
+				printf '%s\n' "$result"
+			else
+				printf '{"error":"defaults_unavailable"}\n'
+			fi
+			exit 0
+		fi
+		[ "$2" = getStatus ] || exit 1
+		device=$(uci -q get airoha_qos.main.device)
+		device=${device:-lan1}
+		case "$device" in
+			*[!a-zA-Z0-9_.:-]*) printf '{"error":"invalid_device"}\n'; exit 0 ;;
+		esac
+		if result=$(/usr/sbin/airoha-qosctl get "$device" 2>/dev/null); then
+			printf '%s\n' "$result"
+		else
+			printf '{"error":"status_unavailable"}\n'
+		fi
+		;;
+esac
