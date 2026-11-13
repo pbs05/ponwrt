@@ -4,7 +4,7 @@ REQUIRE_IMAGE_METADATA=1
 
 airoha_require_ubi_layout()
 {
-	local ubidev volume fip_volume
+	local ubidev volume volume_id fip_volume
 
 	ubidev="$(nand_find_ubi ubi)"
 	[ -n "$ubidev" ] || {
@@ -13,7 +13,10 @@ airoha_require_ubi_layout()
 	}
 
 	for volume in fip ubootenv ubootenv2 "$@"; do
-		if ! nand_find_volume "$ubidev" "$volume" >/dev/null; then
+		# nand_find_volume can return success without finding a volume.
+		# Require the resolved name before allowing any flash writes.
+		if ! volume_id="$(nand_find_volume "$ubidev" "$volume")" ||
+		   [ -z "$volume_id" ]; then
 			echo "UBI base volume $volume is missing; repair the layout from U-Boot recovery."
 			return 1
 		fi
