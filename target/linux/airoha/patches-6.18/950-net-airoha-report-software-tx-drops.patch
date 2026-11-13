@@ -1,0 +1,32 @@
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Subject: [PATCH] net: airoha: report software TX drops through netdev core stats
+
+The common TX failures update legacy netdev stats, but ndo_get_stats64
+reports hardware drops and does not merge that legacy field. Use core
+per-CPU drops, which dev_get_stats() merges with ndo_get_stats64. Keep
+PON atomic accounting and NETDEV_TX_BUSY semantics unchanged.
+
+Export of the retained 950 repair on the current upstream TX layout.
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 5fe8abc..936f136 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3029,7 +3029,7 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 	if (pon_data && unlikely(skb->len < ETH_ZLEN)) {
+ 		if (skb_put_padto(skb, ETH_ZLEN)) {
+ 			atomic64_inc(&dev->pon_stats.tx_dropped);
+-			owner_netdev->stats.tx_dropped++;
++			dev_core_stats_tx_dropped_inc(owner_netdev);
+ 			spin_unlock_bh(&q->lock);
+ 			rcu_read_unlock();
+ 			return NETDEV_TX_OK;
+@@ -3126,7 +3126,7 @@ error:
+ 	if (pon_data)
+ 		atomic64_inc(&dev->pon_stats.tx_dropped);
+ 	dev_kfree_skb_any(skb);
+-	owner_netdev->stats.tx_dropped++;
++	dev_core_stats_tx_dropped_inc(owner_netdev);
+ 	rcu_read_unlock();
+ 
+ 	return NETDEV_TX_OK;

@@ -1,0 +1,40 @@
+From: HG maintainers
+Subject: [PATCH] net: airoha: size the WAN multicast CPU-copy ring for sustained traffic
+
+The regular AN7581 SDK WAN profile uses 1024 descriptors for ring 6.
+Keep its IRQ routing and LRO-safe buffers. Restrict the extra
+allocation to AN7581 builds with routed multicast offload.
+
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1253,6 +1253,19 @@
+ 			FIELD_PREP(RX_RING_DMA_IDX_MASK, q->tail));
+ }
+ 
++/* The WAN multicast CPU-copy path carries sustained traffic, not just
++ * exceptions. Keep the existing LRO buffer geometry when increasing depth.
++ */
++static int airoha_qdma_rx_desc_count(struct airoha_qdma *qdma, int qid)
++{
++	if (IS_ENABLED(CONFIG_NET_AIROHA_MCAST) &&
++	    airoha_is_7581(qdma->eth) &&
++	    qdma == &qdma->eth->qdma[1] && qid == 6)
++		return 1024;
++
++	return RX_DSCP_NUM(qid);
++}
++
+ static int airoha_qdma_init_rx(struct airoha_qdma *qdma)
+ {
+ 	int i;
+@@ -1266,7 +1279,7 @@
+ 		}
+ 
+ 		err = airoha_qdma_init_rx_queue(&qdma->q_rx[i], qdma,
+-						RX_DSCP_NUM(i));
++						airoha_qdma_rx_desc_count(qdma, i));
+ 		if (err)
+ 			return err;
+ 	}

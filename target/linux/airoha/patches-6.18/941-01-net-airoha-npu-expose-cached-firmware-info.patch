@@ -1,0 +1,127 @@
+From fd8a1339bae8ec44d64f29337ff341754a6296ca Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 21:17:49 +0800
+Subject: [PATCH] net: airoha: npu: expose cached firmware identity and
+ initialized core count
+
+Reuse the existing probe-time firmware query. Read-only device attributes do not perform mailbox or register accesses and report ENODATA when the version query failed. Core count follows the array the driver actually initializes.
+---
+ .../ABI/testing/sysfs-driver-airoha-npu       | 20 +++++++++++
+ drivers/net/ethernet/airoha/airoha_npu.c      | 36 ++++++++++++++++++-
+ include/linux/soc/airoha/airoha_offload.h     |  3 ++
+ 3 files changed, 58 insertions(+), 1 deletion(-)
+ create mode 100644 Documentation/ABI/testing/sysfs-driver-airoha-npu
+
+diff --git a/Documentation/ABI/testing/sysfs-driver-airoha-npu b/Documentation/ABI/testing/sysfs-driver-airoha-npu
+new file mode 100644
+index 000000000..90615043c
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-driver-airoha-npu
+@@ -0,0 +1,20 @@
++What:           /sys/bus/platform/devices/.../fw_version
++Date:           October 2026
++Contact:        netdev@vger.kernel.org
++Description:
++                Read-only firmware version of a device bound to airoha-npu,
++                formatted as unsigned decimal major.minor followed by a newline.
++                The value is cached from the existing firmware query during
++                probe. Reading this file does not access hardware or send a
++                mailbox request. If that query failed, read returns ENODATA;
++                no version is inferred from a firmware file on disk.
++                This is boot-time identity, not a firmware health indicator.
++
++What:           /sys/bus/platform/devices/.../num_cores
++Date:           October 2026
++Contact:        netdev@vger.kernel.org
++Description:
++                Read-only decimal number of NPU cores initialized by the bound
++                driver, followed by a newline. Derived from the driver's core
++                array, not the host CPU count or a userspace SoC assumption.
++                This is not a count of currently busy or healthy cores.
+diff --git a/drivers/net/ethernet/airoha/airoha_npu.c b/drivers/net/ethernet/airoha/airoha_npu.c
+index 0d03ca78d..4b86460e2 100644
+--- a/drivers/net/ethernet/airoha/airoha_npu.c
++++ b/drivers/net/ethernet/airoha/airoha_npu.c
+@@ -11,6 +11,7 @@
+ #include <linux/of_platform.h>
+ #include <linux/of_reserved_mem.h>
+ #include <linux/regmap.h>
++#include <linux/sysfs.h>
+ 
+ #include "airoha_eth.h"
+ 
+@@ -722,6 +723,35 @@ static const struct regmap_config regmap_config = {
+ 	.disable_locking	= true,
+ };
+ 
++static ssize_t fw_version_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct airoha_npu *npu = dev_get_drvdata(dev);
++
++	if (!npu->fw_version_valid)
++		return -ENODATA;
++
++	return sysfs_emit(buf, "%u.%u\n", npu->fw_version >> 16,
++			  npu->fw_version & 0xffff);
++}
++static DEVICE_ATTR_RO(fw_version);
++
++static ssize_t num_cores_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct airoha_npu *npu = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%zu\n", ARRAY_SIZE(npu->cores));
++}
++static DEVICE_ATTR_RO(num_cores);
++
++static struct attribute *airoha_npu_attrs[] = {
++	&dev_attr_fw_version.attr,
++	&dev_attr_num_cores.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(airoha_npu);
++
+ static int airoha_npu_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -833,9 +863,12 @@ static int airoha_npu_probe(struct platform_device *pdev)
+ 	msleep(100);
+ 
+ 	if (!airoha_npu_wlan_msg_get(npu, 0, WLAN_FUNC_GET_WAIT_NPU_VERSION,
+-				     &val, sizeof(val), GFP_KERNEL))
++				     &val, sizeof(val), GFP_KERNEL)) {
++		npu->fw_version = val;
++		npu->fw_version_valid = true;
+ 		dev_info(dev, "NPU fw version: %0d.%d\n",
+ 			 (val >> 16) & 0xffff, val & 0xffff);
++	}
+ 
+ 	platform_set_drvdata(pdev, npu);
+ 
+@@ -857,6 +890,7 @@ static struct platform_driver airoha_npu_driver = {
+ 	.driver = {
+ 		.name = "airoha-npu",
+ 		.of_match_table = of_airoha_npu_match,
++		.dev_groups = airoha_npu_groups,
+ 	},
+ };
+ module_platform_driver(airoha_npu_driver);
+diff --git a/include/linux/soc/airoha/airoha_offload.h b/include/linux/soc/airoha/airoha_offload.h
+index 16a988ad7..45ff90bda 100644
+--- a/include/linux/soc/airoha/airoha_offload.h
++++ b/include/linux/soc/airoha/airoha_offload.h
+@@ -167,6 +167,9 @@ struct airoha_npu {
+ #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+ 	struct device *dev;
+ 	struct regmap *regmap;
++	/* Firmware identity sampled once during probe, never by status readers. */
++	u32 fw_version;
++	bool fw_version_valid;
+ 
+ 	struct airoha_npu_core {
+ 		struct airoha_npu *npu;
+-- 
+2.53.0
+

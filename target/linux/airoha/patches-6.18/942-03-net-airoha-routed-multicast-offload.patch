@@ -1,0 +1,2246 @@
+From 06af885b4d44ced67c5a4f0ebee01255975e6564 Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:32:11 +0800
+Subject: [PATCH] net: airoha: add scoped routed IPv4 multicast offload
+
+Consolidate retained multicast implementation and follow-up fixes.
+---
+ drivers/net/ethernet/airoha/Kconfig           |   18 +
+ drivers/net/ethernet/airoha/Makefile          |    2 +
+ drivers/net/ethernet/airoha/airoha_eth.c      |   29 +-
+ drivers/net/ethernet/airoha/airoha_eth.h      |   12 +
+ drivers/net/ethernet/airoha/airoha_mcast.c    | 1564 +++++++++++++++++
+ drivers/net/ethernet/airoha/airoha_mcast.h    |   63 +
+ .../net/ethernet/airoha/airoha_mcast_test.c   |  110 ++
+ drivers/net/ethernet/airoha/airoha_ppe.c      |   84 +-
+ .../net/ethernet/airoha/airoha_ppe_debugfs.c  |   18 +-
+ include/net/airoha_mcast.h                    |   49 +
+ include/uapi/linux/airoha_mcast.h             |   46 +
+ 11 files changed, 1988 insertions(+), 7 deletions(-)
+ create mode 100644 drivers/net/ethernet/airoha/airoha_mcast.c
+ create mode 100644 drivers/net/ethernet/airoha/airoha_mcast.h
+ create mode 100644 drivers/net/ethernet/airoha/airoha_mcast_test.c
+ create mode 100644 include/net/airoha_mcast.h
+ create mode 100644 include/uapi/linux/airoha_mcast.h
+
+diff --git a/drivers/net/ethernet/airoha/Kconfig b/drivers/net/ethernet/airoha/Kconfig
+index 00cb856..9951eea 100644
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -18,6 +18,11 @@ config NET_AIROHA_QOS
+ 	tristate
+ 	depends on INET
+ 
++config NET_AIROHA_MCAST_KUNIT_TEST
++	tristate "Airoha multicast CPU header tests" if !KUNIT_ALL_TESTS
++	depends on KUNIT && INET
++	default KUNIT_ALL_TESTS
++
+ config NET_AIROHA_QOS_KUNIT_TEST
+ 	tristate "Airoha QoS metadata tests" if !KUNIT_ALL_TESTS
+ 	depends on KUNIT && INET
+@@ -46,6 +51,19 @@ config NET_AIROHA
+ 	  This driver supports the gigabit ethernet MACs in the
+ 	  Airoha SoC family.
+ 
++config NET_AIROHA_MCAST
++	bool "Experimental AN7581 routed IPv4 multicast offload"
++	select SKB_EXTENSIONS
++	depends on NET_AIROHA && IP_MROUTE && BRIDGE_IGMP_SNOOPING && NET_SWITCHDEV
++	depends on BRIDGE=y || NET_AIROHA=m
++	default n
++	help
++	  Learn accepted PON IPv4 UDP multicast and replicate it in LAN QDMA.
++	  An explicit Generic Netlink policy must enable and scope the backend.
++	  The first backend supports one bridged egress with uniform VLAN
++	  actions. The NPU ingress/VID lookup key and CPU-copy header format
++	  require hardware qualification; keep disabled on production networks.
++
+ config NET_AIROHA_FLOW_STATS
+ 	default y
+ 	bool "Airoha flow stats"
+diff --git a/drivers/net/ethernet/airoha/Makefile b/drivers/net/ethernet/airoha/Makefile
+index a8b7b0b..2bbfbb7 100644
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -4,9 +4,11 @@
+ #
+ 
+ obj-$(CONFIG_NET_AIROHA_PRIORITY_KUNIT_TEST) += airoha_priority_test.o
++obj-$(CONFIG_NET_AIROHA_MCAST_KUNIT_TEST) += airoha_mcast_test.o
+ 
+ obj-$(CONFIG_NET_AIROHA) += airoha-eth.o
+ airoha-eth-y := airoha_eth.o airoha_ppe.o
++airoha-eth-$(CONFIG_NET_AIROHA_MCAST) += airoha_mcast.o
+ airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
+ obj-$(CONFIG_NET_AIROHA_QOS_KUNIT_TEST) += airoha_qos_test.o
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index d5bb47a..2dcc1cc 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1109,6 +1109,12 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ 				     PKT_HASH_TYPE_L4);
+ 
+ 		reason = FIELD_GET(AIROHA_RXD4_PPE_CPU_REASON, msg1);
++		if (!airoha_mcast_rx_copy(eth->ppe, q->skb, hash, reason, msg0)) {
++			dev_kfree_skb_any(q->skb);
++			q->skb = NULL;
++			done++;
++			continue;
++		}
+ 		if (reason == PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED)
+ 			airoha_ppe_check_skb(&eth->ppe->dev, q->skb, hash,
+ 					     false);
+@@ -1121,7 +1127,13 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ 			atomic64_inc(&dev->pon_stats.rx_packets_delivered);
+ 			atomic64_inc(&dev->pon_stats.rx_channel_packets[channel]);
+ 		}
+-		napi_gro_receive(&q->napi, q->skb);
++		/* Keep learning cookies datagram-specific. Hardware CPU copies
++		 * must also stay separate from packets requiring SW forwarding.
++		 */
++		if (airoha_mcast_no_gro(q->skb))
++			airoha_mcast_gro_bypass(&q->napi, q->skb);
++		else
++			napi_gro_receive(&q->napi, q->skb);
+ 		q->skb = NULL;
+ 		continue;
+ free_frag:
+@@ -2967,6 +2979,7 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 	int i = 0, qid;
+ 	u16 index;
+ 	u8 fport, nboq;
++	bool mc_sample;
+ 
+ 	rcu_read_lock();
+ 	qdma = rcu_dereference(dev->qdma);
+@@ -3178,6 +3191,7 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 		owner_netdev->stats.tx_bytes += skb->len;
+ 	}
+ 
++	mc_sample = !ctrl && !pon_data && airoha_mcast_is_sample(skb);
+ 	skb_tx_timestamp(skb);
+ 	netdev_tx_sent_queue(txq, skb->len);
+ 	if (q->ndesc - q->queued < q->free_thr) {
+@@ -3185,10 +3199,21 @@ static netdev_tx_t airoha_dev_xmit_common(
+ 		q->txq_stopped = true;
+ 	}
+ 
+-	if (netif_xmit_stopped(txq) || !netdev_xmit_more())
++	if (mc_sample || netif_xmit_stopped(txq) || !netdev_xmit_more()) {
++		if (mc_sample)
++			dma_wmb();
+ 		airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(qid),
+ 				TX_RING_CPU_IDX_MASK,
+ 				FIELD_PREP(TX_RING_CPU_IDX_MASK, index));
++	}
++	if (mc_sample) {
++		/* Complete the doorbell write before publishing BIND. The TX lock
++		 * still pins skb against completion; xmit_more must not defer a
++		 * learning sample. Submission is not a physical-egress fence.
++		 */
++		airoha_qdma_rr(qdma, REG_TX_CPU_IDX(qid));
++		airoha_mcast_tx(dev, skb, msg0);
++	}
+ 
+ 	spin_unlock_bh(&q->lock);
+ 	rcu_read_unlock();
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 82d9e83..287ec90 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -18,6 +18,7 @@
+ #include <net/airoha_priority.h>
+ #include <net/dsa.h>
+ #include <net/airoha_qos.h>
++#include "airoha_mcast.h"
+ 
+ #define AIROHA_MAX_NUM_GDM_PORTS	4
+ #define AIROHA_MAX_NUM_GDM_DEVS		2
+@@ -435,6 +436,10 @@ struct airoha_foe_ipv4 {
+ 
+ 	struct airoha_foe_ipv4_tuple new_tuple;
+ 
++	/* AN7581 SDK: word 8 includes four 3-bit hop selectors in bits 31:20.
++	 * UNBIND uses the action area as packet scratch. Zero both words when
++	 * binding; rsv does not mean hardware ignores their contents.
++	 */
+ 	u32 rsv[2];
+ 
+ 	u32 data;
+@@ -499,6 +504,10 @@ struct airoha_foe_entry {
+ 	};
+ };
+ 
++static_assert(offsetof(struct airoha_foe_entry, ipv4.orig_tuple) == 4);
++static_assert(offsetof(struct airoha_foe_entry, ipv4.ib2) == 16);
++static_assert(offsetof(struct airoha_foe_entry, ipv4.rsv) == 32);
++static_assert(offsetof(struct airoha_foe_entry, ipv4.data) == 40);
+ static_assert(offsetof(struct airoha_foe_entry, l2b.src_mac_hi) == 16);
+ static_assert(offsetof(struct airoha_foe_entry, l2b.data) == 40);
+ static_assert(offsetof(struct airoha_foe_entry, l2b.ib2) == 44);
+@@ -728,7 +737,10 @@ struct airoha_gdm_port {
+ #define AIROHA_RXD4_PPE_CPU_REASON	GENMASK(20, 16)
+ #define AIROHA_RXD4_FOE_ENTRY		GENMASK(15, 0)
+ 
++struct airoha_mcast;
++
+ struct airoha_ppe {
++	struct airoha_mcast *mcast;
+ 	struct airoha_ppe_dev dev;
+ 	struct airoha_eth *eth;
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_mcast.c b/drivers/net/ethernet/airoha/airoha_mcast.c
+new file mode 100644
+index 0000000..745920d
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_mcast.c
+@@ -0,0 +1,1564 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* IPv4 routed multicast: learn once, replicate in LAN QDMA. */
++#include <linux/ethtool.h>
++#include <linux/if_bridge.h>
++#include <linux/if_vlan.h>
++#include <linux/inetdevice.h>
++#include <linux/module.h>
++#include <linux/rtnetlink.h>
++#include <linux/airoha_mcast.h>
++#include <net/genetlink.h>
++#include <linux/mroute.h>
++#include <linux/seq_file.h>
++#include <linux/udp.h>
++#include <net/ip.h>
++#include <net/ip_fib.h>
++#include <net/airoha_mcast.h>
++#include <net/switchdev.h>
++#include "airoha_regs.h"
++#include "airoha_eth.h"
++#include "airoha_mcast.h"
++
++#define MC_MAX_FLOWS 64
++#define MC_DSA_PORTS GENMASK(5, 0)
++#define MC_DSA_COUNT 6
++#define MC_NATIVE_SLOT 13
++#define MC_OUTPUTS (MC_DSA_PORTS | BIT(MC_NATIVE_SLOT))
++#define MC_FPORT 0xe
++#define MC_REPL_REG(n) (0x880 + (n) * 4)
++#define MC_REPL_KEEP_UP BIT(31)
++#define MC_REPL_FPORT GENMASK(24, 16)
++#define MC_HASH_MODE BIT(21)
++#define MC_SAMPLE_LIFE (HZ / 2)
++#define MC_RETRY_SLOTS 64
++#define MC_RETRY_LIFE HZ
++
++/* A successful boot APPLY is the only activation path. Hardware ingress-key
++ * qualification is still required before enabling a production profile.
++ */
++static struct genl_family mc_genl_family;
++static struct airoha_mcast *mc_device;
++
++struct mc_packet {
++	__be32 source, group;
++	__be16 sport, dport, id, length;
++	u16 vlan;
++	u8 dsfield, ttl;
++	bool tagged;
++};
++
++struct mc_flow {
++	struct airoha_foe_entry learned, bound;
++	struct mc_packet sample;
++	struct mr_mfc *mfc;
++	unsigned long expires;
++	u64 cookie;
++	u16 hash, outputs, seen, out_vlan;
++	u16 bridge_vid;
++	vifi_t parent;
++	u8 ttls[MAXVIFS];
++	int iif;
++	u8 source_mac[ETH_ALEN], ingress_mac[ETH_ALEN];
++	u8 dsfield, queue;
++	u8 tx_channels[MC_DSA_COUNT], channel;
++	int output_ifindex[MC_DSA_COUNT];
++	bool used, committed, out_tagged, local, switch_path;
++};
++
++struct mc_link {
++	int ifindex;
++	u32 speed;
++};
++
++enum mc_event_reason {
++	MC_EVENT_EXPLICIT,
++	MC_EVENT_MFC,
++	MC_EVENT_VIF,
++	MC_EVENT_MEMBER,
++	MC_EVENT_RULE,
++	MC_EVENT_BRIDGE,
++	MC_EVENT_NETDEV,
++	MC_EVENT_SWITCHDEV,
++	MC_EVENT_FIB,
++	MC_EVENT_MAX,
++};
++
++struct mc_filter {
++	__be32 source, group;
++	const struct mr_mfc *refresh;
++	u32 prefix;
++	u16 vid;
++	u8 prefix_len;
++	bool by_vid, by_prefix;
++};
++
++/* A miss delays learning only; packets continue through ordinary IP input.
++ * The full key prevents a recycled PPE hash from suppressing another flow.
++ */
++struct mc_retry {
++	struct mc_packet packet;
++	unsigned long expires;
++	u64 epoch;
++	u16 hash;
++	int iif;
++	bool valid;
++};
++
++struct airoha_mcast {
++	struct airoha_ppe *ppe;
++	/* Order: routing/bridge/TX lock -> lock -> ppe_lock. Never take
++	 * a routing, bridge or TX lock while holding this lock.
++	 */
++	spinlock_t lock;
++	struct notifier_block mr_nb, br_nb, net_nb, sw_nb, swb_nb, fib_nb;
++	struct mc_link links[MC_DSA_COUNT];
++	bool links_dirty;
++	struct delayed_work reap;
++	struct mc_flow flows[MC_MAX_FLOWS];
++	struct mc_retry retry[MC_RETRY_SLOTS];
++	u64 retry_skipped;
++	struct net_device *ingress, *egress;
++	u16 ingress_vid, egress_vid;
++	u32 ingress_index, egress_index;
++	bool enabled, frozen, scope_lost;
++	u64 reject[AIROHA_MC_REJECT_MAX];
++	u32 saved_repl[16], saved_pce;
++	u64 serial, epoch, learned, bound, invalidated, rejected, copies, errors;
++	u64 keepalives, stale_copies, bad_copies, delivered;
++	u64 events[MC_EVENT_MAX], unchanged;
++	u32 last_copy_msg0;
++	bool isolated, ppe_stopped;
++	bool running, broken, slots_owned, stopping, paused;
++};
++
++/* RX starts at the network header; TX starts at the Ethernet header.
++ * Only one 802.1Q tag is supported; QinQ and PPPoE stay in software.
++ */
++static bool mc_parse(struct sk_buff *skb, bool tx, struct mc_packet *p,
++		     int *network_offset)
++{
++	struct ethhdr eh, *eth;
++	struct vlan_hdr vh, *vlan;
++	struct iphdr ih, *ip;
++	struct udphdr uh, *udp;
++	__be16 proto = skb->protocol;
++	int off = 0;
++
++	memset(p, 0, sizeof(*p));
++	if (skb_is_gso(skb))
++		return false;
++	if (tx) {
++		eth = skb_header_pointer(skb, 0, sizeof(eh), &eh);
++		if (!eth || !is_multicast_ether_addr(eth->h_dest))
++			return false;
++		proto = eth->h_proto;
++		off = ETH_HLEN;
++	}
++	if (skb_vlan_tag_present(skb)) {
++		if (skb->vlan_proto != htons(ETH_P_8021Q))
++			return false;
++		p->tagged = true;
++		p->vlan = skb_vlan_tag_get(skb);
++	}
++	if (proto == htons(ETH_P_8021Q)) {
++		if (p->tagged)
++			return false;
++		vlan = skb_header_pointer(skb, off, sizeof(vh), &vh);
++		if (!vlan)
++			return false;
++		p->tagged = true;
++		p->vlan = ntohs(vlan->h_vlan_TCI);
++		proto = vlan->h_vlan_encapsulated_proto;
++		off += VLAN_HLEN;
++	}
++	if (proto != htons(ETH_P_IP))
++		return false;
++	ip = skb_header_pointer(skb, off, sizeof(ih), &ih);
++	if (!ip || ip->version != 4 || ip->ihl != 5 ||
++	    ip->protocol != IPPROTO_UDP || ip_is_fragment(ip) ||
++	    !ipv4_is_multicast(ip->daddr) || ipv4_is_local_multicast(ip->daddr) ||
++	    ntohs(ip->tot_len) < sizeof(ih) + sizeof(uh) ||
++	    ntohs(ip->tot_len) > skb->len - off)
++		return false;
++	udp = skb_header_pointer(skb, off + sizeof(ih), sizeof(uh), &uh);
++	if (!udp || ntohs(udp->len) != ntohs(ip->tot_len) - sizeof(ih))
++		return false;
++	p->source = ip->saddr;
++	p->group = ip->daddr;
++	p->sport = udp->source;
++	p->dport = udp->dest;
++	p->id = ip->id;
++	p->length = ip->tot_len;
++	p->ttl = ip->ttl;
++	p->dsfield = ip->tos;
++	*network_offset = off;
++	return true;
++}
++
++static bool mc_same_tuple(const struct mc_packet *a, const struct mc_packet *b)
++{
++	return a->source == b->source && a->group == b->group &&
++	       a->sport == b->sport && a->dport == b->dport;
++}
++
++static bool mc_retry_skip(struct airoha_mcast *mc, const struct mc_flow *f,
++			  u64 *epoch)
++{
++	struct mc_retry *r = &mc->retry[f->hash % MC_RETRY_SLOTS];
++	bool skip;
++
++	spin_lock_bh(&mc->lock);
++	*epoch = mc->epoch;
++	skip = r->valid && r->epoch == mc->epoch &&
++	       time_before(jiffies, r->expires) &&
++	       r->hash == f->hash && r->iif == f->iif &&
++	       mc_same_tuple(&r->packet, &f->sample) &&
++	       r->packet.tagged == f->sample.tagged &&
++	       r->packet.vlan == f->sample.vlan &&
++	       r->packet.dsfield == f->sample.dsfield &&
++	       r->packet.ttl == f->sample.ttl;
++	if (skip)
++		mc->retry_skipped++;
++	spin_unlock_bh(&mc->lock);
++	return skip;
++}
++
++static void mc_retry_defer(struct airoha_mcast *mc, const struct mc_flow *f,
++			   u64 epoch)
++{
++	struct mc_retry *r = &mc->retry[f->hash % MC_RETRY_SLOTS];
++
++	lockdep_assert_held(&mc->lock);
++	/* Do not cache a snapshot which raced an admission change. Every
++	 * existing invalidation event advances epoch, including local joins.
++	 */
++	if (!mc->running || mc->epoch != epoch)
++		return;
++	*r = (struct mc_retry) {
++		.packet = f->sample, .expires = jiffies + MC_RETRY_LIFE,
++		.epoch = epoch, .hash = f->hash, .iif = f->iif, .valid = true,
++	};
++}
++
++static u32 mc_replication(unsigned int slot)
++{
++	if (slot < 6)
++		return MC_REPL_KEEP_UP | BIT(slot) |
++		       FIELD_PREP(MC_REPL_FPORT, (FE_PSE_PORT_GDM1 << 5) | slot);
++	if (slot == MC_NATIVE_SLOT)
++		return FIELD_PREP(MC_REPL_FPORT, FE_PSE_PORT_GDM4 << 5);
++	return FIELD_PREP(MC_REPL_FPORT, FE_PSE_PORT_DROP << 5);
++}
++
++static void mc_fault(struct airoha_mcast *mc)
++{
++	struct airoha_eth *eth = mc->ppe->eth;
++	struct airoha_qdma *qdma = &eth->qdma[0];
++	u32 drop = FIELD_PREP(MC_REPL_FPORT, FE_PSE_PORT_DROP << 5);
++	bool isolated = mc->slots_owned;
++	bool direct = false;
++	int i;
++
++	/* A pending direct BIND may already be visible after a timeout. Replica
++	 * slot isolation cannot contain GDM1/STAG forwarding.
++	 */
++	for (i = 0; i < MC_MAX_FLOWS; i++)
++		direct |= mc->flows[i].used && mc->flows[i].switch_path;
++	mc->errors++;
++	mc->running = false;
++	mc->broken = true;
++	/* Failed invalidation can leave a live entry. Isolate only the slots
++	 * owned by this backend first. This is containment, NOT a software
++	 * fallback: multicast may be lost until reboot. Never conceal that.
++	 */
++	if (mc->slots_owned) {
++		for (i = 0; i < 16; i++)
++			if (MC_OUTPUTS & BIT(i))
++				airoha_qdma_wr(qdma, MC_REPL_REG(i), drop);
++		for (i = 0; i < 16; i++)
++			if ((MC_OUTPUTS & BIT(i)) &&
++			    airoha_qdma_rr(qdma, MC_REPL_REG(i)) != drop)
++				isolated = false;
++	}
++	isolated &= !direct;
++	mc->isolated = isolated;
++	if (!isolated) {
++		/* Last resort if even the isolated-domain write cannot be read
++		 * back. Do not restore replication while stale entries exist.
++		 */
++		for (i = 0; i < eth->soc->num_ppe; i++)
++			airoha_fe_clear(eth, REG_PPE_GLO_CFG(i), PPE_GLO_CFG_EN_MASK);
++		mc->ppe_stopped = true;
++	}
++	dev_err_once(eth->dev, "multicast fault: isolated=%u PPE-stopped=%u; reboot required\n",
++		     mc->isolated, mc->ppe_stopped);
++}
++
++static void mc_remove(struct airoha_mcast *mc, struct mc_flow *f)
++{
++	struct airoha_foe_entry invalid;
++	int err;
++
++	if (!f->used)
++		return;
++	if (f->committed) {
++		invalid = f->bound;
++		invalid.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++		err = airoha_ppe_mcast_write(mc->ppe, f->hash, &f->bound, &invalid);
++		if (err && err != -ESTALE)
++			mc_fault(mc);
++		mc->invalidated++;
++	}
++	if (f->mfc)
++		mr_cache_put(f->mfc);
++	memset(f, 0, sizeof(*f));
++}
++
++static bool mc_matches(const struct mc_flow *f, const struct mc_filter *filter)
++{
++	u32 mask;
++
++	if (!filter)
++		return true;
++	if ((filter->group && filter->group != f->sample.group) ||
++	    (filter->source && filter->source != f->sample.source) ||
++	    (filter->by_vid && filter->vid != f->bridge_vid))
++		return false;
++	if (!filter->by_prefix)
++		return true;
++	mask = filter->prefix_len ? ~0U << (32 - filter->prefix_len) : 0;
++	return !((ntohl(f->sample.source) ^ filter->prefix) & mask) ||
++	       !((ntohl(f->sample.group) ^ filter->prefix) & mask);
++}
++
++static bool mc_route_unchanged(const struct mc_flow *f, const struct mr_mfc *mfc)
++{
++	/* The MFC is updated in place. Compare with the admission snapshot,
++	 * never with the current contents of f->mfc itself. A new object also
++	 * needs re-learning so that accounting retains the correct reference.
++	 */
++	return mfc && f->mfc == mfc && f->parent == mfc->mfc_parent &&
++	       !memcmp(f->ttls, mfc->mfc_un.res.ttls, sizeof(f->ttls));
++}
++
++static void mc_invalidate_locked(struct airoha_mcast *mc,
++				 enum mc_event_reason reason,
++				 const struct mc_filter *filter)
++{
++	int i;
++
++	lockdep_assert_held(&mc->lock);
++	/* Fence snapshots not yet inserted, even if no matching flow exists.
++	 * This generation is not a count of hardware entries removed.
++	 */
++	mc->epoch++;
++	mc->events[reason]++;
++	for (i = 0; i < MC_MAX_FLOWS; i++) {
++		struct mc_flow *f = &mc->flows[i];
++
++		if (!f->used || !mc_matches(f, filter))
++			continue;
++		if (filter && mc_route_unchanged(f, filter->refresh)) {
++			mc->unchanged++;
++			continue;
++		}
++		/* Pending samples must be revoked along with committed entries. */
++		mc_remove(mc, f);
++	}
++}
++
++void airoha_mcast_invalidate(struct airoha_ppe *ppe)
++{
++	struct airoha_mcast *mc = ppe->mcast;
++
++	if (!mc)
++		return;
++	spin_lock_bh(&mc->lock);
++	mc_invalidate_locked(mc, MC_EVENT_EXPLICIT, NULL);
++	spin_unlock_bh(&mc->lock);
++}
++
++/* RCU plus the state lock protects topology and configured device identities.
++ * Upper walks include VLAN parents, bridge ports and DSA conduits. Do not
++ * acquire bridge/mroute locks here: notifications may already hold them.
++ */
++static bool mc_scope_dev(struct airoha_mcast *mc, struct net_device *dev)
++{
++	struct net_device *in = mc->ingress, *out = mc->egress;
++
++	if (!dev || !in || !out || !net_eq(dev_net(dev), &init_net))
++		return false;
++	return dev == in || dev == out ||
++	       netdev_has_upper_dev_all_rcu(dev, in) ||
++	       netdev_has_upper_dev_all_rcu(dev, out);
++}
++
++/* Only the existing process-context maintenance work queries ethtool. A
++ * stop path can hold RTNL while cancelling that work, so never wait for RTNL.
++ * Cache publication advances epoch before any candidate can use new speeds.
++ */
++static void mc_refresh_links(struct airoha_mcast *mc)
++{
++	struct mc_link links[MC_DSA_COUNT] = {};
++	struct net_device *dev;
++	u64 epoch;
++
++	if (!READ_ONCE(mc->links_dirty) || !rtnl_trylock())
++		return;
++	spin_lock_bh(&mc->lock);
++	epoch = mc->epoch;
++	if (!mc->enabled || mc->stopping) {
++		spin_unlock_bh(&mc->lock);
++		goto out;
++	}
++	spin_unlock_bh(&mc->lock);
++	for_each_netdev(&init_net, dev) {
++		struct ethtool_link_ksettings settings;
++		struct airoha_gdm_dev *gdm;
++		struct dsa_port *dp;
++
++		if (!dsa_user_dev_check(dev) || !netif_running(dev) ||
++		    !netif_carrier_ok(dev))
++			continue;
++		dp = dsa_port_from_netdev(dev);
++		if (dp->index >= MC_DSA_COUNT)
++			continue;
++		gdm = netdev_priv(dsa_port_to_conduit(dp));
++		if (!airoha_is_valid_gdm_dev(mc->ppe->eth, gdm) ||
++		    gdm->port->id != AIROHA_GDM1_IDX ||
++		    !dev->ethtool_ops || !dev->ethtool_ops->get_link_ksettings ||
++		    __ethtool_get_link_ksettings(dev, &settings) ||
++		    !settings.base.speed || settings.base.speed == SPEED_UNKNOWN)
++			continue;
++		links[dp->index].ifindex = dev->ifindex;
++		links[dp->index].speed = settings.base.speed;
++	}
++	spin_lock_bh(&mc->lock);
++	if (mc->epoch == epoch && !mc->stopping) {
++		if (memcmp(mc->links, links, sizeof(links))) {
++			mc_invalidate_locked(mc, MC_EVENT_NETDEV, NULL);
++			memcpy(mc->links, links, sizeof(links));
++		}
++		mc->links_dirty = false;
++	}
++	spin_unlock_bh(&mc->lock);
++out:
++	rtnl_unlock();
++}
++
++static int mc_mr_notify(struct notifier_block *nb, unsigned long event, void *data)
++{
++	struct airoha_mcast *mc = container_of(nb, struct airoha_mcast, mr_nb);
++	const struct ipmr_offload_event *info = data;
++	struct mc_filter filter = { .group = info->group };
++
++	if (!net_eq(info->net, &init_net))
++		return NOTIFY_DONE;
++	spin_lock_bh(&mc->lock);
++	if (!info->dev)
++		mc_invalidate_locked(mc, MC_EVENT_RULE, NULL);
++	else if (info->dev == mc->ingress)
++		mc_invalidate_locked(mc, MC_EVENT_MEMBER, &filter);
++	spin_unlock_bh(&mc->lock);
++	return NOTIFY_DONE;
++}
++
++static int mc_br_notify(struct notifier_block *nb, unsigned long event, void *data)
++{
++	struct airoha_mcast *mc = container_of(nb, struct airoha_mcast, br_nb);
++	const struct br_mcast_event *info = data;
++	struct mc_filter filter = {};
++	struct net_device *br;
++
++	if (info->group) {
++		if (info->group->proto != htons(ETH_P_IP))
++			return NOTIFY_DONE;
++		filter.group = info->group->dst.ip4;
++		/* Group-wide invalidation also covers (*,G) source-filter changes. */
++		filter.vid = info->group->vid;
++		filter.by_vid = true;
++	}
++	spin_lock_bh(&mc->lock);
++	br = mc->egress;
++	if (br && is_vlan_dev(br))
++		br = vlan_dev_real_dev(br);
++	if (br == info->br_dev)
++		mc_invalidate_locked(mc, MC_EVENT_BRIDGE, &filter);
++	spin_unlock_bh(&mc->lock);
++	return NOTIFY_DONE;
++}
++
++static int mc_net_notify(struct notifier_block *nb, unsigned long event, void *data)
++{
++	struct airoha_mcast *mc = container_of(nb, struct airoha_mcast, net_nb);
++	struct net_device *dev = netdev_notifier_info_to_dev(data);
++	bool related;
++
++	/* Device identity survives a rename. Other relevant changes retain a
++	 * conservative fence, including receive-mode/admission changes.
++	 */
++	if (event == NETDEV_CHANGENAME)
++		return NOTIFY_DONE;
++	rcu_read_lock();
++	spin_lock_bh(&mc->lock);
++	related = mc_scope_dev(mc, dev);
++	if (event == NETDEV_CHANGEUPPER || event == NETDEV_PRECHANGEUPPER) {
++		struct netdev_notifier_changeupper_info *info = data;
++
++		/* CHANGEUPPER may arrive after the old topology was unlinked. */
++		related |= mc_scope_dev(mc, info->upper_dev);
++	}
++	if (related) {
++		mc->links_dirty = true;
++		mc_invalidate_locked(mc, MC_EVENT_NETDEV, NULL);
++	}
++	if (event == NETDEV_UNREGISTER) {
++		if (dev == mc->ingress || dev == mc->egress) {
++			mc->scope_lost = true;
++			mc->running = false;
++			if (dev == mc->ingress) {
++				dev_put(mc->ingress);
++				mc->ingress = NULL;
++			}
++			if (dev == mc->egress) {
++				dev_put(mc->egress);
++				mc->egress = NULL;
++			}
++		}
++	}
++	spin_unlock_bh(&mc->lock);
++	rcu_read_unlock();
++	return NOTIFY_DONE;
++}
++
++static int mc_sw_event(struct airoha_mcast *mc, unsigned long event, void *data)
++{
++	struct net_device *dev = switchdev_notifier_info_to_dev(data);
++
++	if (event == SWITCHDEV_PORT_OBJ_ADD || event == SWITCHDEV_PORT_OBJ_DEL) {
++		struct switchdev_notifier_port_obj_info *info = data;
++
++		/* The bridge notifier already supplies the IP group and VID.
++		 * Switchdev MDB objects carry an Ethernet address and are coarser.
++		 */
++		if (info->obj->id == SWITCHDEV_OBJ_ID_PORT_MDB ||
++		    info->obj->id == SWITCHDEV_OBJ_ID_HOST_MDB)
++			return NOTIFY_DONE;
++	} else if (event != SWITCHDEV_PORT_ATTR_SET) {
++		return NOTIFY_DONE;
++	}
++	rcu_read_lock();
++	spin_lock_bh(&mc->lock);
++	if (mc_scope_dev(mc, dev))
++		mc_invalidate_locked(mc, MC_EVENT_SWITCHDEV, NULL);
++	spin_unlock_bh(&mc->lock);
++	rcu_read_unlock();
++	return NOTIFY_DONE;
++}
++static int mc_sw_notify(struct notifier_block *nb, unsigned long event, void *data)
++{
++	return mc_sw_event(container_of(nb, struct airoha_mcast, sw_nb), event, data);
++}
++static int mc_swb_notify(struct notifier_block *nb, unsigned long event, void *data)
++{
++	return mc_sw_event(container_of(nb, struct airoha_mcast, swb_nb), event, data);
++}
++static int mc_fib_notify(struct notifier_block *nb, unsigned long event, void *data)
++{
++	struct fib_notifier_info *info = data;
++	struct airoha_mcast *mc = container_of(nb, struct airoha_mcast, fib_nb);
++	enum mc_event_reason reason = MC_EVENT_FIB;
++	struct mc_filter filter = {};
++
++	if (info->family != AF_INET && info->family != RTNL_FAMILY_IPMR)
++		return NOTIFY_DONE;
++	if (info->family == RTNL_FAMILY_IPMR) {
++		struct mfc_entry_notifier_info *mfc_info = data;
++		struct vif_entry_notifier_info *vif_info = data;
++		struct mfc_cache *cache;
++
++		switch (event) {
++		case FIB_EVENT_ENTRY_REPLACE:
++		case FIB_EVENT_ENTRY_ADD:
++		case FIB_EVENT_ENTRY_DEL:
++			if (mfc_info->tb_id != RT_TABLE_DEFAULT)
++				return NOTIFY_DONE;
++			cache = container_of(mfc_info->mfc, struct mfc_cache, _c);
++			filter.source = cache->mfc_origin;
++			filter.group = cache->mfc_mcastgrp;
++			if (event != FIB_EVENT_ENTRY_DEL)
++				filter.refresh = mfc_info->mfc;
++			reason = MC_EVENT_MFC;
++			break;
++		case FIB_EVENT_VIF_ADD:
++		case FIB_EVENT_VIF_DEL:
++			if (vif_info->tb_id != RT_TABLE_DEFAULT)
++				return NOTIFY_DONE;
++			/* VIF indices can be reused and change threshold meaning. */
++			reason = MC_EVENT_VIF;
++			break;
++		case FIB_EVENT_RULE_ADD:
++		case FIB_EVENT_RULE_DEL:
++			/* Covered by ipmr_offload_flush_rules(). */
++			return NOTIFY_DONE;
++		default:
++			break;
++		}
++	} else if (event == FIB_EVENT_ENTRY_REPLACE || event == FIB_EVENT_ENTRY_ADD ||
++		   event == FIB_EVENT_ENTRY_APPEND || event == FIB_EVENT_ENTRY_DEL) {
++		struct fib_entry_notifier_info *entry = data;
++
++		/* Either source validation or destination routing may change.
++		 * Rules/nexthops and malformed prefixes retain the full fence.
++		 */
++		if (entry->dst_len >= 0 && entry->dst_len <= 32) {
++			filter.prefix = entry->dst;
++			filter.prefix_len = entry->dst_len;
++			filter.by_prefix = true;
++		}
++	}
++	spin_lock_bh(&mc->lock);
++	mc_invalidate_locked(mc, reason, &filter);
++	spin_unlock_bh(&mc->lock);
++	return NOTIFY_DONE;
++}
++
++/* Resolve Linux ports, never infer physical ports from interface names. */
++static int mc_output(struct airoha_eth *eth, struct net_device *dev)
++{
++	struct airoha_gdm_dev *gdm;
++	struct net_device *real = dev;
++	int port = -1;
++
++	if (netdev_uses_dsa(dev) || is_vlan_dev(dev) ||
++	    !netif_running(dev) || !netif_carrier_ok(dev))
++		return -EOPNOTSUPP;
++	if (dsa_user_dev_check(dev)) {
++		struct dsa_port *dp = dsa_port_from_netdev(dev);
++
++		port = dp->index;
++		real = dsa_port_to_conduit(dp);
++	}
++	gdm = netdev_priv(real);
++	if (!airoha_is_valid_gdm_dev(eth, gdm) || !airoha_is_lan_gdm_dev(gdm))
++		return -EOPNOTSUPP;
++	if (port >= 0)
++		return gdm->port->id == AIROHA_GDM1_IDX && port < 6 ?
++			BIT(port) : -EOPNOTSUPP;
++	return gdm->port->id == AIROHA_GDM4_IDX && !gdm->nbq ?
++		BIT(MC_NATIVE_SLOT) : -EOPNOTSUPP;
++}
++
++static int mc_fanout(struct airoha_mcast *mc, struct net_device *out,
++		     const struct mc_packet *packet, struct mc_flow *flow)
++{
++	struct br_mcast_fwd fwd;
++	struct bridge_vlan_info vinfo;
++	u16 vid = 0;
++	int i, bit, err;
++	bool tagged = false;
++
++	if (is_vlan_dev(out)) {
++		if (vlan_dev_vlan_proto(out) != htons(ETH_P_8021Q))
++			return -EOPNOTSUPP;
++		vid = vlan_dev_vlan_id(out);
++		out = vlan_dev_real_dev(out);
++	}
++	if (!netif_is_bridge_master(out) || !netif_running(out) ||
++	    (out->flags & IFF_PROMISC))
++		return -EOPNOTSUPP;
++	if (br_vlan_enabled(out)) {
++		if (!vid && br_vlan_get_pvid_rcu(out, &vid))
++			return -EOPNOTSUPP;
++		if (br_vlan_get_info_rcu(out, vid, &vinfo))
++			return -EOPNOTSUPP;
++	} else if (vid) {
++		return -EOPNOTSUPP;
++	}
++	err = br_multicast_ipv4_snapshot(out, packet->source, packet->group, vid, &fwd);
++	if (err || !fwd.num_ports)
++		return -EOPNOTSUPP;
++	for (i = 0; i < fwd.num_ports; i++) {
++		struct net_device *port = fwd.ports[i].dev;
++		bool tag = vid && !(fwd.ports[i].vlan_flags & BRIDGE_VLAN_INFO_UNTAGGED);
++
++		/* One FOE header action applies to every copy. Mixed tagged and
++		 * untagged outputs must use software until per-port VLAN actions
++		 * have a separately owned and validated FE table implementation.
++		 */
++		if (i && tag != tagged)
++			return -EOPNOTSUPP;
++		tagged = tag;
++		bit = mc_output(mc->ppe->eth, port);
++		/* Bridge slaves normally run promiscuous. The MDB snapshot, not
++		 * that RX filter flag, defines eligible routed egress ports.
++		 */
++		if (bit < 0 || port->mtu < ntohs(packet->length))
++			return -EOPNOTSUPP;
++		flow->outputs |= bit;
++		if (bit & MC_DSA_PORTS)
++			flow->output_ifindex[__ffs(bit)] = port->ifindex;
++	}
++	flow->out_tagged = tagged;
++	flow->out_vlan = tagged ? vid : 0;
++	flow->bridge_vid = vid;
++	/* Local subscriptions are handled on the ingress CPU copy. Locally
++	 * originated bridge TX does not deliver a second bridge host copy.
++	 */
++	return 0;
++}
++
++void airoha_mcast_learn(struct airoha_ppe *ppe, struct sk_buff *skb, u16 hash)
++{
++	struct airoha_mcast *mc = ppe->mcast;
++	struct ipmr_offload_route route;
++	struct net_device *in = skb->dev;
++	struct mc_flow candidate = {}, *f = NULL;
++	struct airoha_gdm_dev *gdm;
++	u64 epoch, *cookie;
++	int off, i, why = AIROHA_MC_REJECT_PACKET;
++	u32 state;
++
++	if (!mc || !READ_ONCE(mc->running))
++		return;
++	rcu_read_lock();
++	if (skb->mark ||
++	    !mc_parse(skb, false, &candidate.sample, &off) ||
++	    candidate.sample.ttl <= 1)
++		goto reject;
++	gdm = netdev_priv(in);
++	why = AIROHA_MC_REJECT_INGRESS;
++	/* First implementation: native PON IPoE input, optional one VLAN. */
++	if (!airoha_is_valid_gdm_dev(ppe->eth, gdm) ||
++	    !test_bit(AIROHA_DEV_F_PON, &gdm->flags))
++		goto reject;
++	if (candidate.sample.tagged)
++		in = __vlan_find_dev_deep_rcu(in, htons(ETH_P_8021Q),
++					    candidate.sample.vlan & VLAN_VID_MASK);
++	if (!in || !netif_running(in) || netif_is_bridge_port(in) ||
++	    (in->flags & IFF_PROMISC))
++		goto reject;
++	why = AIROHA_MC_REJECT_SCOPE;
++	if (in != READ_ONCE(mc->ingress))
++		goto reject;
++	candidate.hash = hash;
++	candidate.iif = in->ifindex;
++	if (mc_retry_skip(mc, &candidate, &epoch))
++		goto out;
++	why = AIROHA_MC_REJECT_ROUTE;
++	if (ipmr_offload_snapshot(in, candidate.sample.source, candidate.sample.group, &route))
++		goto reject;
++	why = AIROHA_MC_REJECT_SCOPE;
++	if (route.out != READ_ONCE(mc->egress))
++		goto reject;
++	why = AIROHA_MC_REJECT_BRIDGE;
++	if (mc_fanout(mc, route.out, &candidate.sample, &candidate))
++		goto reject;
++	candidate.iif = in->ifindex;
++	candidate.local = route.local;
++	candidate.parent = route.parent;
++	memcpy(candidate.ttls, route.ttls, sizeof(candidate.ttls));
++	ether_addr_copy(candidate.ingress_mac, eth_hdr(skb)->h_source);
++	candidate.hash = hash;
++	candidate.expires = jiffies + MC_SAMPLE_LIFE;
++	spin_lock_bh(&mc->lock);
++	if (!mc->running || mc->epoch != epoch)
++		goto unlock;
++	for (i = 0; i < MC_MAX_FLOWS; i++) {
++		struct mc_flow *old = &mc->flows[i];
++
++		if (old->used && old->hash == hash) {
++			if (old->committed)
++				goto unlock;
++			mc_remove(mc, old);
++			f = old;
++			break;
++		}
++		if (!old->used && !f)
++			f = old;
++	}
++	if (!f || airoha_ppe_mcast_read(ppe, hash, &candidate.learned)) {
++		mc->reject[AIROHA_MC_REJECT_RESOURCE]++;
++		mc->rejected++;
++		goto unlock;
++	}
++	state = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, candidate.learned.ib1);
++	if (state != AIROHA_FOE_STATE_UNBIND ||
++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, candidate.learned.ib1) !=
++		PPE_PKT_TYPE_IPV4_HNAPT ||
++	    !(candidate.learned.ib1 & AIROHA_FOE_IB1_BIND_UDP) ||
++	    candidate.learned.ipv4.orig_tuple.src_ip != ntohl(candidate.sample.source) ||
++	    candidate.learned.ipv4.orig_tuple.dest_ip != ntohl(candidate.sample.group))
++		goto unlock;
++	/* Preserve all learned hash words. HSK_MC is deliberately opaque. */
++	if (!refcount_inc_not_zero(&route.mfc->mfc_un.res.refcount))
++		goto unlock;
++	cookie = skb_ext_add(skb, SKB_EXT_MCAST_COOKIE);
++	if (!cookie) {
++		mr_cache_put(route.mfc);
++		goto unlock;
++	}
++	candidate.cookie = ++mc->serial;
++	*cookie = candidate.cookie;
++	candidate.used = true;
++	candidate.mfc = route.mfc;
++	*f = candidate;
++	mc->learned++;
++unlock:
++	spin_unlock_bh(&mc->lock);
++	goto out;
++reject:
++	spin_lock_bh(&mc->lock);
++	if (why == AIROHA_MC_REJECT_ROUTE)
++		mc_retry_defer(mc, &candidate, epoch);
++	mc->reject[why]++;
++	mc->rejected++;
++	spin_unlock_bh(&mc->lock);
++out:
++	rcu_read_unlock();
++}
++
++/* Follow the SDK's speed-first LAN channel choice. Stable ascending port
++ * order breaks ties; do not copy its platform-specific port count/sentinel.
++ * The selected channel is the one actually observed in software TX.
++ */
++static void mc_select_path(struct airoha_mcast *mc, struct mc_flow *f)
++{
++	u32 speed = 0;
++	int i, selected = -1;
++
++	lockdep_assert_held(&mc->lock);
++	f->switch_path = false;
++	if (!f->outputs || (f->outputs & ~MC_DSA_PORTS) || mc->links_dirty)
++		return;
++	for (i = 0; i < MC_DSA_COUNT; i++) {
++		if (!(f->outputs & BIT(i)))
++			continue;
++		if (!mc->links[i].speed ||
++		    mc->links[i].ifindex != f->output_ifindex[i])
++			return;
++		if (mc->links[i].speed > speed) {
++			speed = mc->links[i].speed;
++			selected = i;
++		}
++	}
++	if (selected >= 0) {
++		f->switch_path = true;
++		f->channel = f->tx_channels[selected];
++	}
++}
++
++static void mc_encode(struct mc_flow *f)
++{
++	struct airoha_foe_entry *e = &f->bound;
++	struct airoha_foe_mac_info_common *l2;
++	u8 dest[ETH_ALEN];
++
++	/* UNBIND stores packet scratch after the learned IPv4 key. Do not
++	 * reinterpret it as BIND action data (including the SDK hop fields).
++	 * Preserve HSK_MC exactly, then construct the action from zero.
++	 */
++	memset(e, 0, sizeof(*e));
++	e->ipv4.orig_tuple = f->learned.ipv4.orig_tuple;
++	e->ib1 = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
++		AIROHA_FOE_IB1_BIND_UDP | AIROHA_FOE_IB1_BIND_TTL |
++		FIELD_PREP(AIROHA_FOE_IB1_BIND_VLAN_LAYER, f->out_tagged) |
++		FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, f->out_tagged);
++	e->ipv4.new_tuple = e->ipv4.orig_tuple;
++	e->ipv4.new_tuple.src_port = ntohs(f->sample.sport);
++	e->ipv4.new_tuple.dest_port = ntohs(f->sample.dport);
++	e->ipv4.ib2 = FIELD_PREP(AIROHA_FOE_IB2_DSCP, f->dsfield) |
++		FIELD_PREP(AIROHA_FOE_IB2_PORT_AG, 0x1f) | AIROHA_FOE_IB2_PSE_QOS |
++		FIELD_PREP(AIROHA_FOE_IB2_PSE_PORT,
++			   f->switch_path ? FE_PSE_PORT_GDM1 : MC_FPORT) |
++		FIELD_PREP(AIROHA_FOE_IB2_NBQ,
++			   f->switch_path ? 1 : f->outputs >> 11);
++	if (f->local)
++		e->ipv4.ib2 |= AIROHA_FOE_IB2_MULTICAST;
++	e->ipv4.data = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f) |
++		FIELD_PREP(AIROHA_FOE_QID, f->queue) |
++		FIELD_PREP(AIROHA_FOE_CHANNEL,
++			   f->switch_path ? f->channel : (f->outputs >> 6) & 0x1f);
++	l2 = &e->ipv4.l2.common;
++	l2->vlan1 = f->out_vlan;
++	l2->vlan2 = 0;
++	l2->etype = airoha_stag_set_priority(f->outputs & MC_DSA_PORTS, f->queue);
++	ip_eth_mc_map(f->sample.group, dest);
++	l2->dest_mac_hi = get_unaligned_be32(dest);
++	l2->dest_mac_lo = get_unaligned_be16(dest + 4);
++	l2->src_mac_hi = get_unaligned_be32(f->source_mac);
++	e->ipv4.l2.src_mac_lo = get_unaligned_be16(f->source_mac + 4);
++}
++
++/* Called under the TX queue lock after successful DMA mapping and doorbell
++ * submission. Every expected output must have submitted the SAME accepted
++ * datagram before BIND. This does not guarantee physical transmit completion
++ * or drain packets still queued elsewhere in the software forwarding path.
++ */
++void airoha_mcast_tx(struct airoha_gdm_dev *dev, struct sk_buff *skb, u32 msg0)
++{
++	struct airoha_mcast *mc = dev->eth->ppe->mcast;
++	struct mc_packet packet;
++	struct ethhdr eh, *eth;
++	const u64 *cookie;
++	u16 output;
++	u8 queue;
++	int i, off, err;
++
++	cookie = skb_ext_find(skb, SKB_EXT_MCAST_COOKIE);
++	if (!cookie || !mc || !READ_ONCE(mc->running) || skb->mark ||
++	    !mc_parse(skb, true, &packet, &off))
++		return;
++	if (dev->port->id == AIROHA_GDM1_IDX)
++		output = FIELD_GET(QDMA_ETH_TXMSG_SP_TAG_MASK, msg0) & MC_DSA_PORTS;
++	else if (dev->port->id == AIROHA_GDM4_IDX && !dev->nbq)
++		output = BIT(MC_NATIVE_SLOT);
++	else
++		return;
++	if (!is_power_of_2(output))
++		return;
++	eth = skb_header_pointer(skb, 0, sizeof(eh), &eh);
++	if (!eth)
++		return;
++	queue = FIELD_GET(QDMA_ETH_TXMSG_QUEUE_MASK, msg0);
++	spin_lock_bh(&mc->lock);
++	if (!mc->running)
++		goto out;
++	for (i = 0; i < MC_MAX_FLOWS; i++) {
++		struct mc_flow *f = &mc->flows[i];
++
++		if (!f->used || f->committed || f->cookie != *cookie ||
++		    f->iif != skb->skb_iif ||
++		    !mc_same_tuple(&f->sample, &packet) ||
++		    f->sample.id != packet.id || f->sample.length != packet.length)
++			continue;
++		if (time_after(jiffies, f->expires) || packet.ttl + 1 != f->sample.ttl ||
++		    packet.tagged != f->out_tagged ||
++		    (packet.vlan & VLAN_VID_MASK) != (f->out_vlan & VLAN_VID_MASK) ||
++		    !(f->outputs & output) || (f->seen & output) ||
++		    (f->seen && (queue != f->queue || packet.dsfield != f->dsfield ||
++				packet.vlan != f->out_vlan ||
++				!ether_addr_equal(eth->h_source, f->source_mac)))) {
++			mc_remove(mc, f);
++			mc->reject[AIROHA_MC_REJECT_SAMPLE]++;
++			mc->rejected++;
++			break;
++		}
++		f->queue = queue;
++		f->dsfield = packet.dsfield;
++		f->out_vlan = packet.vlan;
++		ether_addr_copy(f->source_mac, eth->h_source);
++		f->seen |= output;
++		if (output & MC_DSA_PORTS)
++			f->tx_channels[__ffs(output)] =
++				FIELD_GET(QDMA_ETH_TXMSG_CHAN_MASK, msg0);
++		if (f->seen != f->outputs)
++			break;
++		mc_select_path(mc, f);
++		mc_encode(f);
++		err = airoha_ppe_mcast_write(mc->ppe, f->hash, &f->learned, &f->bound);
++		if (err) {
++			/* A timed-out BIND may already be visible to hardware. */
++			if (err != -ESTALE)
++				mc_fault(mc);
++			mc_remove(mc, f);
++			break;
++		}
++		f->committed = true;
++		mc->bound++;
++		break;
++	}
++out:
++	spin_unlock_bh(&mc->lock);
++}
++
++/* SDK duplicates carry the forwarded header. Normalize STAG, recover the
++ * logical ingress, then enter ordinary IP input with a no-second-fanout mark.
++ * Do not shortcut to udp_rcv: local firewall and source filters still apply.
++ * Original-to-CPU (0x19) remains ordinary software input.
++ */
++bool airoha_mcast_rx_copy(struct airoha_ppe *ppe, struct sk_buff *skb,
++			  u16 hash, u8 reason, u32 msg0)
++{
++	struct airoha_mcast *mc = ppe->mcast;
++	struct mc_packet packet;
++	struct net_device *in;
++	struct mc_flow copy = {};
++	struct iphdr *ip;
++	struct ethhdr *eh;
++	int i, off;
++	bool found = false, ok = false;
++
++	if (!mc || !READ_ONCE(mc->enabled) ||
++	    (reason != AIROHA_MC_DUPLICATE && reason != AIROHA_MC_KEEPALIVE))
++		return true;
++	spin_lock_bh(&mc->lock);
++	if (reason == AIROHA_MC_KEEPALIVE) {
++		mc->keepalives++;
++		goto unlock;
++	}
++	for (i = 0; i < MC_MAX_FLOWS; i++) {
++		struct mc_flow *f = &mc->flows[i];
++
++		if (!f->used || !f->committed || f->hash != hash)
++			continue;
++		copy = *f;
++		/* Keep statistics storage alive outside the state lock. */
++		found = refcount_inc_not_zero(&copy.mfc->mfc_un.res.refcount);
++		break;
++	}
++	mc->copies++;
++	mc->last_copy_msg0 = msg0;
++	if (!found)
++		mc->stale_copies++;
++unlock:
++	spin_unlock_bh(&mc->lock);
++	/* A stale hardware duplicate must never be forwarded again. */
++	if (!found)
++		return false;
++	if (!copy.local ||
++	    airoha_mcast_cpu_untag(skb, copy.bound.ipv4.l2.common.etype) ||
++	    !mc_parse(skb, false, &packet, &off) ||
++	    !mc_same_tuple(&packet, &copy.sample) ||
++	    packet.tagged != copy.out_tagged ||
++	    (packet.vlan & VLAN_VID_MASK) != (copy.out_vlan & VLAN_VID_MASK) ||
++	    packet.dsfield != copy.dsfield || packet.ttl == 255)
++		goto put;
++	rcu_read_lock();
++	in = dev_get_by_index_rcu(&init_net, copy.iif);
++	if (!in || in != READ_ONCE(mc->ingress) || !netif_running(in) ||
++	    !pskb_may_pull(skb, off + sizeof(*ip)) || skb_cow_head(skb, ETH_HLEN))
++		goto out;
++	skb_pull(skb, off);
++	ip = (struct iphdr *)skb->data;
++	if (ip_fast_csum(ip, ip->ihl))
++		goto out;
++	/* The binder records a stable per-flow header action. Its packet-varying
++	 * DSCP/ECN limitations also apply to hardware egress; qualify separately.
++	 */
++	ip->ttl++;
++	ip->tos = copy.sample.dsfield;
++	ip_send_check(ip);
++	__vlan_hwaccel_clear_tag(skb);
++	skb_scrub_packet(skb, false);
++	skb_clear_hash(skb);
++	skb->dev = in;
++	skb->skb_iif = copy.iif;
++	skb->protocol = htons(ETH_P_IP);
++	skb->pkt_type = PACKET_MULTICAST;
++	skb_reset_network_header(skb);
++	skb_set_transport_header(skb, sizeof(*ip));
++	skb_set_mac_header(skb, -ETH_HLEN);
++	eh = eth_hdr(skb);
++	ip_eth_mc_map(packet.group, eh->h_dest);
++	ether_addr_copy(eh->h_source, copy.ingress_mac);
++	eh->h_proto = htons(ETH_P_IP);
++	skb->mac_len = ETH_HLEN;
++	skb->ip_summed = CHECKSUM_NONE;
++	skb->offload_mr_fwd_mark = 1;
++	atomic_long_inc(&copy.mfc->mfc_un.res.pkt);
++	atomic_long_add(ntohs(packet.length), &copy.mfc->mfc_un.res.bytes);
++	ok = true;
++out:
++	rcu_read_unlock();
++put:
++	mr_cache_put(copy.mfc);
++	spin_lock_bh(&mc->lock);
++	if (ok)
++		mc->delivered++;
++	else
++		mc->bad_copies++;
++	spin_unlock_bh(&mc->lock);
++	return ok;
++}
++
++static void mc_reap(struct work_struct *work)
++{
++	struct airoha_mcast *mc = container_of(to_delayed_work(work),
++					     struct airoha_mcast, reap);
++	struct airoha_foe_entry entry;
++	int i;
++
++	if (READ_ONCE(mc->enabled) && !READ_ONCE(mc->scope_lost) &&
++	    !READ_ONCE(mc->stopping) && !READ_ONCE(mc->running) &&
++	    !READ_ONCE(mc->broken) && !READ_ONCE(mc->paused))
++		airoha_ppe_mcast_enable(mc->ppe);
++	mc_refresh_links(mc);
++	spin_lock_bh(&mc->lock);
++	if (!mc->running)
++		goto reschedule;
++	for (i = 0; i < MC_MAX_FLOWS; i++) {
++		struct mc_flow *f = &mc->flows[i];
++		u32 now, last, idle;
++
++		if (!f->used)
++			continue;
++		if (!f->committed) {
++			if (time_after(jiffies, f->expires))
++				mc_remove(mc, f);
++			continue;
++		}
++		if (airoha_ppe_mcast_read(mc->ppe, f->hash, &entry)) {
++			mc_fault(mc);
++			break;
++		}
++		if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, entry.ib1) != AIROHA_FOE_STATE_BIND ||
++		    memcmp(&entry.d, &f->bound.d, sizeof(entry) - sizeof(entry.ib1))) {
++			/* The slot aged or was reused. Do not invalidate its new owner. */
++			f->committed = false;
++			mc_remove(mc, f);
++			continue;
++		}
++		now = airoha_fe_get(mc->ppe->eth, REG_FE_FOE_TS, AIROHA_FOE_IB1_BIND_TIMESTAMP);
++		last = FIELD_GET(AIROHA_FOE_IB1_BIND_TIMESTAMP, entry.ib1);
++		idle = (now - last) & FIELD_MAX(AIROHA_FOE_IB1_BIND_TIMESTAMP);
++		if (idle < 4)
++			WRITE_ONCE(f->mfc->mfc_un.res.lastuse, jiffies - idle * HZ);
++	}
++reschedule:
++	if (!mc->stopping && !mc->broken && mc->enabled && !mc->scope_lost)
++		schedule_delayed_work(&mc->reap, 2 * HZ);
++	spin_unlock_bh(&mc->lock);
++}
++
++static int mc_status_show(struct seq_file *s, void *unused)
++{
++	struct airoha_mcast *mc = s->private;
++	int i, active = 0, pending = 0;
++
++	spin_lock_bh(&mc->lock);
++	for (i = 0; i < MC_MAX_FLOWS; i++) {
++		active += mc->flows[i].used && mc->flows[i].committed;
++		pending += mc->flows[i].used && !mc->flows[i].committed;
++	}
++	seq_printf(s, "requested=%u running=%u broken=%u active=%d pending=%d epoch=%llu\n",
++		   mc->enabled, mc->running, mc->broken, active, pending, mc->epoch);
++	seq_printf(s, "learned=%llu bound=%llu invalidated=%llu rejected=%llu copies=%llu errors=%llu\n",
++		   mc->learned, mc->bound, mc->invalidated, mc->rejected, mc->copies, mc->errors);
++	seq_printf(s, "delivered=%llu keepalives=%llu stale_copies=%llu bad_copies=%llu last_copy_msg0=%08x isolated=%u ppe_stopped=%u\n",
++		   mc->delivered, mc->keepalives, mc->stale_copies, mc->bad_copies,
++		   mc->last_copy_msg0, mc->isolated, mc->ppe_stopped);
++	seq_puts(s, "scope=ipv4-udp-pon-to-one-bridge counters=cpu-copies-only hardware-qualification=pending\n");
++	seq_printf(s, "retry_skipped=%llu retry_interval_ms=1000\n", mc->retry_skipped);
++	seq_printf(s, "events_explicit=%llu mfc=%llu vif=%llu member=%llu rule=%llu bridge=%llu netdev=%llu switchdev=%llu fib=%llu unchanged=%llu\n",
++		   mc->events[MC_EVENT_EXPLICIT], mc->events[MC_EVENT_MFC],
++		   mc->events[MC_EVENT_VIF], mc->events[MC_EVENT_MEMBER],
++		   mc->events[MC_EVENT_RULE], mc->events[MC_EVENT_BRIDGE],
++		   mc->events[MC_EVENT_NETDEV], mc->events[MC_EVENT_SWITCHDEV],
++		   mc->events[MC_EVENT_FIB], mc->unchanged);
++	for (i = 0; i < MC_MAX_FLOWS; i++) {
++		struct mc_flow *f = &mc->flows[i];
++
++		if (f->used)
++			seq_printf(s, "%04x %s iif=%d %pI4:%u->%pI4:%u outputs=%04x seen=%04x vlan=%u local=%u queue=%u hsk=%08x path=%s fport=%u channel=%u nbq=%u\n",
++				   f->hash, f->committed ? "BIND" : "pending", f->iif,
++				   &f->sample.source, ntohs(f->sample.sport),
++				   &f->sample.group, ntohs(f->sample.dport),
++				   f->outputs, f->seen, f->out_vlan, f->local, f->queue,
++				   f->learned.ipv4.orig_tuple.ports,
++				   FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, f->bound.ipv4.ib2) == FE_PSE_PORT_GDM1 ?
++					"switch" : "replicate",
++				   (u32)FIELD_GET(AIROHA_FOE_IB2_PSE_PORT, f->bound.ipv4.ib2),
++				   (u32)FIELD_GET(AIROHA_FOE_CHANNEL, f->bound.ipv4.data),
++				   (u32)FIELD_GET(AIROHA_FOE_IB2_NBQ, f->bound.ipv4.ib2));
++	}
++	spin_unlock_bh(&mc->lock);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(mc_status);
++
++/* Quiesce before changing firewall policy; resume only after the new
++ * rules are installed. This cannot activate a boot-disabled backend.
++ */
++static int mc_enable_get(void *data, u64 *value)
++{
++	struct airoha_mcast *mc = data;
++
++	*value = READ_ONCE(mc->running);
++	return 0;
++}
++
++static int mc_enable_set(void *data, u64 value)
++{
++	struct airoha_mcast *mc = data;
++	int i, err = 0;
++
++	if (value > 1)
++		return -EINVAL;
++	spin_lock_bh(&mc->lock);
++	if (mc->stopping || (value && (!READ_ONCE(mc->enabled) || !mc->slots_owned || mc->broken || mc->scope_lost))) {
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++	mc->paused = !value;
++	mc->running = value;
++	mc->epoch++;
++	for (i = 0; i < MC_MAX_FLOWS; i++)
++		mc_remove(mc, &mc->flows[i]);
++	if (mc->broken)
++		err = -EIO;
++out:
++	spin_unlock_bh(&mc->lock);
++	return err;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(mc_enable_fops, mc_enable_get, mc_enable_set, "%llu\n");
++
++void airoha_mcast_start(struct airoha_ppe *ppe)
++{
++	struct airoha_mcast *mc = ppe->mcast;
++	struct airoha_eth *eth = ppe->eth;
++	struct airoha_qdma *qdma = &eth->qdma[0];
++	int i;
++
++	if (!mc || !READ_ONCE(mc->enabled) || !airoha_is_7581(eth))
++		return;
++	spin_lock_bh(&mc->lock);
++	if (mc->broken || mc->running || mc->stopping || mc->paused || mc->scope_lost)
++		goto out;
++	/* NPU must already have configured multicast-aware lookup. Changing
++	 * hash format on an active table is not an activation mechanism.
++	 */
++	for (i = 0; i < eth->soc->num_ppe; i++)
++		if (airoha_ppe_is_enabled(eth, i) &&
++		    !(airoha_fe_rr(eth, REG_PPE_PPE_FLOW_CFG(i)) & MC_HASH_MODE))
++			goto unsupported;
++	for (i = 0; i < 16; i++) {
++		if (!(MC_OUTPUTS & BIT(i)))
++			continue;
++		if (!mc->slots_owned)
++			mc->saved_repl[i] = airoha_qdma_rr(qdma, MC_REPL_REG(i));
++		airoha_qdma_wr(qdma, MC_REPL_REG(i), mc_replication(i));
++	}
++	if (!mc->slots_owned)
++		mc->saved_pce = airoha_fe_rr(eth, REG_FE_PCE_CFG);
++	/* Per-entry MULTICAST requests a CPU copy only for local consumers. */
++	airoha_fe_set(eth, REG_FE_PCE_CFG, PCE_MC_EN_MASK);
++	mc->slots_owned = true;
++	for (i = 0; i < 16; i++)
++		if ((MC_OUTPUTS & BIT(i)) &&
++		    airoha_qdma_rr(qdma, MC_REPL_REG(i)) != mc_replication(i))
++			goto restore;
++	if (!(airoha_fe_rr(eth, REG_FE_PCE_CFG) & PCE_MC_EN_MASK))
++		goto restore;
++	mc->running = true;
++	schedule_delayed_work(&mc->reap, 2 * HZ);
++	dev_warn(eth->dev, "experimental multicast offload enabled; ingress-key qualification required\n");
++	goto out;
++restore:
++	for (i = 0; i < 16; i++)
++		if (MC_OUTPUTS & BIT(i))
++			airoha_qdma_wr(qdma, MC_REPL_REG(i), mc->saved_repl[i]);
++	airoha_fe_rmw(eth, REG_FE_PCE_CFG, PCE_MC_EN_MASK, mc->saved_pce & PCE_MC_EN_MASK);
++	mc->slots_owned = false;
++	mc->errors++;
++	mc->broken = true;
++	goto out;
++unsupported:
++	mc->broken = true;
++	dev_warn(eth->dev, "multicast offload unavailable: NPU multicast lookup is not enabled\n");
++out:
++	spin_unlock_bh(&mc->lock);
++}
++
++static const struct nla_policy mc_genl_policy[AIROHA_MCAST_A_MAX + 1] = {
++	[AIROHA_MCAST_A_ENABLED] = NLA_POLICY_MAX(NLA_U8, 1),
++	[AIROHA_MCAST_A_INGRESS] = { .type = NLA_U32 },
++	[AIROHA_MCAST_A_EGRESS] = { .type = NLA_U32 },
++	[AIROHA_MCAST_A_STATUS] = { .type = NLA_REJECT },
++	[AIROHA_MCAST_A_LIVE_APPLY] = { .type = NLA_REJECT },
++};
++
++/* RTNL pins validated device identities throughout policy replacement. */
++static int mc_apply(struct airoha_mcast *mc, struct genl_info *info)
++{
++	struct net_device *in = NULL, *out = NULL, *real;
++	struct airoha_gdm_dev *gdm;
++	u32 iif = 0, oif = 0;
++	u16 ivid = 0, ovid = 0;
++	bool enabled;
++	int err = 0;
++
++	if (!info->attrs[AIROHA_MCAST_A_ENABLED])
++		return -EINVAL;
++	enabled = nla_get_u8(info->attrs[AIROHA_MCAST_A_ENABLED]);
++	if (info->attrs[AIROHA_MCAST_A_INGRESS])
++		iif = nla_get_u32(info->attrs[AIROHA_MCAST_A_INGRESS]);
++	if (info->attrs[AIROHA_MCAST_A_EGRESS])
++		oif = nla_get_u32(info->attrs[AIROHA_MCAST_A_EGRESS]);
++	if (!enabled && (iif || oif))
++		return -EINVAL;
++	if (enabled) {
++		in = __dev_get_by_index(&init_net, iif);
++		out = __dev_get_by_index(&init_net, oif);
++		if (!in || !out)
++			return -ENODEV;
++		real = in;
++		if (is_vlan_dev(real)) {
++			if (vlan_dev_vlan_proto(real) != htons(ETH_P_8021Q))
++				return -EOPNOTSUPP;
++			ivid = vlan_dev_vlan_id(real);
++			real = vlan_dev_real_dev(real);
++		}
++		gdm = netdev_priv(real);
++		if (is_vlan_dev(real) || !airoha_is_valid_gdm_dev(mc->ppe->eth, gdm) ||
++		    !test_bit(AIROHA_DEV_F_PON, &gdm->flags) || netif_is_bridge_port(in))
++			return -EOPNOTSUPP;
++		real = out;
++		if (is_vlan_dev(real)) {
++			if (vlan_dev_vlan_proto(real) != htons(ETH_P_8021Q))
++				return -EOPNOTSUPP;
++			ovid = vlan_dev_vlan_id(real);
++			real = vlan_dev_real_dev(real);
++		}
++		if (!netif_is_bridge_master(real))
++			return -EOPNOTSUPP;
++	}
++	spin_lock_bh(&mc->lock);
++	if (mc->stopping) {
++		err = -ENODEV;
++	} else if (mc->broken) {
++		/* A failed hardware invalidation still requires device recovery. */
++		err = -EIO;
++	} else if (mc->frozen && !mc->scope_lost &&
++		   mc->enabled == enabled && mc->ingress == in &&
++		   mc->egress == out && mc->ingress_vid == ivid &&
++		   mc->egress_vid == ovid) {
++		/* Hotplug retries are idempotent, including a diagnostic pause. */
++	} else {
++		/* Stop admission and revoke pending TX snapshots as well as BINDs.
++		 * Publish new references only after every old flow is withdrawn.
++		 * Frames already on the wire cannot be recalled by this operation.
++		 */
++		mc->running = false;
++		mc_invalidate_locked(mc, MC_EVENT_EXPLICIT, NULL);
++		if (mc->broken) {
++			err = -EIO;
++			goto unlock;
++		}
++		if (in)
++			dev_hold(in);
++		if (out)
++			dev_hold(out);
++		if (mc->ingress)
++			dev_put(mc->ingress);
++		if (mc->egress)
++			dev_put(mc->egress);
++		mc->ingress = in;
++		mc->egress = out;
++		mc->ingress_index = iif;
++		mc->egress_index = oif;
++		mc->ingress_vid = ivid;
++		mc->egress_vid = ovid;
++		mc->enabled = enabled;
++		mc->links_dirty = true;
++		/* Preserve the v1 ABI: frozen now records an accepted policy.
++		 * LIVE_APPLY distinguishes replacement support from old kernels.
++		 */
++		mc->frozen = true;
++		mc->scope_lost = false;
++		mc->paused = false;
++	}
++unlock:
++	spin_unlock_bh(&mc->lock);
++	if (!err && enabled)
++		mod_delayed_work(system_wq, &mc->reap, 0);
++	return err;
++}
++
++static int mc_genl_request(struct sk_buff *skb, struct genl_info *info)
++{
++	struct airoha_mcast_status status = {};
++	struct airoha_mcast *mc = mc_device;
++	struct sk_buff *reply;
++	void *hdr;
++	int i, err = 0;
++
++	if (!net_eq(genl_info_net(info), &init_net))
++		return -EOPNOTSUPP;
++	if (!mc)
++		return -ENODEV;
++	rtnl_lock();
++	if (info->genlhdr->cmd == AIROHA_MCAST_CMD_APPLY) {
++		err = mc_apply(mc, info);
++		if (err)
++			goto out;
++	}
++	spin_lock_bh(&mc->lock);
++	if (info->genlhdr->cmd == AIROHA_MCAST_CMD_FLUSH) {
++		if (!mc->broken)
++			mc_invalidate_locked(mc, MC_EVENT_EXPLICIT, NULL);
++		if (mc->broken) {
++			spin_unlock_bh(&mc->lock);
++			err = -EIO;
++			goto out;
++		}
++	}
++	status.enabled = mc->enabled;
++	status.frozen = mc->frozen;
++	status.running = mc->running;
++	status.broken = mc->broken;
++	status.isolated = mc->isolated;
++	status.ppe_stopped = mc->ppe_stopped;
++	status.paused = mc->paused;
++	status.scope_lost = mc->scope_lost;
++	status.ingress = mc->ingress_index;
++	status.egress = mc->egress_index;
++	status.ingress_vid = mc->ingress_vid;
++	status.egress_vid = mc->egress_vid;
++	for (i = 0; i < MC_MAX_FLOWS; i++) {
++		status.active += mc->flows[i].used && mc->flows[i].committed;
++		status.pending += mc->flows[i].used && !mc->flows[i].committed;
++	}
++	status.epoch = mc->epoch;
++	status.learned = mc->learned;
++	status.bound = mc->bound;
++	status.invalidated = mc->invalidated;
++	status.rejected = mc->rejected;
++	status.copies = mc->copies;
++	status.delivered = mc->delivered;
++	status.keepalives = mc->keepalives;
++	status.stale_copies = mc->stale_copies;
++	status.bad_copies = mc->bad_copies;
++	status.errors = mc->errors;
++	memcpy(status.reject, mc->reject, sizeof(status.reject));
++	spin_unlock_bh(&mc->lock);
++	reply = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++	if (!reply) {
++		err = -ENOMEM;
++		goto out;
++	}
++	hdr = genlmsg_put_reply(reply, info, &mc_genl_family, 0, info->genlhdr->cmd);
++	if (!hdr || nla_put(reply, AIROHA_MCAST_A_STATUS, sizeof(status), &status) ||
++	    nla_put_u8(reply, AIROHA_MCAST_A_LIVE_APPLY, 1)) {
++		kfree_skb(reply);
++		err = -EMSGSIZE;
++		goto out;
++	}
++	genlmsg_end(reply, hdr);
++	err = genlmsg_reply(reply, info);
++out:
++	rtnl_unlock();
++	return err;
++}
++
++static const struct genl_small_ops mc_genl_ops[] = {
++	{ .cmd = AIROHA_MCAST_CMD_GET, .flags = GENL_ADMIN_PERM,
++	  .doit = mc_genl_request },
++	{ .cmd = AIROHA_MCAST_CMD_APPLY, .flags = GENL_ADMIN_PERM,
++	  .doit = mc_genl_request },
++	{ .cmd = AIROHA_MCAST_CMD_FLUSH, .flags = GENL_ADMIN_PERM,
++	  .doit = mc_genl_request },
++};
++static struct genl_family mc_genl_family = {
++	.name = AIROHA_MCAST_FAMILY,
++	.version = AIROHA_MCAST_VERSION,
++	.maxattr = AIROHA_MCAST_A_MAX,
++	.policy = mc_genl_policy,
++	.module = THIS_MODULE,
++	.netnsok = false,
++	.small_ops = mc_genl_ops,
++	.n_small_ops = ARRAY_SIZE(mc_genl_ops),
++	.resv_start_op = AIROHA_MCAST_CMD_FLUSH + 1,
++};
++
++int airoha_mcast_init(struct airoha_ppe *ppe)
++{
++	struct airoha_mcast *mc;
++	int err;
++
++	if (!airoha_is_7581(ppe->eth))
++		return 0;
++	mc = devm_kzalloc(ppe->eth->dev, sizeof(*mc), GFP_KERNEL);
++	if (!mc) {
++		dev_warn(ppe->eth->dev, "multicast state allocation failed; using software\n");
++		return 0;
++	}
++	mc->ppe = ppe;
++	spin_lock_init(&mc->lock);
++	INIT_DELAYED_WORK(&mc->reap, mc_reap);
++	mc->links_dirty = true;
++	ppe->mcast = mc;
++	mc->mr_nb.notifier_call = mc_mr_notify;
++	mc->br_nb.notifier_call = mc_br_notify;
++	mc->net_nb.notifier_call = mc_net_notify;
++	mc->sw_nb.notifier_call = mc_sw_notify;
++	mc->swb_nb.notifier_call = mc_swb_notify;
++	mc->fib_nb.notifier_call = mc_fib_notify;
++	err = ipmr_offload_register(&mc->mr_nb);
++	if (err)
++		goto fail;
++	err = br_multicast_register_notifier(&mc->br_nb);
++	if (err)
++		goto unreg_mr;
++	err = register_netdevice_notifier(&mc->net_nb);
++	if (err)
++		goto unreg_br;
++	err = register_switchdev_notifier(&mc->sw_nb);
++	if (err)
++		goto unreg_net;
++	err = register_switchdev_blocking_notifier(&mc->swb_nb);
++	if (err)
++		goto unreg_sw;
++	err = register_fib_notifier(&init_net, &mc->fib_nb, NULL, NULL);
++	if (err)
++		goto unreg_swb;
++	mc_device = mc;
++	err = genl_register_family(&mc_genl_family);
++	if (err) {
++		mc_device = NULL;
++		unregister_fib_notifier(&init_net, &mc->fib_nb);
++		goto unreg_swb;
++	}
++	debugfs_create_file("multicast", 0400, ppe->debugfs_dir, mc, &mc_status_fops);
++	debugfs_create_file("multicast_enable", 0600, ppe->debugfs_dir, mc, &mc_enable_fops);
++	return 0;
++unreg_swb:
++	unregister_switchdev_blocking_notifier(&mc->swb_nb);
++unreg_sw:
++	unregister_switchdev_notifier(&mc->sw_nb);
++unreg_net:
++	unregister_netdevice_notifier(&mc->net_nb);
++unreg_br:
++	br_multicast_unregister_notifier(&mc->br_nb);
++unreg_mr:
++	ipmr_offload_unregister(&mc->mr_nb);
++fail:
++	ppe->mcast = NULL;
++	dev_warn(ppe->eth->dev, "multicast notifier registration failed (%d); using software\n", err);
++	return 0;
++}
++
++void airoha_mcast_exit(struct airoha_ppe *ppe)
++{
++	struct airoha_mcast *mc = ppe->mcast;
++	int i;
++
++	if (!mc)
++		return;
++	spin_lock_bh(&mc->lock);
++	mc->stopping = true;
++	mc->running = false;
++	spin_unlock_bh(&mc->lock);
++	genl_unregister_family(&mc_genl_family);
++	mc_device = NULL;
++	cancel_delayed_work_sync(&mc->reap);
++	unregister_fib_notifier(&init_net, &mc->fib_nb);
++	unregister_switchdev_blocking_notifier(&mc->swb_nb);
++	unregister_switchdev_notifier(&mc->sw_nb);
++	unregister_netdevice_notifier(&mc->net_nb);
++	br_multicast_unregister_notifier(&mc->br_nb);
++	ipmr_offload_unregister(&mc->mr_nb);
++	airoha_mcast_invalidate(ppe);
++	synchronize_net();
++	if (mc->slots_owned && !mc->broken) {
++		for (i = 0; i < 16; i++)
++			if (MC_OUTPUTS & BIT(i))
++				airoha_qdma_wr(&ppe->eth->qdma[0], MC_REPL_REG(i), mc->saved_repl[i]);
++		airoha_fe_rmw(ppe->eth, REG_FE_PCE_CFG, PCE_MC_EN_MASK,
++			      mc->saved_pce & PCE_MC_EN_MASK);
++	}
++	if (mc->ingress)
++		dev_put(mc->ingress);
++	if (mc->egress)
++		dev_put(mc->egress);
++}
+diff --git a/drivers/net/ethernet/airoha/airoha_mcast.h b/drivers/net/ethernet/airoha/airoha_mcast.h
+new file mode 100644
+index 0000000..e03d8d5
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_mcast.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef AIROHA_MCAST_H
++#define AIROHA_MCAST_H
++
++#include <net/busy_poll.h>
++#include <net/gro.h>
++
++struct airoha_ppe;
++struct airoha_gdm_dev;
++struct airoha_foe_entry;
++
++/* Preserve this NAPI's delivery order without merging datagram cookies or
++ * hardware-forwarded copies. Completing held GRO packets queues them behind
++ * older GRO_NORMAL packets; the new packet then joins the same list.
++ * This does not serialize different RX rings or software/hardware egress.
++ */
++static inline void airoha_mcast_gro_bypass(struct napi_struct *napi,
++					   struct sk_buff *skb)
++{
++	napi_gro_flush(napi, false);
++	skb_mark_napi_id(skb, napi);
++	gro_normal_one(&napi->gro, skb, 1);
++}
++
++#if IS_ENABLED(CONFIG_NET_AIROHA_MCAST)
++static inline bool airoha_mcast_no_gro(struct sk_buff *skb)
++{
++	return skb->offload_mr_fwd_mark || skb_ext_exist(skb, SKB_EXT_MCAST_COOKIE);
++}
++
++static inline bool airoha_mcast_is_sample(struct sk_buff *skb)
++{
++	return skb_ext_exist(skb, SKB_EXT_MCAST_COOKIE);
++}
++int airoha_ppe_mcast_enable(struct airoha_ppe *ppe);
++int airoha_mcast_init(struct airoha_ppe *ppe);
++void airoha_mcast_exit(struct airoha_ppe *ppe);
++void airoha_mcast_start(struct airoha_ppe *ppe);
++void airoha_mcast_invalidate(struct airoha_ppe *ppe);
++void airoha_mcast_learn(struct airoha_ppe *ppe, struct sk_buff *skb, u16 hash);
++bool airoha_mcast_rx_copy(struct airoha_ppe *ppe, struct sk_buff *skb,
++			  u16 hash, u8 reason, u32 msg0);
++void airoha_mcast_tx(struct airoha_gdm_dev *dev, struct sk_buff *skb, u32 msg0);
++int airoha_ppe_mcast_read(struct airoha_ppe *ppe, u16 hash,
++			struct airoha_foe_entry *entry);
++int airoha_ppe_mcast_write(struct airoha_ppe *ppe, u16 hash,
++			 const struct airoha_foe_entry *old,
++			 const struct airoha_foe_entry *entry);
++#else
++static inline bool airoha_mcast_is_sample(struct sk_buff *skb) { return false; }
++static inline bool airoha_mcast_no_gro(struct sk_buff *skb) { return false; }
++static inline int airoha_mcast_init(struct airoha_ppe *ppe) { return 0; }
++static inline void airoha_mcast_exit(struct airoha_ppe *ppe) {}
++static inline void airoha_mcast_start(struct airoha_ppe *ppe) {}
++static inline void airoha_mcast_invalidate(struct airoha_ppe *ppe) {}
++static inline void airoha_mcast_learn(struct airoha_ppe *ppe,
++				    struct sk_buff *skb, u16 hash) {}
++static inline bool airoha_mcast_rx_copy(struct airoha_ppe *ppe,
++			struct sk_buff *skb, u16 hash, u8 reason, u32 msg0) { return true; }
++static inline void airoha_mcast_tx(struct airoha_gdm_dev *dev,
++				 struct sk_buff *skb, u32 msg0) {}
++#endif
++#endif
+diff --git a/drivers/net/ethernet/airoha/airoha_mcast_test.c b/drivers/net/ethernet/airoha/airoha_mcast_test.c
+new file mode 100644
+index 0000000..f952abd
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_mcast_test.c
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <kunit/test.h>
++#include <net/airoha_mcast.h>
++#include "airoha_mcast.h"
++
++static struct sk_buff *mc_test_skb(struct kunit *test, u16 proto, u16 inner)
++{
++	struct sk_buff *skb = alloc_skb(128, GFP_KERNEL);
++	struct ethhdr *eth;
++
++	KUNIT_ASSERT_NOT_NULL(test, skb);
++	skb_reserve(skb, 32);
++	eth = skb_put_zero(skb, ETH_HLEN + VLAN_HLEN + 20);
++	skb_reset_mac_header(skb);
++	eth->h_proto = htons(proto);
++	skb_pull(skb, ETH_HLEN);
++	put_unaligned_be16(inner, skb->data + 2);
++	skb->protocol = htons(proto);
++	return skb;
++}
++
++static void mc_cpu_header_test(struct kunit *test)
++{
++	struct sk_buff *skb;
++	const u16 stag = 0xc005;
++
++	skb = mc_test_skb(test, ETH_P_IP, 0);
++	KUNIT_EXPECT_EQ(test, airoha_mcast_cpu_untag(skb, stag), 0);
++	KUNIT_EXPECT_EQ(test, skb->len, (unsigned int)(VLAN_HLEN + 20));
++	kfree_skb(skb);
++	skb = mc_test_skb(test, stag, ETH_P_IP);
++	KUNIT_EXPECT_EQ(test, airoha_mcast_cpu_untag(skb, stag), 0);
++	KUNIT_EXPECT_EQ(test, skb->len, 20U);
++	KUNIT_EXPECT_EQ(test, skb->protocol, htons(ETH_P_IP));
++	kfree_skb(skb);
++	skb = mc_test_skb(test, stag | 0x100, ETH_P_IP);
++	KUNIT_EXPECT_EQ(test, airoha_mcast_cpu_untag(skb, stag), 0);
++	KUNIT_EXPECT_EQ(test, skb->protocol, htons(ETH_P_8021Q));
++	KUNIT_EXPECT_EQ(test, skb->len, (unsigned int)(VLAN_HLEN + 20));
++	kfree_skb(skb);
++	skb = mc_test_skb(test, stag | 0x200, ETH_P_IP);
++	KUNIT_EXPECT_LT(test, airoha_mcast_cpu_untag(skb, stag), 0);
++	kfree_skb(skb);
++	skb = mc_test_skb(test, stag ^ 1, ETH_P_IP);
++	KUNIT_EXPECT_LT(test, airoha_mcast_cpu_untag(skb, stag), 0);
++	kfree_skb(skb);
++	skb = mc_test_skb(test, stag, ETH_P_8021Q);
++	KUNIT_EXPECT_LT(test, airoha_mcast_cpu_untag(skb, stag), 0);
++	kfree_skb(skb);
++}
++
++static void mc_gro_order_test(struct kunit *test)
++{
++	struct napi_struct napi = {};
++	struct sk_buff *first, *held, *special, *skb, *tmp;
++	unsigned int expected = 1;
++
++	/* Keep delivery in the real GRO list so no protocol stack or device is
++	 * needed. Production normally batches eight segments.
++	 */
++	if (READ_ONCE(net_hotdata.gro_normal_batch) <= 3) {
++		kunit_skip(test, "GRO batch too small for list inspection");
++		return;
++	}
++	first = alloc_skb(64, GFP_KERNEL);
++	KUNIT_ASSERT_NOT_NULL(test, first);
++	held = alloc_skb(64, GFP_KERNEL);
++	if (!held) {
++		kfree_skb(first);
++		KUNIT_FAIL(test, "held skb allocation");
++		return;
++	}
++	special = alloc_skb(64, GFP_KERNEL);
++	if (!special) {
++		kfree_skb(first);
++		kfree_skb(held);
++		KUNIT_FAIL(test, "special skb allocation");
++		return;
++	}
++	first->mark = 1;
++	held->mark = 2;
++	special->mark = 3;
++	gro_init(&napi.gro);
++	gro_normal_one(&napi.gro, first, 1);
++	NAPI_GRO_CB(held)->count = 1;
++	list_add(&held->list, &napi.gro.hash[0].list);
++	napi.gro.hash[0].count = 1;
++	napi.gro.bitmask = BIT(0);
++	airoha_mcast_gro_bypass(&napi, special);
++	KUNIT_EXPECT_EQ(test, napi.gro.bitmask, 0UL);
++	KUNIT_EXPECT_EQ(test, napi.gro.rx_count, 3);
++	list_for_each_entry_safe(skb, tmp, &napi.gro.rx_list, list) {
++		KUNIT_EXPECT_EQ(test, skb->mark, expected++);
++		skb_list_del_init(skb);
++		kfree_skb(skb);
++	}
++	KUNIT_EXPECT_EQ(test, expected, 4U);
++}
++
++static struct kunit_case mc_cases[] = {
++	KUNIT_CASE(mc_cpu_header_test),
++	KUNIT_CASE(mc_gro_order_test),
++	{}
++};
++static struct kunit_suite mc_suite = {
++	.name = "airoha-multicast",
++	.test_cases = mc_cases,
++};
++kunit_test_suite(mc_suite);
++MODULE_LICENSE("GPL");
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 118bfb8..71326e1 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -931,6 +931,58 @@ unlock:
+ 	return err;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_AIROHA_MCAST)
++int airoha_ppe_mcast_read(struct airoha_ppe *ppe, u16 hash,
++			struct airoha_foe_entry *entry)
++{
++	struct airoha_foe_entry *hwe;
++	int err = 0;
++
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return -EINVAL;
++	spin_lock_bh(&ppe_lock);
++	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (hwe)
++		*entry = *hwe;
++	else
++		err = -ETIMEDOUT;
++	spin_unlock_bh(&ppe_lock);
++	return err;
++}
++
++int airoha_ppe_mcast_write(struct airoha_ppe *ppe, u16 hash,
++			 const struct airoha_foe_entry *old,
++			 const struct airoha_foe_entry *entry)
++{
++	struct airoha_foe_entry *hwe, update = *entry;
++	u32 mask = AIROHA_FOE_IB1_BIND_STATE | AIROHA_FOE_IB1_BIND_PACKET_TYPE |
++		   AIROHA_FOE_IB1_BIND_UDP;
++	bool bound = FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, old->ib1) == AIROHA_FOE_STATE_BIND;
++	int err = -ESTALE;
++
++	if (hash >= airoha_ppe_get_total_num_entries(ppe))
++		return -EINVAL;
++	spin_lock_bh(&ppe_lock);
++	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
++	if (!hwe) {
++		err = -ETIMEDOUT;
++		goto out;
++	}
++	if ((hwe->ib1 & mask) != (old->ib1 & mask) ||
++	    memcmp(&hwe->ipv4.orig_tuple, &old->ipv4.orig_tuple,
++		   sizeof(old->ipv4.orig_tuple)) ||
++	    (bound && memcmp(&hwe->d, &old->d, sizeof(*old) - sizeof(old->ib1))))
++		goto out;
++	/* Keep the replication action direct. The unicast NPU accounting
++	 * trampoline has no established multicast replication contract.
++	 */
++	err = airoha_ppe_foe_commit_entry(ppe, &update, hash, true);
++out:
++	spin_unlock_bh(&ppe_lock);
++	return err;
++}
++#endif
++
+ static void airoha_ppe_foe_remove_flow(struct airoha_ppe *ppe,
+ 				       struct airoha_flow_table_entry *e)
+ {
+@@ -985,6 +1037,7 @@ void airoha_ppe_remove_egress_flows(struct airoha_gdm_dev *dev)
+ 	LIST_HEAD(remove_list);
+ 
+ 	lockdep_assert_held(&flow_offload_mutex);
++	airoha_mcast_invalidate(eth->ppe);
+ 
+ 	/* TC replace and destroy callbacks share flow_offload_mutex with this walk.
+ 	 * Collect matching objects before removal so rhashtable iteration continues
+@@ -1666,8 +1719,8 @@ static int airoha_ppe_offload_setup(struct airoha_eth *eth)
+ 
+ 	airoha_ppe_hw_init(ppe);
+ 	airoha_ppe_foe_flow_stats_reset(ppe, npu);
+-
+ 	rcu_assign_pointer(eth->npu, npu);
++	airoha_mcast_start(ppe);
+ 	synchronize_rcu();
+ 
+ 	return 0;
+@@ -1678,6 +1731,24 @@ error_npu_put:
+ 	return err;
+ }
+ 
++#if IS_ENABLED(CONFIG_NET_AIROHA_MCAST)
++int airoha_ppe_mcast_enable(struct airoha_ppe *ppe)
++{
++	struct airoha_eth *eth = ppe->eth;
++	int err = 0;
++
++	if (!test_bit(DEV_STATE_REGISTERED, &eth->state))
++		return -EBUSY;
++	mutex_lock(&flow_offload_mutex);
++	if (!eth->npu)
++		err = airoha_ppe_offload_setup(eth);
++	else
++		airoha_mcast_start(ppe);
++	mutex_unlock(&flow_offload_mutex);
++	return err;
++}
++#endif
++
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data)
+ {
+ 	struct airoha_ppe *ppe = dev->priv;
+@@ -1719,6 +1790,11 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 		return;
+ 
+ 	ppe->foe_check_time[hash] = now;
++	if (is_multicast_ether_addr(eth_hdr(skb)->h_dest)) {
++		if (!rx_wlan)
++			airoha_mcast_learn(ppe, skb, hash);
++		return;
++	}
+ 	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan);
+ }
+ 
+@@ -1882,6 +1958,11 @@ int airoha_ppe_init(struct airoha_eth *eth)
+ 	err = airoha_ppe_debugfs_init(ppe);
+ 	if (err)
+ 		goto error_l2_flow_table_destroy;
++	err = airoha_mcast_init(ppe);
++	if (err) {
++		debugfs_remove(ppe->debugfs_dir);
++		goto error_l2_flow_table_destroy;
++	}
+ 
+ 	return 0;
+ 
+@@ -1897,6 +1978,7 @@ void airoha_ppe_deinit(struct airoha_eth *eth)
+ {
+ 	struct airoha_npu *npu;
+ 
++	airoha_mcast_exit(eth->ppe);
+ 	mutex_lock(&flow_offload_mutex);
+ 
+ 	npu = rcu_replace_pointer(eth->npu, NULL,
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+index 8f04b4c..c223550 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -68,7 +68,7 @@ static int airoha_ppe_debugfs_foe_show(struct seq_file *m, void *private,
+ 		unsigned char h_dest[ETH_ALEN];
+ 		struct airoha_foe_entry *hwe;
+ 		u32 type, state, ib2, data;
+-		bool ipv6 = false, smac_index = false;
++		bool ipv6 = false, smac_index = false, multicast = false;
+ 
+ 		hwe = airoha_ppe_foe_get_entry(ppe, i);
+ 		if (!hwe)
+@@ -91,8 +91,11 @@ static int airoha_ppe_debugfs_foe_show(struct seq_file *m, void *private,
+ 		switch (type) {
+ 		case PPE_PKT_TYPE_IPV4_HNAPT:
+ 		case PPE_PKT_TYPE_IPV4_DSLITE:
+-			src_port = &hwe->ipv4.orig_tuple.src_port;
+-			dest_port = &hwe->ipv4.orig_tuple.dest_port;
++			multicast = ipv4_is_multicast(cpu_to_be32(hwe->ipv4.orig_tuple.dest_ip));
++			if (!multicast) {
++				src_port = &hwe->ipv4.orig_tuple.src_port;
++				dest_port = &hwe->ipv4.orig_tuple.dest_port;
++			}
+ 			fallthrough;
+ 		case PPE_PKT_TYPE_IPV4_ROUTE:
+ 			src_addr = &hwe->ipv4.orig_tuple.src_ip;
+@@ -158,7 +161,8 @@ static int airoha_ppe_debugfs_foe_show(struct seq_file *m, void *private,
+ 				cpu_to_be16(hwe->ipv4.l2.src_mac_lo);
+ 		}
+ 
+-		airoha_ppe_foe_entry_get_stats(ppe, i, &stats);
++		if (!multicast)
++			airoha_ppe_foe_entry_get_stats(ppe, i, &stats);
+ 
+ 		*((__be32 *)h_dest) = cpu_to_be32(l2->dest_mac_hi);
+ 		*((__be16 *)&h_dest[4]) = cpu_to_be16(l2->dest_mac_lo);
+@@ -182,6 +186,12 @@ static int airoha_ppe_debugfs_foe_show(struct seq_file *m, void *private,
+ 			seq_printf(m, " eth=%pM->%pM", h_source, h_dest);
+ 		}
+ 
++		if (multicast) {
++			seq_printf(m, " multicast=1 hsk=%08x etype=%04x data=%08x vlan=%d,%d ib1=%08x ib2=%08x hw_stats=unavailable\n",
++				   hwe->ipv4.orig_tuple.ports, l2->etype, data,
++				   l2->vlan1, l2->vlan2, hwe->ib1, ib2);
++			continue;
++		}
+ 		seq_printf(m, " etype=%04x data=%08x"
+ 			      " vlan=%d,%d ib1=%08x ib2=%08x"
+ 			      " packets=%llu bytes=%llu\n",
+diff --git a/include/net/airoha_mcast.h b/include/net/airoha_mcast.h
+new file mode 100644
+index 0000000..f32dd3c
+--- /dev/null
++++ b/include/net/airoha_mcast.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NET_AIROHA_MCAST_H
++#define _NET_AIROHA_MCAST_H
++
++#include <linux/if_vlan.h>
++#include <linux/skbuff.h>
++#include <linux/unaligned.h>
++
++/* AN7581 SDK frame_engine.h. Only DUPLICATE has already been forwarded. */
++enum airoha_mcast_reason {
++	AIROHA_MC_KEEPALIVE = 0x14,
++	AIROHA_MC_DUPLICATE = 0x18,
++	AIROHA_MC_ORIGINAL = 0x19,
++};
++
++/* Called after eth_type_trans, for an OWNED multicast duplicate only.
++ * SDK STAG VPM=0 adds four bytes, VPM=1 overlays the VLAN TPID. AN7581
++ * can also strip STAG into descriptor metadata. Never guess from IP bytes.
++ * QinQ is outside this backend's admitted scope.
++ */
++static inline int airoha_mcast_cpu_untag(struct sk_buff *skb, u16 stag)
++{
++	u16 raw, vpm;
++
++	if (skb->protocol == htons(ETH_P_IP) ||
++	    skb->protocol == htons(ETH_P_8021Q))
++		return 0;
++	if (!skb_mac_header_was_set(skb) ||
++	    skb->data - skb_mac_header(skb) != ETH_HLEN ||
++	    !pskb_may_pull(skb, VLAN_HLEN))
++		return -EINVAL;
++	raw = ntohs(eth_hdr(skb)->h_proto);
++	if ((raw & ~0x0300) != (stag & ~0x0300))
++		return -EINVAL;
++	vpm = (raw >> 8) & 3;
++	if (!vpm) {
++		if (get_unaligned_be16(skb->data + 2) != ETH_P_IP)
++			return -EPROTONOSUPPORT;
++		skb_pull(skb, VLAN_HLEN);
++		skb->protocol = htons(ETH_P_IP);
++	} else if (vpm == 1) {
++		skb->protocol = htons(ETH_P_8021Q);
++	} else {
++		return -EPROTONOSUPPORT;
++	}
++	return 0;
++}
++
++#endif
+diff --git a/include/uapi/linux/airoha_mcast.h b/include/uapi/linux/airoha_mcast.h
+new file mode 100644
+index 0000000..3d64db7
+--- /dev/null
++++ b/include/uapi/linux/airoha_mcast.h
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_AIROHA_MCAST_H
++#define _UAPI_LINUX_AIROHA_MCAST_H
++#include <linux/types.h>
++
++#define AIROHA_MCAST_FAMILY "airoha_mcast"
++#define AIROHA_MCAST_VERSION 1
++enum {
++	AIROHA_MCAST_CMD_UNSPEC,
++	AIROHA_MCAST_CMD_GET,
++	AIROHA_MCAST_CMD_APPLY,
++	AIROHA_MCAST_CMD_FLUSH, /* withdraw entries; retain policy and pause state */
++};
++enum {
++	AIROHA_MCAST_A_UNSPEC,
++	AIROHA_MCAST_A_ENABLED, /* u8; consult LIVE_APPLY before runtime replacement */
++	AIROHA_MCAST_A_INGRESS, /* u32 logical PON IPoE ifindex, optional VLAN */
++	AIROHA_MCAST_A_EGRESS,  /* u32 bridge / bridge VLAN ifindex */
++	AIROHA_MCAST_A_STATUS,  /* struct airoha_mcast_status, read-only */
++	AIROHA_MCAST_A_LIVE_APPLY, /* u8 read-only; absent means boot-only */
++	__AIROHA_MCAST_A_MAX,
++};
++#define AIROHA_MCAST_A_MAX (__AIROHA_MCAST_A_MAX - 1)
++
++enum airoha_mcast_reject {
++	AIROHA_MC_REJECT_PACKET,
++	AIROHA_MC_REJECT_INGRESS,
++	AIROHA_MC_REJECT_SCOPE,
++	AIROHA_MC_REJECT_ROUTE,
++	AIROHA_MC_REJECT_BRIDGE,
++	AIROHA_MC_REJECT_RESOURCE,
++	AIROHA_MC_REJECT_SAMPLE,
++	AIROHA_MC_REJECT_MAX,
++};
++
++struct airoha_mcast_status {
++	__u8 enabled, frozen, running, broken;
++	__u8 isolated, ppe_stopped, paused, scope_lost;
++	__u32 ingress, egress;
++	__u16 ingress_vid, egress_vid;
++	__u16 active, pending;
++	__aligned_u64 epoch, learned, bound, invalidated, rejected;
++	__aligned_u64 copies, delivered, keepalives, stale_copies, bad_copies, errors;
++	__aligned_u64 reject[AIROHA_MC_REJECT_MAX];
++};
++#endif
+-- 
+2.53.0
+

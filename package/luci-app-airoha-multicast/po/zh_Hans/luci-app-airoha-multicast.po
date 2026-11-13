@@ -1,0 +1,106 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: zh_Hans\n"
+
+msgid "Running policy"
+msgstr "当前运行策略"
+
+msgid "Multicast status unavailable. Saved settings do not prove that hardware offload is active."
+msgstr "无法读取组播状态。已保存配置不代表硬件卸载已经启用。"
+
+msgid "Hardware fault; reboot is required for recovery. Delivery may be interrupted."
+msgstr "硬件故障，需重启恢复，组播交付可能中断。"
+
+msgid "Interface was recreated. Waiting for interface recovery; Apply can rebind the configured scope online."
+msgstr "接口已重建，正在等待恢复；点击应用可在线重新绑定配置的接口。"
+
+msgid "Interface was removed. This older kernel requires a reboot."
+msgstr "接口已移除，当前旧版内核需要重启恢复。"
+
+msgid "Waiting for the configured interfaces and policy."
+msgstr "等待配置的接口和策略就绪。"
+
+msgid "Offload disabled; multicast uses software forwarding."
+msgstr "卸载已关闭，组播使用软件转发。"
+
+msgid "Temporarily paused by a diagnostic tool."
+msgstr "已由诊断工具临时暂停。"
+
+msgid "Policy accepted; waiting for hardware initialization."
+msgstr "策略已接受，等待硬件初始化。"
+
+msgid "Offload ready; active hardware flows: %s."
+msgstr "卸载已就绪，当前硬件流数：%s。"
+
+msgid "Saved settings differ from the accepted policy. Use Save & Apply; no reboot is needed."
+msgstr "已保存配置与已接受策略不同。点击“保存并应用”即可，无需重启。"
+
+msgid "This kernel only accepts policy at boot. Save settings and reboot to apply them."
+msgstr "当前内核仅在启动时接受策略。保存后需重启设备才能生效。"
+
+msgid "Accepted scope: %s → %s; interface indices: %s → %s; VLAN IDs: %s → %s."
+msgstr "已请求范围：%s → %s；接口索引：%s → %s；VLAN ID：%s → %s。"
+
+msgid "Pending flows: %s; invalidated: %s; errors: %s."
+msgstr "待处理流：%s；已撤销：%s；错误：%s。"
+
+msgid "Open reboot page"
+msgstr "打开重启页面"
+
+msgid "Refresh status"
+msgstr "刷新状态"
+
+msgid "Multicast offload"
+msgstr "组播卸载"
+
+msgid "Accelerate supported IPv4 multicast forwarding from the PON interface to a LAN bridge. Multicast routing and firewall permissions must already be configured."
+msgstr "加速从 PON 接口到 LAN 桥的受支持 IPv4 组播转发。请先配置组播路由和防火墙权限。"
+
+msgid "Enable multicast hardware offload"
+msgstr "启用组播硬件卸载"
+
+msgid "Disabling offload keeps software multicast routing available. This switch does not disable IPTV or filter unsolicited multicast."
+msgstr "关闭卸载后仍可使用软件组播路由。此开关不会关闭 IPTV，也不负责过滤未订阅组播。"
+
+msgid "Upstream logical interface"
+msgstr "上游逻辑接口"
+
+msgid "Downstream logical interface"
+msgstr "下游逻辑接口"
+
+msgid "Select the PON IPoE interface, optionally with one VLAN. PPPoE and QinQ are not supported by this backend."
+msgstr "选择 PON IPoE 接口，可包含一层 VLAN。此卸载后端不支持 PPPoE 或 QinQ。"
+
+msgid "Select the LAN bridge or its VLAN interface. Subscriptions determine the actual output ports."
+msgstr "选择 LAN 桥或桥上的 VLAN 接口，实际出口由订阅成员决定。"
+
+msgid "Select an existing logical interface."
+msgstr "请选择已存在的逻辑接口。"
+
+msgid "Upstream and downstream must differ."
+msgstr "上游和下游必须使用不同的接口。"
+
+msgid "Applying changes"
+msgstr "配置生效方式"
+
+msgid "On a kernel with online-policy support, Save & Apply withdraws old multicast flows and relearns them in the new scope. Brief software forwarding and playback jitter are possible. WAN and LAN interfaces are not restarted. Save alone stores settings without changing the running policy."
+msgstr "支持在线策略的内核在“保存并应用”时撤销旧组播流，并在新范围内重新学习。期间可能短暂使用软件转发并出现播放抖动，不重启 WAN 或 LAN 接口。仅“保存”不会改变运行策略。"
+
+msgid "Interface recovery"
+msgstr "接口恢复"
+
+msgid "When an applied logical interface is recreated, its ifup event revalidates the PON/bridge devices and restores offload. Saved-but-unapplied edits are not used by this recovery. Hardware invalidation faults still require a reboot."
+msgstr "已应用的逻辑接口重建后，接口上线事件会重新验证 PON 和桥设备并恢复卸载，不会使用尚未应用的编辑内容。硬件清表故障仍需重启恢复。"
+
+msgid "Settings saved; the running multicast policy was not changed."
+msgstr "配置已保存，运行中的组播策略未改变。"
+
+msgid "This kernel requires a reboot. Settings have been saved."
+msgstr "此内核需要重启才能生效，配置已保存。"
+
+msgid "Apply failed. Check interface availability, driver status and the system log."
+msgstr "应用失败，请检查接口是否就绪、驱动状态和系统日志。"
+
+msgid "Policy accepted online. Refresh status to confirm hardware readiness."
+msgstr "策略已在线接受，请刷新状态确认硬件是否就绪。"
