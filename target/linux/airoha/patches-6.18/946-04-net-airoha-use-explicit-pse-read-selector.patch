@@ -1,0 +1,25 @@
+From: HG development <hg@localhost>
+Subject: [PATCH] net: airoha: select PSE queue reads without command bits
+
+Follow AN7581 SDK pse_get_oq_rsv(): issue a read selector containing only
+the port and queue. Read-modify-write needlessly carries any previous
+write-enable/command bits into a query. Keep queue reservations, total
+reservation accounting and shared thresholds unchanged. This is defensive
+command construction, not a demonstrated fix for PSE free-queue exhaustion.
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -271,9 +271,9 @@ static u32 airoha_fe_get_pse_queue_rsv_pages(struct airoha_eth *eth,
+ 					     u32 port, u32 queue)
+ {
+-	airoha_fe_rmw(eth, REG_FE_PSE_QUEUE_CFG_WR,
+-		      PSE_CFG_PORT_ID_MASK | PSE_CFG_QUEUE_ID_MASK,
+-		      FIELD_PREP(PSE_CFG_PORT_ID_MASK, port) |
+-		      FIELD_PREP(PSE_CFG_QUEUE_ID_MASK, queue));
++	/* A query must not replay a previous write-enable or command bit. */
++	airoha_fe_wr(eth, REG_FE_PSE_QUEUE_CFG_WR,
++		     FIELD_PREP(PSE_CFG_PORT_ID_MASK, port) |
++		     FIELD_PREP(PSE_CFG_QUEUE_ID_MASK, queue));
+ 
+ 	return airoha_fe_get(eth, REG_FE_PSE_QUEUE_CFG_VAL,
+ 			     PSE_CFG_OQ_RSV_MASK);
