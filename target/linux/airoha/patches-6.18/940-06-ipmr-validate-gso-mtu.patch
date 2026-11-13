@@ -1,0 +1,140 @@
+From: HG PonWrt contributors
+Subject: [PATCH] ipmr: validate GSO segment MTU before multicast forwarding
+
+An IPv4 GRO batch can exceed the egress MTU even though every constituent
+UDP datagram fits. The early DF check in ipmr_prepare_xmit() otherwise
+rejects the entire batch before ip_finish_output_gso() can segment it.
+
+Use the existing network segment length validator, keeping the non-GSO
+and genuine oversized-DF checks. Evaluate each routed output separately
+and account for IPIP encapsulation without unsigned MTU underflow.
+
+The legacy IPIP encapsulator and PIM register upcall do not carry GSO
+metadata. Segment only those output copies first; normal multicast keeps
+GRO until the existing egress segmentation path. No Airoha hardware,
+flowtable, DSCP policy or device address is involved.
+
+Link: https://github.com/openwrt/openwrt/issues/25713
+---
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -43,6 +43,7 @@
+ #include <linux/if_ether.h>
+ #include <linux/slab.h>
+ #include <net/flow.h>
++#include <net/gso.h>
+ #include <net/net_namespace.h>
+ #include <net/ip.h>
+ #include <net/protocol.h>
+@@ -1890,6 +1891,7 @@
+ 	struct net_device *vif_dev;
+ 	struct rtable *rt;
+ 	struct flowi4 fl4;
++	unsigned int mtu;
+ 	int    encap = 0;
+ 
+ 	vif_dev = vif_dev_read(vif);
+@@ -1923,7 +1925,14 @@
+ 			return -1;
+ 	}
+ 
+-	if (skb->len+encap > dst4_mtu(&rt->dst) && (ntohs(iph->frag_off) & IP_DF)) {
++	mtu = dst4_mtu(&rt->dst);
++	/* GRO length describes the batch, not the datagrams sent on the wire.
++	 * Check each output against its MTU, including any IPIP header.
++	 */
++	if ((ntohs(iph->frag_off) & IP_DF) &&
++	    (mtu <= encap ||
++	     (skb_is_gso(skb) ? !skb_gso_validate_network_len(skb, mtu - encap) :
++			       skb->len > mtu - encap))) {
+ 		/* Do not fragment multicasts. Alas, IPv4 does not
+ 		 * allow to send ICMP, so that packets will disappear
+ 		 * to blackhole.
+@@ -2005,6 +2014,42 @@
+ 
+ out_free:
+ 	kfree_skb(skb);
++}
++
++/* Legacy IPIP and PIM register paths consume complete IP datagrams and
++ * do not build tunnel GSO metadata. Segment only those copies before their
++ * headers are changed or handed to the routing daemon. Ordinary multicast
++ * keeps GRO batching until the usual output path.
++ */
++static void ipmr_queue_xmit(struct net *net, struct mr_table *mrt,
++			   int in_vifi, struct sk_buff *skb, int vifi, bool local)
++{
++	struct sk_buff *segs, *next;
++
++	if (!skb_is_gso(skb) ||
++	    !(mrt->vif_table[vifi].flags & (VIFF_TUNNEL | VIFF_REGISTER))) {
++		if (local)
++			ipmr_queue_output_xmit(net, mrt, skb, vifi);
++		else
++			ipmr_queue_fwd_xmit(net, mrt, in_vifi, skb, vifi);
++		return;
++	}
++
++	BUILD_BUG_ON(sizeof(*IPCB(skb)) > SKB_GSO_CB_OFFSET);
++	segs = skb_gso_segment(skb, 0);
++	if (IS_ERR_OR_NULL(segs)) {
++		kfree_skb(skb);
++		return;
++	}
++	consume_skb(skb);
++
++	skb_list_walk_safe(segs, segs, next) {
++		skb_mark_not_on_list(segs);
++		if (local)
++			ipmr_queue_output_xmit(net, mrt, segs, vifi);
++		else
++			ipmr_queue_fwd_xmit(net, mrt, in_vifi, segs, vifi);
++	}
+ }
+ 
+ /* Called with mrt_lock or rcu_read_lock() */
+@@ -2117,8 +2162,8 @@
+ 				struct sk_buff *skb2 = skb_clone(skb, GFP_ATOMIC);
+ 
+ 				if (skb2)
+-					ipmr_queue_fwd_xmit(net, mrt, true_vifi,
+-							    skb2, psend);
++					ipmr_queue_xmit(net, mrt, true_vifi,
++							    skb2, psend, false);
+ 			}
+ 			psend = ct;
+ 		}
+@@ -2129,10 +2174,10 @@
+ 			struct sk_buff *skb2 = skb_clone(skb, GFP_ATOMIC);
+ 
+ 			if (skb2)
+-				ipmr_queue_fwd_xmit(net, mrt, true_vifi, skb2,
+-						    psend);
++				ipmr_queue_xmit(net, mrt, true_vifi, skb2,
++						    psend, false);
+ 		} else {
+-			ipmr_queue_fwd_xmit(net, mrt, true_vifi, skb, psend);
++			ipmr_queue_xmit(net, mrt, true_vifi, skb, psend, false);
+ 			return;
+ 		}
+ 	}
+@@ -2303,8 +2348,8 @@
+ 
+ 				skb2 = skb_clone(skb, GFP_ATOMIC);
+ 				if (skb2)
+-					ipmr_queue_output_xmit(net, mrt,
+-							       skb2, psend);
++					ipmr_queue_xmit(net, mrt, -1,
++							       skb2, psend, true);
+ 			}
+ 			psend = ct;
+ 		}
+@@ -2312,7 +2357,7 @@
+ 
+ last_xmit:
+ 	if (psend != -1) {
+-		ipmr_queue_output_xmit(net, mrt, skb, psend);
++		ipmr_queue_xmit(net, mrt, -1, skb, psend, true);
+ 		return;
+ 	}
+ 
