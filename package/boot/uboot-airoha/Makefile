@@ -35,6 +35,8 @@ endef
 
 define U-Boot/an7581_nokia_xg-040g-md
   NAME:=Nokia XG-040G-MD
+  # Sysupgrade/recovery FIT images do not consume bootloader artifacts.
+  HIDDEN:=
   UBOOT_CONFIG:=an7581_nokia_xg-040g-md
   BUILD_DEVICES:=nokia_xg-040g-md-ubi
   BUILD_SUBTARGET:=an7581

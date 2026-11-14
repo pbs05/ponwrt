@@ -28,6 +28,8 @@ endef
 
 define Trusted-Firmware-A/an7581-bl2
   $(call Trusted-Firmware-A/bl2/Default)
+  # Expose an explicit build choice; retain the existing default.
+  HIDDEN:=
   BUILD_SUBTARGET:=an7581
   SOC:=EN7581
   BUILD_DEVICES:=airoha_an7581-evb-multievb nokia_valyrian nokia_xg-040g-md-ubi
@@ -49,6 +51,8 @@ endef
 
 define Trusted-Firmware-A/an7581-bl31
   $(call Trusted-Firmware-A/bl31/Default)
+  # Expose an explicit build choice; retain the existing default.
+  HIDDEN:=
   BUILD_SUBTARGET:=an7581
   SOC:=EN7581
   BUILD_DEVICES:=airoha_an7581-evb-multievb nokia_valyrian nokia_xg-040g-md-ubi
