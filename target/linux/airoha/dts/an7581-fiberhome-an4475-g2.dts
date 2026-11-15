@@ -463,24 +463,22 @@
 			reg = <0x040000 0x14a800>;
 		};
 
-		pon_cal_10ge_asym: calibration-10ge-asym@1a0000 {
-			reg = <0x1a0000 0x000800>;
-		};
+		/* 上行 PON 校准（ONT / UX3363，APONCAL 格式）
+		 * 5 个固定槽，偏移 = 0x1a0000 + 槽号*0x1000，每槽前 0x800 有效：
+		 *   0x1a0000  10ge_asym_table | 10G-EPON 非对称(10G下/1G上)
+		 *   0x1a1000  10ge_sym_table  | 10G-EPON 对称（与 0x1a4000 逐字节相同）
+		 *   0x1a2000  xg_table        | XG-PON(10G下/2.5G上)
+		 *   0x1a3000  xgs_table       | XGS-PON 10G 对称（与 0x1a4000 逐字节相同）
+		 *   0x1a4000  table           | 通用/XGS/10G-EPON 对称复用 
+		 * 【启用哪一个】只改下面节点的 reg 起始地址，并把节点名 @地址
+		 * 改成同一个值（两者不一致 dtc 会报 unit address 与 reg 不匹配）。
+		 * label 与 &an4475_bosa 都不用动；其 nvmem-cell-names 必须恒为
+		 * "calibration"（驱动 devm_nvmem_cell_get(dev,"calibration") 精确匹配）。
+		 * 例：改用 XG-PON 表 -> calibration@1a2000 / reg = <0x1a2000 0x000800>
+		 * 校准在 probe 时一次性读入，换表必须重编 DTB 并重启，不能开机热切。 */
 
-		pon_cal_10ge_sym: calibration-10ge-sym@1a1000 {
-			reg = <0x1a1000 0x000800>;
-		};
-
-		pon_cal_xg: calibration-xg@1a2000 {
+		pon_calibration: calibration@1a2000 {
 			reg = <0x1a2000 0x000800>;
-		};
-
-		pon_cal_xgs: calibration-xgs@1a3000 {
-			reg = <0x1a3000 0x000800>;
-		};
-
-		pon_calibration: calibration@1a4000 {
-			reg = <0x1a4000 0x000800>;
 		};
 
 		pon_cal_olt_downlink: calibration-olt-downlink@1a5000 {
@@ -689,8 +687,8 @@
 		reg = <0x51>;
 		fiberhome,ben-active-high;
 		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
-		nvmem-cells = <&pon_cal_xg>;
-		nvmem-cell-names = "calibration-xg";	
+		nvmem-cells = <&pon_calibration>;
+		nvmem-cell-names = "calibration";	
 		status = "okay";
 	};
 
