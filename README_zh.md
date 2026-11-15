@@ -18,6 +18,7 @@ PonWrt 是一个用于研究和开发的开源光猫固件项目。
 
 | SoC | 设备 | Profile | 原厂校准/身份数据分区 |
 | --- | --- | --- | --- |
+| AN7581 | FiberHome AN4475-G2 | `fiberhome_an4475-g2` | `factory`（2 MiB AN4-2MiB） |
 | AN7581 | FiberHome HG5382A | `fiberhome_hg5382a` | `factory` |
 | AN7581 | FiberHome HG5585F CT | `fiberhome_hg5585f-ct` | `factory` |
 | AN7581 | FiberHome HG5585F CU | `fiberhome_hg5585f-cu` | `factory` |

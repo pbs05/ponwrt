@@ -1,0 +1,783 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/dts-v1/;
+
+/memreserve/ 0x80000000 0x200000;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/clock/en7523-clk.h>
+#include <dt-bindings/reset/airoha,en7581-reset.h>
+#include "an7581.dtsi"
+
+
+/ {
+	model = "FiberHome AN4475-G2";
+	compatible = "fiberhome,an4475-g2", "airoha,an7581", "airoha,en7581";
+	variant = "usb-sfp";
+
+	aliases {
+		label-mac-device = &gdm2;
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
+
+		serial0 = &uart1;
+	};
+
+	chosen {
+		rootdisk = <&ubi_fit>;
+		bootargs = "console=ttyS0,115200 earlycon";
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x20000000>;
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		key-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&en7581_pinctrl 0 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+
+		key-wlan {
+			label = "wlan";
+			linux,code = <KEY_WLAN>;
+			gpios = <&en7581_pinctrl 17 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+	};
+
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_power: led-power {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_POWER;
+			gpios = <&en7581_pinctrl 35 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+			panic-indicator;
+		};
+
+		led_lan2: led-lan2 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <2>;
+			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
+		};
+
+		led_lan3: led-lan3 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <3>;
+			gpios = <&en7581_pinctrl 44 GPIO_ACTIVE_LOW>;
+		};
+
+		led_lan4: led-lan4 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <4>;
+			gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_LOW>;
+		};
+
+		led_lan5: led-lan5 {
+			color = <LED_COLOR_ID_GREEN>;
+			function = LED_FUNCTION_LAN;
+			function-enumerator = <5>;
+			gpios = <&en7581_pinctrl 46 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	i2c_gpio: i2c-gpio {
+		compatible = "i2c-gpio";
+		sda-gpios = <&en7581_pinctrl 29 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&en7581_pinctrl 28 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <10>;	/* ~50 kHz, conservative */
+		i2c-gpio,timeout-ms = <100>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		pca9555: gpio@20 {
+			compatible = "nxp,pca9555";
+			reg = <0x20>;
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+
+	leds_expander: leds-expander {
+		compatible = "gpio-leds";
+
+		/* P0.0 - 面板丝印"光纤" */
+		led_internet: led-internet {
+			label = "green:wan-online";
+			gpios = <&pca9555 0 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* P0.1 - 面板丝印"光信号"（LOS 告警，红色）*/
+		led_los: led-los {
+			label = "red:los";
+			gpios = <&pca9555 1 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* P0.2 - 面板丝印"下行PON"（绿色，FTTR 下联口状态） */
+		led_pon_downlink: led-pon-downlink {
+			label = "green:pon-downlink";
+			gpios = <&pca9555 2 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/*
+		 * P0.3 / P0.4 - 面板丝印"系统"，一颗双色灯
+		 * 拉低 P0.3 得绿、拉低 P0.4 得红（同时拉低呈偏黄）。
+		 */
+		led_sys: led-sys {
+			label = "green:sys";
+			gpios = <&pca9555 3 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		led_sys_red: led-sys-red {
+			label = "red:sys";
+			gpios = <&pca9555 4 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* P0.5 - 面板丝印"VPN" */
+		led_vpn: led-vpn {
+			label = "green:vpn";
+			gpios = <&pca9555 5 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* P0.6 - 面板丝印"WLAN"，由 ledpaneld 按终端关联状态驱动 */
+		led_wlan: led-wlan {
+			label = "green:wlan";
+			gpios = <&pca9555 6 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* P0.7 - 面板丝印"USB2"（SuperSpeed 侧） */
+		led_usb2: led-usb2 {
+			label = "green:usb-2";
+			gpios = <&pca9555 7 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* P1.0 - 面板丝印"USB"（USB2.0 侧） */
+		led_usb1: led-usb1 {
+			label = "green:usb-1";
+			gpios = <&pca9555 8 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		/* 2.5G 光电复用口的光口（SFP 笼）指示，与 PHY 侧无关 */
+		led_2g5_fiber: led-2g5-fiber {
+			label = "green:2g5-fiber";
+			gpios = <&pca9555 9 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_voice1: led-voice-1 {
+			label = "green:voice1";
+			gpios = <&pca9555 10 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_voice2: led-voice-2 {
+			label = "green:voice2";
+			gpios = <&pca9555 11 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_voice3: led-voice-3 {
+			label = "green:voice3";
+			gpios = <&pca9555 12 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_voice4: led-voice-4 {
+			label = "green:voice4";
+			gpios = <&pca9555 13 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+	};
+
+	/* The USB PHY 3.3V reference supply is always on. */
+	reg_3p3v: regulator-3p3v {
+		compatible = "regulator-fixed";
+		regulator-always-on;
+		regulator-boot-on;
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-name = "fixed-3.3V";
+	};
+
+};
+
+&en7581_pinctrl {
+	gpio-ranges = <&en7581_pinctrl 0 13 50>;
+
+	pon_pins: pon-pins {
+		mux {
+			function = "pon";
+			groups = "pon_tx_disable_gpio";
+		};
+	};
+
+	downstream_pon_spi_pins: downstream-pon-spi-pins {
+		mux {
+			function = "pcm_spi";
+			groups = "pcm_spi";
+		};
+	};
+
+	mdio_pins: mdio-pins {
+		mux {
+			function = "mdio";
+			groups = "mdio";
+		};
+
+		conf {
+			pins = "gpio2";
+			output-high;
+		};
+	};
+
+	pcie0_rst_pins: pcie0-rst-pins {
+		conf {
+			pins = "pcie_reset0";
+			drive-open-drain = <1>;
+		};
+	};
+
+	pcie1_rst_pins: pcie1-rst-pins {
+		conf {
+			pins = "pcie_reset1";
+			drive-open-drain = <1>;
+		};
+	};
+
+
+	fsl_reset_hog: fsl-reset-hog {
+		gpio-hog;
+		gpios = <4 GPIO_ACTIVE_LOW>;
+		output-high;
+		line-name = "fsl-reset";
+	};
+
+
+	gpon_power_hog: gpon-power-hog {
+		gpio-hog;
+		gpios = <20 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "gpon-power";
+	};
+
+	combo_mux_sel0_hog: combo-mux-sel0-hog {
+		gpio-hog;
+		gpios = <22 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "combo-mux-sel0";
+	};
+
+	combo_mux_sel1_hog: combo-mux-sel1-hog {
+		gpio-hog;
+		gpios = <23 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "combo-mux-sel1";
+	};
+
+};
+
+&snfi {
+	status = "okay";
+};
+
+&{/soc} {
+
+	pcm_spi: spi@1fbd4000 {
+		compatible = "airoha,en7581-spi", "airoha,spi";
+		reg = <0x0 0x1fbd4000 0x0 0x140>;
+
+		clocks = <&scuclk EN7523_CLK_SPI>;
+		clock-names = "spi";
+		resets = <&scuclk EN7581_SFC2_PCM_RST>;
+		reset-names = "pcm";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+		spi-num-chipselects = <2>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&downstream_pon_spi_pins>;
+
+		status = "disabled";
+
+		fsl: fsl@0 {
+			compatible = "fiberhome,an4475-g2-fsl";
+			reg = <0>;
+			spi-max-frequency = <20000000>;
+			spi-cpol;
+			spi-cpha;
+			/*
+			 * 复位脚 gpio4 由 pinctrl 下的 fsl_reset_hog 以 output-high
+			 * （ACTIVE_LOW，即释放复位）常驻持有；这里再写 reset-gpios
+			 * 会让驱动 request 时 EBUSY。SPI 目前 disabled，真要启用
+			 * FSL 时须先删掉那个 hog，把复位权交回驱动。
+			 */
+		};
+	};
+};
+
+&spi_nand {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	partitions: partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		partition@0 {
+			label = "bl2";
+			reg = <0x00000000 0x00020000>;
+			read-only;
+		};
+
+		/* UBI manages every eraseblock after BL2. */
+		partition@20000 {
+			label = "ubi";
+			reg = <0x00020000 0x00000000>;
+			compatible = "linux,ubi";
+
+			volumes {
+				ubi_fip: ubi-volume-fip {
+					/* The second-stage FIP contains BL31 and U-Boot. */
+					volname = "fip";
+				};
+
+				ubi_env: ubi-volume-ubootenv {
+					volname = "ubootenv";
+				};
+
+				ubi_env2: ubi-volume-ubootenv2 {
+					volname = "ubootenv2";
+				};
+
+				ubi_factory: ubi-volume-factory {
+					volname = "factory";
+				};
+
+				ubi_fit: ubi-volume-fit {
+					volname = "fit";
+				};
+			};
+		};
+	};
+};
+
+&ubi_factory {
+	nvmem-layout {
+		compatible = "fixed-layout";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		container_magic: magic@0 {
+			reg = <0x000000 0x000008>;
+		};
+
+		device_serial: device-serial@20 {
+			reg = <0x000020 0x000018>;
+		};
+
+		pon_serial: pon-serial@a2 {
+			reg = <0x0000a2 0x00000c>;
+		};
+
+		base_mac: base-mac@40 {
+			compatible = "mac-base";
+			reg = <0x000040 0x000006>;
+			#nvmem-cell-cells = <1>;
+		};
+
+		eth_base_mac: eth-base-mac@46 {
+			compatible = "mac-base";
+			reg = <0x000046 0x000006>;
+			#nvmem-cell-cells = <1>;
+		};
+
+		oui: oui@4c {
+			reg = <0x00004c 0x000003>;
+		};
+
+		vendor_code: vendor-code@4f {
+			reg = <0x00004f 0x000002>;
+		};
+
+		gpon_password: gpon-password@51 {
+			reg = <0x000051 0x00000a>;
+		};
+
+		internet_mac: internet-mac@60 {
+			reg = <0x000060 0x000006>;
+		};
+
+		tr069_mac: tr069-mac@66 {
+			reg = <0x000066 0x000006>;
+		};
+
+		voip_mac: voip-mac@6c {
+			reg = <0x00006c 0x000006>;
+		};
+
+		priprotocol_mac: priprotocol-mac@72 {
+			reg = <0x000072 0x000006>;
+		};
+
+		wifi_mac_2g4: wifi-mac-2g4@96 {
+			reg = <0x000096 0x000006>;
+		};
+
+		wifi_mac_5g: wifi-mac-5g@9c {
+			reg = <0x00009c 0x000006>;
+		};
+
+		/* MT7993_EEPROM.bin: 1353728 B, stored verbatim, ends at 0x18a800. */
+		vendor_eeprom: eeprom-vendor@40000 {
+			reg = <0x040000 0x14a800>;
+		};
+
+		pon_cal_10ge_asym: calibration-10ge-asym@1a0000 {
+			reg = <0x1a0000 0x000800>;
+		};
+
+		pon_cal_10ge_sym: calibration-10ge-sym@1a1000 {
+			reg = <0x1a1000 0x000800>;
+		};
+
+		pon_cal_xg: calibration-xg@1a2000 {
+			reg = <0x1a2000 0x000800>;
+		};
+
+		pon_cal_xgs: calibration-xgs@1a3000 {
+			reg = <0x1a3000 0x000800>;
+		};
+
+		pon_calibration: calibration@1a4000 {
+			reg = <0x1a4000 0x000800>;
+		};
+
+		pon_cal_olt_downlink: calibration-olt-downlink@1a5000 {
+			reg = <0x1a5000 0x000800>;
+		};
+
+		apd_wtd01: apd-wtd01@1a6000 {
+			reg = <0x1a6000 0x00012a>;
+		};
+
+		apd_ys01: apd-ys01@1a7000 {
+			reg = <0x1a7000 0x00012c>;
+		};
+
+		bosa_info: bosa-info@1a8000 {
+			reg = <0x1a8000 0x0000e6>;
+		};
+
+		bosa_rssi: bosa-rssi@1a9000 {
+			reg = <0x1a9000 0x0000cc>;
+		};
+
+		lan_optic_tx: lan-optic-tx-calib@1aa000 {
+			reg = <0x1aa000 0x000218>;
+		};
+
+		wifi_eeprom: eeprom@1ab000 {
+			/* Exactly 7680 B = the mt76/OpenWrt EEPROM view. The full
+			 * vendor image is 1353728 B (0x14a800) in vendor_eeprom. */
+			reg = <0x1ab000 0x001e00>;
+		};
+	};
+};
+
+&ubi_env {
+	nvmem-layout {
+		compatible = "u-boot,env-redundant-bool";
+	};
+};
+
+&ubi_env2 {
+	nvmem-layout {
+		compatible = "u-boot,env-redundant-bool";
+	};
+};
+
+&usb0 {
+	status = "okay";
+	mediatek,u3p-dis-msk = <0x1>;
+	phys = <&usb0_phy PHY_TYPE_USB2>;
+	vusb33-supply = <&reg_3p3v>;
+};
+
+&usb1 {
+	status = "okay";
+	mediatek,u3p-dis-msk = <0x1>;
+	phys = <&usb1_phy PHY_TYPE_USB2>;
+	vusb33-supply = <&reg_3p3v>;
+};
+
+&npu {
+	status = "okay";
+	firmware-name = "airoha/en7581_MT7996_npu_rv32.bin",
+			"airoha/en7581_MT7996_npu_data.bin";
+};
+
+&eth {
+	status = "okay";
+};
+
+&gdm1 {
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 0>;
+	status = "okay";
+};
+
+&eth_pcs {
+	status = "okay";
+};
+
+&usb_pcs {
+	status = "okay";
+};
+
+&mdio {
+	reset-gpios = <&en7581_pinctrl 30 GPIO_ACTIVE_LOW>;
+	reset-delay-us = <30000>;
+	reset-post-delay-us = <300000>;
+
+	phy_2p5g: ethernet-phy@7 {
+		compatible = "ethernet-phy-ieee802.3-c22";
+		reg = <7>;
+		/* 2 = 纯 2500BASE-X（64B/66B）。本板这颗 PHY 挂的是 USB
+		 * SerDes，usb_pcs 的 TBI_10B 由 priv->phy 决定为 0，即
+		 * 64B/66B；HiSGMII（模式 1/3）是 8B/10B，编码对不上。 */
+		realtek,serdes-option-mode = <2>;
+	};
+};
+
+
+&gdm4 {
+	/delete-property/ pcs-handle;
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	/*
+	 * GDM4 经硬件仲裁器同时接 ETH SerDes 与 USB SerDes，两边各是一个
+	 * netdev。驱动把 ethernet-port 的 reg 直接当作 nbq，并用它把收到
+	 * 的帧分派给对应 netdev（airoha_en7581_get_dev_from_sport）：
+	 *   nbq 0 <- HSGMII_LAN_7581_ETH_SRCPORT -> eth_pcs -> SFP 笼
+	 *   nbq 1 <- HSGMII_LAN_7581_USB_SRCPORT -> usb_pcs -> RTL8221B
+	 * 所以 2.5G 铜口必须挂在 ethernet-port@1，否则它的帧会被投递到
+	 * 另一个 netdev 上。
+	 */
+	sfp_port: ethernet-port@0 {
+		compatible = "airoha,eth-port";
+		reg = <0>;
+		managed = "in-band-status";
+		pcs-handle = <&eth_pcs>;
+		phy-mode = "2500base-x";
+		nvmem-cells = <&eth_base_mac 1>;
+		nvmem-cell-names = "mac-address";
+		openwrt,netdev-name = "sfp0";
+		status = "okay";
+	};
+
+	port_2p5g: ethernet-port@1 {
+		compatible = "airoha,eth-port";
+		reg = <1>;
+		pcs-handle = <&usb_pcs>;
+		phy-handle = <&phy_2p5g>;
+		phy-mode = "2500base-x";
+		nvmem-cells = <&eth_base_mac 2>;
+		nvmem-cell-names = "mac-address";
+		openwrt,netdev-name = "lan1";
+		status = "okay";
+	};
+};
+
+&switch {
+	pinctrl-names = "default";
+	pinctrl-0 = <&mdio_pins>;
+	status = "okay";
+};
+
+&gsw_port1 {
+	label = "lan2";
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 3>;
+	status = "okay";
+};
+
+&gsw_port2 {
+	label = "lan3";
+	/* eth3mac */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 4>;
+	status = "okay";
+};
+
+&gsw_port3 {
+	label = "lan4";
+	/* eth4mac */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 5>;
+	status = "okay";
+};
+
+&gsw_port4 {
+	label = "lan5";
+	/* eth5mac */
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&eth_base_mac 6>;
+	status = "okay";
+};
+
+&gsw_phy1 {
+	interrupts = <1>;
+	status = "okay";
+};
+
+&gsw_phy2 {
+	interrupts = <2>;
+	status = "okay";
+};
+
+&gsw_phy3 {
+	interrupts = <3>;
+	status = "okay";
+};
+
+&gsw_phy4 {
+	interrupts = <4>;
+	status = "okay";
+};
+
+
+&i2c0 {
+	status = "okay";
+	an4475_bosa: optical-front-end@51 {
+		compatible = "fiberhome,hg5x-bosa", "airoha,paged-bosa";
+		reg = <0x51>;
+		fiberhome,ben-active-high;
+		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
+		nvmem-cells = <&pon_calibration>;
+		nvmem-cell-names = "calibration";
+		status = "okay";
+	};
+
+	downstream_bosa: optical-front-end@63 {
+		compatible = "fiberhome,ux3326s";
+		reg = <0x63>;
+	};
+};
+
+/*
+ * i2c1 在本板没有任何器件：只写了 status = "okay"，却从未给 pinctrl-0
+ * （以前的 i2c1_pins 定义了却无人引用），实测 /sys/bus/i2c/devices/i2c-1
+ * 下 client 数为 0，i2c_scl / i2c_sda 两个 pin 也一直是 UNCLAIMED。
+ * 保留只会多注册一条没有引脚的空总线，所以关掉。
+ */
+&i2c1 {
+	status = "disabled";
+};
+
+&pon_pcs {
+	status = "okay";
+};
+
+&xpon_mac {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pon_pins>;
+	optical-front-end = <&an4475_bosa>;
+	nvmem-cells = <&pon_serial>;
+	nvmem-cell-names = "pon-serial";
+	data-path = <&gdm2>;
+	status = "okay";
+};
+
+&gdm2 {
+	nvmem-cell-names = "mac-address";
+	nvmem-cells = <&base_mac 0>;
+	airoha,pon-data-path;
+	status = "okay";
+};
+
+
+&pcie0 {
+	status = "okay";
+	max-link-speed = <2>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie0_rst_pins>;
+
+	pcie@0,0 {
+		reg = <0x0000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+
+		wifi@0,0 {
+			compatible = "mediatek,mt76";
+			reg = <0x0000 0 0 0 0>;
+
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			nvmem-cells = <&wifi_eeprom>;
+			nvmem-cell-names = "eeprom";
+			mediatek,eeprom-merge-otp;
+
+			airoha,npu = <&npu>;
+			airoha,eth = <&eth>;
+
+			band@0 {
+				reg = <0>;
+				nvmem-cells = <&wifi_mac_2g4>;
+				nvmem-cell-names = "mac-address";
+			};
+
+			band@1 {
+				reg = <1>;
+				nvmem-cells = <&wifi_mac_5g>;
+				nvmem-cell-names = "mac-address";
+			};
+		};
+	};
+};
+
+&pcie1 {
+	status = "okay";
+	max-link-speed = <2>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pcie1_rst_pins>;
+
+	pcie@0,0 {
+		reg = <0x0000 0 0 0 0>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+
+		wifi@0,0 {
+			compatible = "mediatek,mt76";
+			reg = <0x0000 0 0 0 0>;
+		};
+	};
+};

@@ -41,6 +41,17 @@ unionman,ung00a)
 	ucidef_set_led_netdev "lan3" "lan3" "mt7530-0:0a:green:lan-3" "lan3" "link tx rx"
 	ucidef_set_led_netdev "lan4" "lan4" "mt7530-0:09:green:lan-4" "lan4" "link tx rx"
 	;;
+fiberhome,an4475-g2)
+	ucidef_set_led_netdev "lan2" "lan2" "green:lan-2" "lan2" "link tx rx"
+	ucidef_set_led_netdev "lan3" "lan3" "green:lan-3" "lan3" "link tx rx"
+	ucidef_set_led_netdev "lan4" "lan4" "green:lan-4" "lan4" "link tx rx"
+	ucidef_set_led_netdev "lan5" "lan5" "green:lan-5" "lan5" "link tx rx"
+	# 面板上的 WLAN / 光信号 / 光纤 / USB 等灯由 luci-app-ledpanel 的 ledpaneld
+	# 统一驱动，这里不再绑 uci 触发器：
+	#  - wlan 绑 netdev 只代表 AP 起来，不是"有终端关联"，且会和 ledpaneld 抢同一颗灯
+	#  - usb1/usb2 写的 usb3-port1 / usb4-port1 在本 SoC 上不存在（只有 usb1/usb2 两条根
+	#    hub），触发器根本没生效，等于把灯交给 ledpaneld 之外再加一层空绑定
+	;;
 fiberhome,hg5585f-ct)
 	# No GE port or USB3.0 LED on this panel.
 	ucidef_set_led_usbport "usb1" "USB 1" "blue:usb-1" "usb3-port1" "usb4-port1"
