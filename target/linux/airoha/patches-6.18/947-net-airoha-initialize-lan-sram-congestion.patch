@@ -1,0 +1,109 @@
+From: HG development <hg@localhost>
+Subject: [PATCH] net: airoha: initialize AN7581 LAN SRAM congestion thresholds
+
+AN7581 enables TX congestion drop without programming dynamic
+thresholds. On XG-040G-MD this leaves channel/queue minima at 22/2 and
+causes hardware forwarding drops for 2.5G ingress bursts to a 1G LAN
+egress, even at a 500Mbps average. Raising only the channel minimum
+removes most drops.
+
+Initialize the complete LAN SRAM threshold profile from the AN7581 SDK,
+including half-sized DEI bounds and dynamic recalculation triggers.
+Limit this to AN7581 QDMA0 with the 16K SRAM descriptor pool for which
+the SDK profile and hardware tests apply. Keep congestion-drop
+protection enabled; preserve unowned control bits and other queue
+scheduling/classification state.
+
+Source: lotusmomo/airoha_sdk@32b5aa356c2406edef8806aaf75451ff0a5286f2,
+private/qdma/qdma_lan/{qdma_dev_7581.h,qdma_dev.c,qdma_api.c}.
+
+Signed-off-by: HG development <hg@localhost>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1735,6 +1735,54 @@
+ 				 REG_LMGR_INIT_CFG);
+ }
+ 
++static void airoha_qdma_init_lan_sram_congestion(struct airoha_qdma *qdma)
++{
++	static const struct {
++		u32 normal_reg;
++		u32 dei_reg;
++		u16 max;
++		u16 min;
++	} thresholds[] = {
++		{ REG_TXQ_DYN_TOTAL_THR, REG_TXQ_DEI_TOTAL_THR, 0x3ff0, 0x3f00 },
++		{ REG_TXQ_DYN_CHAN_THR, REG_TXQ_DEI_CHAN_THR, 0x3ff0, 0x0400 },
++		{ REG_TXQ_DYN_QUEUE_THR, REG_TXQ_DEI_QUEUE_THR, 0x2000, 0x0020 },
++	};
++	u32 cfg, mask;
++	int i;
++
++	/* These are the AN7581 SDK LAN defaults for the 16K SRAM pool. */
++	if (!airoha_is_7581(qdma->eth) || qdma != &qdma->eth->qdma[0])
++		return;
++
++	cfg = airoha_qdma_rr(qdma, REG_LMGR_INIT_CFG);
++	mask = LMGR_SRAM_MODE_MASK | HW_FWD_DESC_NUM_MASK;
++	if ((cfg & mask) != (LMGR_SRAM_MODE_MASK |
++			    FIELD_PREP(HW_FWD_DESC_NUM_MASK, 0x4000)))
++		return;
++
++	/* Small inherited channel thresholds drop 2.5G-to-1G bursts early.
++	 * Program the matching total/channel/queue bounds together, including
++	 * the SDK's separate DEI bounds at half the normal values.
++	 */
++	for (i = 0; i < ARRAY_SIZE(thresholds); i++) {
++		airoha_qdma_wr(qdma, thresholds[i].normal_reg,
++			       FIELD_PREP(TXQ_CNGST_MAX_THR_MASK, thresholds[i].max) |
++			       FIELD_PREP(TXQ_CNGST_MIN_THR_MASK, thresholds[i].min));
++		airoha_qdma_wr(qdma, thresholds[i].dei_reg,
++			       FIELD_PREP(TXQ_CNGST_MAX_THR_MASK, thresholds[i].max >> 1) |
++			       FIELD_PREP(TXQ_CNGST_MIN_THR_MASK, thresholds[i].min >> 1));
++	}
++
++	/* Recalculate on configuration, packet arrival and every 250 us. */
++	mask = TXQ_CNGST_DYN_EN | TXQ_CNGST_CFG_TRIGGER |
++	       TXQ_CNGST_PACKET_TRIGGER | TXQ_CNGST_TIME_TRIGGER |
++	       TXQ_CNGST_TICKSEL_MASK;
++	cfg = TXQ_CNGST_DYN_EN | TXQ_CNGST_CFG_TRIGGER |
++	      TXQ_CNGST_PACKET_TRIGGER | TXQ_CNGST_TIME_TRIGGER |
++	      FIELD_PREP(TXQ_CNGST_TICKSEL_MASK, 250);
++	airoha_qdma_rmw(qdma, REG_TXQ_CNGST_CFG, mask, cfg);
++}
++
+ static void airoha_qdma_init_qos(struct airoha_qdma *qdma)
+ {
+ 	airoha_qdma_clear(qdma, REG_TXWRR_MODE_CFG, TWRR_WEIGHT_SCALE_MASK);
+@@ -1892,6 +1940,7 @@
+ 		       FIELD_PREP(GLOBAL_CFG_MAX_ISSUE_NUM_MASK, 2));
+ 
+ 	airoha_qdma_init_qos(qdma);
++	airoha_qdma_init_lan_sram_congestion(qdma);
+ 
+ 	/* disable qdma rx delay interrupt */
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -864,6 +864,20 @@
+ #define REG_TXQ_CNGST_CFG		0x10a0
+ #define TXQ_CNGST_DROP_EN		BIT(31)
+ #define TXQ_CNGST_DEI_DROP_EN		BIT(30)
++#define TXQ_CNGST_DYN_EN		BIT(29)
++#define TXQ_CNGST_CFG_TRIGGER		BIT(18)
++#define TXQ_CNGST_PACKET_TRIGGER	BIT(17)
++#define TXQ_CNGST_TIME_TRIGGER		BIT(16)
++#define TXQ_CNGST_TICKSEL_MASK		GENMASK(15, 0)
++
++#define REG_TXQ_DYN_TOTAL_THR		0x10a4
++#define REG_TXQ_DYN_CHAN_THR		0x10a8
++#define REG_TXQ_DYN_QUEUE_THR		0x10ac
++#define REG_TXQ_DEI_TOTAL_THR		0x10d4
++#define REG_TXQ_DEI_CHAN_THR		0x10d8
++#define REG_TXQ_DEI_QUEUE_THR		0x10dc
++#define TXQ_CNGST_MAX_THR_MASK		GENMASK(31, 16)
++#define TXQ_CNGST_MIN_THR_MASK		GENMASK(15, 0)
+ 
+ #define REG_SLA_TRTCM_CFG		0x1150
+ #define SLA_TRTCM_EN_MASK		BIT(31)

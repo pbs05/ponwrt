@@ -1,0 +1,83 @@
+From: HG development <hg@localhost>
+Subject: [PATCH] net: airoha: initialize AN7581 WAN SRAM congestion thresholds
+
+The LAN SRAM congestion repair intentionally excludes WAN QDMA1. On
+XG-040G-MD the WAN block also uses a 16K SRAM descriptor pool, but keeps
+inherited normal total/channel/queue bounds of 0xffff/704, 0xffff/22
+and 0xffff/2, with identical DEI bounds.
+
+Initialize QDMA1 with the distinct AN7581 SDK WAN SRAM profile and its
+half-sized DEI bounds. Program configuration/packet/time recalculation
+with the SDK's 250 us interval, preserving unowned control fields and
+the existing congestion-drop protection. Keep other chips, descriptor
+storage modes and pool sizes unchanged. The LAN helper is untouched.
+
+Source: lotusmomo/airoha_sdk@32b5aa356c2406edef8806aaf75451ff0a5286f2,
+private/qdma/qdma_lan/{qdma_dev_7581.h,qdma_dev.c,qdma_api.c}.
+
+Signed-off-by: HG development <hg@localhost>
+---
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1783,6 +1783,53 @@
+ 	airoha_qdma_rmw(qdma, REG_TXQ_CNGST_CFG, mask, cfg);
+ }
+ 
++static void airoha_qdma_init_wan_sram_congestion(struct airoha_qdma *qdma)
++{
++	static const struct {
++		u32 normal_reg;
++		u32 dei_reg;
++		u16 max;
++		u16 min;
++	} thresholds[] = {
++		{ REG_TXQ_DYN_TOTAL_THR, REG_TXQ_DEI_TOTAL_THR, 0x3999, 0x2e00 },
++		{ REG_TXQ_DYN_CHAN_THR, REG_TXQ_DEI_CHAN_THR, 0x3999, 0x0400 },
++		{ REG_TXQ_DYN_QUEUE_THR, REG_TXQ_DEI_QUEUE_THR, 0x2000, 0x0020 },
++	};
++	u32 cfg, mask;
++	int i;
++
++	/* These are the AN7581 SDK WAN defaults for the 16K SRAM pool. */
++	if (!airoha_is_7581(qdma->eth) || qdma != &qdma->eth->qdma[1])
++		return;
++
++	cfg = airoha_qdma_rr(qdma, REG_LMGR_INIT_CFG);
++	mask = LMGR_SRAM_MODE_MASK | HW_FWD_DESC_NUM_MASK;
++	if ((cfg & mask) != (LMGR_SRAM_MODE_MASK |
++			    FIELD_PREP(HW_FWD_DESC_NUM_MASK, 0x4000)))
++		return;
++
++	/* WAN has its own total/channel limits; do not reuse the LAN profile.
++	 * The SDK initializes DEI bounds to half the normal values, rounded down.
++	 */
++	for (i = 0; i < ARRAY_SIZE(thresholds); i++) {
++		airoha_qdma_wr(qdma, thresholds[i].normal_reg,
++			       FIELD_PREP(TXQ_CNGST_MAX_THR_MASK, thresholds[i].max) |
++			       FIELD_PREP(TXQ_CNGST_MIN_THR_MASK, thresholds[i].min));
++		airoha_qdma_wr(qdma, thresholds[i].dei_reg,
++			       FIELD_PREP(TXQ_CNGST_MAX_THR_MASK, thresholds[i].max >> 1) |
++			       FIELD_PREP(TXQ_CNGST_MIN_THR_MASK, thresholds[i].min >> 1));
++	}
++
++	/* Recalculate on configuration, packet arrival and every 250 us. */
++	mask = TXQ_CNGST_DYN_EN | TXQ_CNGST_CFG_TRIGGER |
++	       TXQ_CNGST_PACKET_TRIGGER | TXQ_CNGST_TIME_TRIGGER |
++	       TXQ_CNGST_TICKSEL_MASK;
++	cfg = TXQ_CNGST_DYN_EN | TXQ_CNGST_CFG_TRIGGER |
++	      TXQ_CNGST_PACKET_TRIGGER | TXQ_CNGST_TIME_TRIGGER |
++	      FIELD_PREP(TXQ_CNGST_TICKSEL_MASK, 250);
++	airoha_qdma_rmw(qdma, REG_TXQ_CNGST_CFG, mask, cfg);
++}
++
+ static void airoha_qdma_init_qos(struct airoha_qdma *qdma)
+ {
+ 	airoha_qdma_clear(qdma, REG_TXWRR_MODE_CFG, TWRR_WEIGHT_SCALE_MASK);
+@@ -1941,6 +1988,7 @@
+ 
+ 	airoha_qdma_init_qos(qdma);
+ 	airoha_qdma_init_lan_sram_congestion(qdma);
++	airoha_qdma_init_wan_sram_congestion(qdma);
+ 
+ 	/* disable qdma rx delay interrupt */
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
