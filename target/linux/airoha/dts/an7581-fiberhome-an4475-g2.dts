@@ -335,12 +335,7 @@
 			spi-max-frequency = <20000000>;
 			spi-cpol;
 			spi-cpha;
-			/*
-			 * 复位脚 gpio4 由 pinctrl 下的 fsl_reset_hog 以 output-high
-			 * （ACTIVE_LOW，即释放复位）常驻持有；这里再写 reset-gpios
-			 * 会让驱动 request 时 EBUSY。SPI 目前 disabled，真要启用
-			 * FSL 时须先删掉那个 hog，把复位权交回驱动。
-			 */
+			/* GPIO4 releases reset while the downstream PON controller is inactive. */
 		};
 	};
 };
@@ -463,19 +458,7 @@
 			reg = <0x040000 0x14a800>;
 		};
 
-		/* 上行 PON 校准（ONT / UX3363，APONCAL 格式）
-		 * 5 个固定槽，偏移 = 0x1a0000 + 槽号*0x1000，每槽前 0x800 有效：
-		 *   0x1a0000  10ge_asym_table | 10G-EPON 非对称(10G下/1G上)
-		 *   0x1a1000  10ge_sym_table  | 10G-EPON 对称（与 0x1a4000 逐字节相同）
-		 *   0x1a2000  xg_table        | XG-PON(10G下/2.5G上)
-		 *   0x1a3000  xgs_table       | XGS-PON 10G 对称（与 0x1a4000 逐字节相同）
-		 *   0x1a4000  table           | 通用/XGS/10G-EPON 对称复用 
-		 * 【启用哪一个】只改下面节点的 reg 起始地址，并把节点名 @地址
-		 * 改成同一个值（两者不一致 dtc 会报 unit address 与 reg 不匹配）。
-		 * label 与 &an4475_bosa 都不用动；其 nvmem-cell-names 必须恒为
-		 * "calibration"（驱动 devm_nvmem_cell_get(dev,"calibration") 精确匹配）。
-		 * 例：改用 XG-PON 表 -> calibration@1a2000 / reg = <0x1a2000 0x000800>
-		 * 校准在 probe 时一次性读入，换表必须重编 DTB 并重启，不能开机热切。 */
+		/* The tested XG-PON calibration occupies the third 4 KiB APONCAL slot. */
 
 		pon_calibration: calibration@1a2000 {
 			reg = <0x1a2000 0x000800>;
@@ -571,9 +554,7 @@
 	phy_2p5g: ethernet-phy@7 {
 		compatible = "ethernet-phy-ieee802.3-c22";
 		reg = <7>;
-		/* 2 = 纯 2500BASE-X（64B/66B）。本板这颗 PHY 挂的是 USB
-		 * SerDes，usb_pcs 的 TBI_10B 由 priv->phy 决定为 0，即
-		 * 64B/66B；HiSGMII（模式 1/3）是 8B/10B，编码对不上。 */
+		/* The USB SerDes uses 2500BASE-X with 64B/66B encoding. */
 		realtek,serdes-option-mode = <2>;
 	};
 };
@@ -585,14 +566,7 @@
 	#size-cells = <0>;
 	status = "okay";
 
-	/*
-	 * GDM4 经硬件仲裁器同时接 ETH SerDes 与 USB SerDes，两边各是一个
-	 * netdev。驱动把 ethernet-port 的 reg 直接当作 nbq，并用它把收到
-	 * 的帧分派给对应 netdev（airoha_en7581_get_dev_from_sport）：
-	 *   nbq 0 <- HSGMII_LAN_7581_ETH_SRCPORT -> eth_pcs -> FSL FTTR 下行 NNI（原厂 eth5）
-	 *   nbq 1 <- HSGMII_LAN_7581_USB_SRCPORT -> usb_pcs -> 2.5G Combo（原厂 eth4，默认铜口）
-	 * 所以 2.5G 铜口必须挂在 ethernet-port@1，FTTR 下行 NNI 挂在 ethernet-port@0。
-	 */
+	/* NBQ0 routes eth_pcs to the FTTR NNI; NBQ1 routes usb_pcs to the combo port. */
 	fttr_port: ethernet-port@0 {
 		compatible = "airoha,eth-port";
 		reg = <0>;
@@ -688,7 +662,7 @@
 		fiberhome,ben-active-high;
 		tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
 		nvmem-cells = <&pon_calibration>;
-		nvmem-cell-names = "calibration";	
+		nvmem-cell-names = "calibration";
 		status = "okay";
 	};
 
@@ -698,12 +672,7 @@
 	};
 };
 
-/*
- * i2c1 在本板没有任何器件：只写了 status = "okay"，却从未给 pinctrl-0
- * （以前的 i2c1_pins 定义了却无人引用），实测 /sys/bus/i2c/devices/i2c-1
- * 下 client 数为 0，i2c_scl / i2c_sda 两个 pin 也一直是 UNCLAIMED。
- * 保留只会多注册一条没有引脚的空总线，所以关掉。
- */
+/* The vendor board map leaves I2C1 unconnected. */
 &i2c1 {
 	status = "disabled";
 };
