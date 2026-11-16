@@ -4,5 +4,5 @@ START=99
 
 boot()
 {
-	[ -x /usr/libexec/mt7916-cpu-affinity.sh ] && /usr/libexec/mt7916-cpu-affinity.sh
+	/usr/libexec/mt7916-cpu-affinity.sh
 }

@@ -11,10 +11,8 @@ fiberhome,hg5585f-cu-usb-sfp)
 		set network.globals.packet_steering='0'
 		commit network
 	EOF
-	if [ -x /etc/init.d/packet_steering ]; then
-		/etc/init.d/packet_steering disable 2>/dev/null || true
-		/etc/init.d/packet_steering stop 2>/dev/null || true
-	fi
+	/etc/init.d/packet_steering disable
+	/etc/init.d/packet_steering stop
 	;;
 esac
 
