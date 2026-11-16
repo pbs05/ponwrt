@@ -440,3 +440,44 @@ define Device/nokia_xg-040g-tf-ubi
   DEVICE_PACKAGES += fitblk
 endef
 TARGET_DEVICES += nokia_xg-040g-tf-ubi
+
+# FiberHome AN4475-G2: 10G xPON uplink plus FTTR downstream, 512 MiB
+# SPI-NAND, MT7990AN/MT7976CN Wi-Fi 7 (PCI 14c3:7993 / 14c3:799b), one
+# 2.5G combo port and four GSW GE ports. The factory UBI volume MUST be
+# 2 MiB: the AN4-2MiB container holds the 1.29 MiB vendor EEPROM at
+# 0x40000, eleven PON calibration slots at 0x1a0000 and the 7680-byte
+# mt76 EEPROM at 0x1ab000. See base-files/etc/board.d/03_pon_data.
+define Device/fiberhome_an4475-g2
+  $(call Device/FitImageLzma)
+  DEVICE_VENDOR := FiberHome
+  DEVICE_MODEL := AN4475-G2
+  DEVICE_DTS := an7581-fiberhome-an4475-g2
+  KERNEL_LOADADDR := 0x8a000000
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  UBOOTENV_IN_UBI := 1
+  KERNEL_IN_UBI := 1
+  KERNEL := kernel-bin | gzip
+  KERNEL_INITRAMFS := kernel-bin | lzma | \
+	fit lzma $$(KDIR)/image-$$(DEVICE_DTS).dtb with-initrd | pad-to 128k
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  IMAGES := sysupgrade.itb
+  IMAGE/sysupgrade.itb := append-kernel | \
+	fit gzip $$(KDIR)/image-$$(DEVICE_DTS).dtb external-static-with-rootfs | \
+	append-metadata
+  SUPPORTED_DEVICES += fiberhome,an4475-g2
+  # MT7990AN uses the mt7990 firmware set (WA/DSP are empty for 7993/799b).
+  # Both 2.5G PHY drivers are kept until the combo port copper PHY ID is
+  # confirmed on hardware; the DTS currently describes 001c.c849.
+  # The board LED expander is a PCA9555 on a bit-banged I2C bus
+  # (GPIO28/GPIO29, see the i2c-gpio node in the DTS); without these three
+  # modules the bus is described but never registered and the expander
+  # LEDs stay dark.
+  DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio \
+	kmod-i2c-gpio kmod-i2c-algo-bit kmod-gpio-pca953x \
+	kmod-phy-realtek kmod-phy-motorcomm kmod-usb3 \
+	kmod-airoha-paged-bosa kmod-airoha-xpon airoha-ponctl airoha-pond \
+	wpad-openssl \
+	fitblk nand-utils ubi-utils
+endef
+TARGET_DEVICES += fiberhome_an4475-g2

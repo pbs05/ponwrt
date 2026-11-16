@@ -40,6 +40,12 @@ znxt,zn504xg-d|znxt,zn515xg-d|unionman,ung00a)
 h3c,hm2004-du)
 	pon_data_target factory ubi 1048576
 	;;
+# AN4-2MiB container: 1.29 MiB vendor EEPROM @0x40000, eleven PON
+# calibration slots @0x1a0000 and the 7680-byte mt76 EEPROM @0x1ab000.
+# A 1 MiB volume truncates the container.
+fiberhome,an4475-g2)
+	pon_data_target factory ubi 2097152
+	;;
 gemtek,xg2010g)
 	pon_data_target factory ubi 2097152
 	;;
@@ -93,6 +99,20 @@ h3c,hm2004-du)
 	json_add_object fields
 	# Device SN, plain ASCII (H3CT0005EBF0) at 0x60 of the compact layout.
 	identity_field pon_sn pon-sn 96 12 pon-ascii12
+	json_close_object
+	json_close_object
+	json_close_object
+	json_close_object
+	;;
+fiberhome,an4475-g2)
+	identity_available=1
+	json_add_object identity
+	json_add_object targets
+	json_add_object factory
+	json_add_object fields
+	identity_field pon_sn pon-sn 162 12 pon-ascii12
+	identity_field pon_mac mac 64 6 mac-binary6
+	identity_field lan_base_mac mac 70 6 mac-binary6
 	json_close_object
 	json_close_object
 	json_close_object

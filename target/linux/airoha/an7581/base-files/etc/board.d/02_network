@@ -55,6 +55,12 @@ an7581_setup_interfaces()
 				;;
 		esac
 		;;
+	fiberhome,an4475-g2)
+	# One 2.5G combo port (lan1) plus four GSW GE ports (lan2..lan5);
+	# xPON is the uplink. The downstream FTTR port (fttr0) is left out
+	# of the LAN bridge until its role is confirmed on hardware.
+	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4 lan5" "pon0"
+	;;
 	unionman,ung00a)
 		# The board exposes one 2.5G and three 1G ports with PON as the uplink.
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "pon0"

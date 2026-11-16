@@ -33,6 +33,7 @@ platform_check_image() {
 
 	case "$board" in
 	gemtek,xg2010g|\
+	fiberhome,an4475-g2|\
 	fiberhome,hg5382a|\
 	fiberhome,hg5585f-ct|\
 	fiberhome,hg5585f-cu|\
@@ -60,6 +61,7 @@ platform_do_upgrade() {
 			fit_do_upgrade "$1"
 			;;
 		gemtek,xg2010g|\
+		fiberhome,an4475-g2|\
 		fiberhome,hg5382a|\
 		fiberhome,hg5585f-ct|\
 		fiberhome,hg5585f-cu|\
