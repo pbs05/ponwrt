@@ -1,0 +1,353 @@
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Subject: [PATCH] net: airoha: map Linux priority bands and validate fixed ETS mappings
+
+Export the retained AN7581 priority/ETS policy on current PonWrt.
+Use the current AIROHA_DEV_F_TX_QOS bit index via test_bit(), and keep
+ETS ownership under RTNL. This is an intentional default queue policy,
+not a claim of an upstream-confirmed universal Linux priority bug.
+
+---
+diff --git a/drivers/net/ethernet/airoha/Kconfig b/drivers/net/ethernet/airoha/Kconfig
+index 5c54a07..df76a93 100644
+--- a/drivers/net/ethernet/airoha/Kconfig
++++ b/drivers/net/ethernet/airoha/Kconfig
+@@ -5,6 +5,13 @@ config NET_VENDOR_AIROHA
+ 	help
+ 	  If you have a Airoha SoC with ethernet, say Y.
+ 
++config NET_AIROHA_PRIORITY_KUNIT_TEST
++	tristate "Airoha priority mapping tests" if !KUNIT_ALL_TESTS
++	depends on NET_VENDOR_AIROHA && KUNIT && INET
++	default KUNIT_ALL_TESTS
++	help
++	  Test traditional priority mapping and fixed-map ETS validation.
++
+ if NET_VENDOR_AIROHA
+ 
+ config NET_AIROHA_NPU
+diff --git a/drivers/net/ethernet/airoha/Makefile b/drivers/net/ethernet/airoha/Makefile
+index 9446805..fdc3705 100644
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -3,6 +3,8 @@
+ # Airoha for the Mediatek SoCs built-in ethernet macs
+ #
+ 
++obj-$(CONFIG_NET_AIROHA_PRIORITY_KUNIT_TEST) += airoha_priority_test.o
++
+ obj-$(CONFIG_NET_AIROHA) += airoha-eth.o
+ airoha-eth-y := airoha_eth.o airoha_ppe.o
+ airoha-eth-$(CONFIG_DEBUG_FS) += airoha_ppe_debugfs.o
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 936f136..c33b85e 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2753,7 +2753,8 @@ static u16 airoha_dev_select_queue(struct net_device *netdev,
+ 	 */
+ 	channel = netdev_uses_dsa(netdev) ? skb_get_queue_mapping(skb) : port->id;
+ 	channel = channel % AIROHA_NUM_QOS_CHANNELS;
+-	queue = skb->priority % AIROHA_NUM_QOS_QUEUES;
++	queue = airoha_is_7581(dev->eth) ? airoha_priority_queue(skb->priority) :
++		skb->priority % AIROHA_NUM_QOS_QUEUES;
+ 	queue = channel * AIROHA_NUM_QOS_QUEUES + queue;
+ 
+ 	return queue < netdev->num_tx_queues ? queue : 0;
+@@ -3328,6 +3329,17 @@ static int airoha_qdma_set_tx_ets_sched(struct net_device *dev, int channel,
+ 	u16 w[AIROHA_NUM_QOS_QUEUES] = {};
+ 	int i, nstrict = 0;
+ 
++	if (airoha_is_7581(((struct airoha_gdm_dev *)netdev_priv(dev))->eth)) {
++		u8 hw_mode;
++		int err;
++
++		err = airoha_priority_ets(p, w, &hw_mode);
++		if (err)
++			return err;
++		return airoha_qdma_set_chan_tx_sched(dev, channel, hw_mode, w,
++						     ARRAY_SIZE(w));
++	}
++
+ 	if (p->bands > AIROHA_NUM_QOS_QUEUES)
+ 		return -EINVAL;
+ 
+@@ -3389,7 +3401,7 @@ static int airoha_qdma_get_tx_ets_stats(struct net_device *netdev, int channel,
+ 	return 0;
+ }
+ 
+-static int airoha_tc_setup_qdisc_ets(struct net_device *dev,
++static int airoha_tc_setup_qdisc_ets_legacy(struct net_device *dev,
+ 				     struct tc_ets_qopt_offload *opt)
+ {
+ 	int channel;
+@@ -3412,6 +3424,75 @@ static int airoha_tc_setup_qdisc_ets(struct net_device *dev,
+ 	}
+ }
+ 
++static int airoha_ets_restore(struct net_device *netdev, int channel,
++			      struct airoha_ets_owner *owner)
++{
++	int err = airoha_qdma_set_tx_prio_sched(netdev, channel);
++
++	if (err) {
++		owner->broken = true;
++		netdev_err(netdev, "ETS channel %d SP restore failed: %d\n", channel, err);
++	} else {
++		memset(owner, 0, sizeof(*owner));
++	}
++	return err;
++}
++
++static int airoha_tc_setup_qdisc_ets(struct net_device *netdev,
++				     struct tc_ets_qopt_offload *opt)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_ets_owner *owner;
++	struct airoha_qdma *qdma;
++	u16 weights[8];
++	u8 mode;
++	int channel, err;
++
++	if (!airoha_is_7581(dev->eth))
++		return airoha_tc_setup_qdisc_ets_legacy(netdev, opt);
++	ASSERT_RTNL();
++	if (opt->parent == TC_H_ROOT)
++		return -EINVAL;
++	channel = TC_H_MIN(opt->parent) % AIROHA_NUM_QOS_CHANNELS;
++	qdma = airoha_qdma_deref(dev);
++	owner = &qdma->ets_owner[channel];
++	if (owner->netdev &&
++	    (owner->netdev != netdev || owner->handle != opt->handle))
++		return -EBUSY;
++
++	switch (opt->command) {
++	case TC_ETS_REPLACE:
++		if (test_bit(AIROHA_DEV_F_TX_QOS, &dev->flags) ||
++		    test_bit(channel, qdma->qos_channel_map))
++			return -EBUSY;
++		err = airoha_priority_ets(&opt->replace_params, weights, &mode);
++		if (err) {
++			/* ETS core may retain its software qdisc despite this error. */
++			if (owner->netdev && airoha_ets_restore(netdev, channel, owner))
++				return -EIO;
++			netdev_warn(netdev, "ETS hardware offload rejected: use eight bands and the fixed priority map\n");
++			return err;
++		}
++		owner->netdev = netdev;
++		owner->handle = opt->handle;
++		err = airoha_qdma_set_tx_ets_sched(netdev, channel, opt);
++		if (err) {
++			airoha_ets_restore(netdev, channel, owner);
++			return err;
++		}
++		owner->broken = false;
++		return 0;
++	case TC_ETS_DESTROY:
++		return owner->netdev ? airoha_ets_restore(netdev, channel, owner) : 0;
++	case TC_ETS_STATS:
++		if (!owner->netdev || owner->broken)
++			return -EOPNOTSUPP;
++		return airoha_qdma_get_tx_ets_stats(netdev, channel, opt);
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static int airoha_qdma_get_rl_param(struct airoha_qdma *qdma, int queue_id,
+ 				    u32 addr, enum trtcm_param_type param,
+ 				    u32 *val_low, u32 *val_high)
+@@ -4080,8 +4161,16 @@ static int airoha_tc_setup_qdisc_htb(struct net_device *netdev,
+ 	switch (opt->command) {
+ 	case TC_HTB_CREATE: {
+ 		struct airoha_gdm_dev *dev = netdev_priv(netdev);
+-		int err;
++		struct airoha_qdma *qdma = airoha_qdma_deref(dev);
++		int err, i;
+ 
++		/* HTB can migrate this GDM to another QDMA domain. */
++		for (i = 0; i < AIROHA_NUM_QOS_CHANNELS; i++) {
++			if (qdma->ets_owner[i].netdev != netdev)
++				continue;
++			NL_SET_ERR_MSG_MOD(opt->extack, "remove this device's ETS offload before HTB");
++			return -EBUSY;
++		}
+ 		err = airoha_enable_qos_for_gdm34(netdev, opt->extack);
+ 		if (err)
+ 			return err;
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index fddbe36..8d65444 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -15,6 +15,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/reset.h>
+ #include <linux/soc/airoha/airoha_offload.h>
++#include <net/airoha_priority.h>
+ #include <net/dsa.h>
+ 
+ #define AIROHA_MAX_NUM_GDM_PORTS	4
+@@ -605,6 +606,13 @@ struct airoha_irq_bank {
+ 	int irq;
+ };
+ 
++/* Protected by RTNL; no packet-path lookup or dynamic queue remapping. */
++struct airoha_ets_owner {
++	struct net_device *netdev;
++	u32 handle;
++	bool broken;
++};
++
+ struct airoha_qdma {
+ 	struct airoha_eth *eth;
+ 	void __iomem *regs;
+@@ -619,6 +627,7 @@ struct airoha_qdma {
+ 	struct airoha_queue q_rx[AIROHA_NUM_RX_RING];
+ 
+ 	DECLARE_BITMAP(qos_channel_map, AIROHA_NUM_QOS_CHANNELS);
++	struct airoha_ets_owner ets_owner[AIROHA_NUM_QOS_CHANNELS];
+ };
+ 
+ enum airoha_dev_flags {
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 068d94a..d918fc4 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -491,7 +491,8 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 				channel %= AIROHA_NUM_QOS_CHANNELS;
+ 			}
+ 			priority = rt_tos2priority(dsfield);
+-			priority = priority % AIROHA_NUM_QOS_QUEUES;
++			priority = airoha_is_7581(eth) ? airoha_priority_queue(priority) :
++				priority % AIROHA_NUM_QOS_QUEUES;
+ 			qdata |= FIELD_PREP(AIROHA_FOE_CHANNEL, channel) |
+ 				 FIELD_PREP(AIROHA_FOE_QID, priority);
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_priority_test.c b/drivers/net/ethernet/airoha/airoha_priority_test.c
+new file mode 100644
+index 0000000..a114889
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_priority_test.c
+@@ -0,0 +1,69 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <kunit/test.h>
++#include <net/airoha_priority.h>
++
++static void priority_map_test(struct kunit *test)
++{
++	static const u8 expected[] = {4, 0, 0, 0, 4, 0, 7, 7,
++				     4, 4, 4, 4, 4, 4, 4, 4};
++	unsigned int p;
++
++	for (p = 0; p < ARRAY_SIZE(expected); p++) {
++		KUNIT_EXPECT_EQ(test, airoha_priority_queue(p), expected[p]);
++		KUNIT_EXPECT_EQ(test, airoha_priority_queue(p + 16), expected[p]);
++		KUNIT_EXPECT_EQ(test, airoha_priority_queue(0x10000 | p), 4);
++	}
++	KUNIT_EXPECT_LT(test, airoha_priority_queue(TC_PRIO_BULK),
++			airoha_priority_queue(TC_PRIO_BESTEFFORT));
++	KUNIT_EXPECT_EQ(test, airoha_priority_queue(U32_MAX), 4);
++}
++
++static void priority_ets_test(struct kunit *test)
++{
++	struct tc_ets_qopt_offload_replace_params p = { .bands = 8 };
++	u16 weights[8];
++	u8 mode;
++	int s, i;
++
++	for (s = 0; s <= 8; s++) {
++		for (i = 0; i < 8; i++) {
++			p.quanta[i] = i < s ? 0 : 100;
++			p.weights[i] = i + 1;
++		}
++		for (i = 0; i <= TC_PRIO_MAX; i++) {
++			u8 q = airoha_priority_queue(i);
++
++			p.priomap[i] = q >= 8 - s ? 7 - q : s + q;
++		}
++		if (s == 7) {
++			KUNIT_EXPECT_EQ(test, airoha_priority_ets(&p, weights, &mode),
++					-EOPNOTSUPP);
++			continue;
++		}
++		KUNIT_ASSERT_EQ(test, airoha_priority_ets(&p, weights, &mode), 0);
++		KUNIT_EXPECT_EQ(test, mode, s == 8 ? 1 : s ? s + 1 : 0);
++		for (i = 0; i < 8; i++)
++			KUNIT_EXPECT_EQ(test, weights[i], i < 8 - s ? s + i + 1 : 0);
++		/* Check all 16 slots, including priorities above the eight queues. */
++		for (i = 0; i <= TC_PRIO_MAX; i++) {
++			p.priomap[i] ^= 1;
++			KUNIT_EXPECT_EQ(test, airoha_priority_ets(&p, weights, &mode),
++					-EOPNOTSUPP);
++			p.priomap[i] ^= 1;
++		}
++	}
++	p.bands = 3;
++	KUNIT_EXPECT_EQ(test, airoha_priority_ets(&p, weights, &mode), -EOPNOTSUPP);
++	p.bands = 8;
++	p.quanta[0] = 100;
++	KUNIT_EXPECT_EQ(test, airoha_priority_ets(&p, weights, &mode), -EINVAL);
++}
++
++static struct kunit_case cases[] = {
++	KUNIT_CASE(priority_map_test),
++	KUNIT_CASE(priority_ets_test),
++	{}
++};
++static struct kunit_suite suite = { .name = "airoha-priority", .test_cases = cases };
++kunit_test_suite(suite);
++MODULE_LICENSE("GPL");
+diff --git a/include/net/airoha_priority.h b/include/net/airoha_priority.h
+new file mode 100644
+index 0000000..c6e127d
+--- /dev/null
++++ b/include/net/airoha_priority.h
+@@ -0,0 +1,49 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NET_AIROHA_PRIORITY_H
++#define _NET_AIROHA_PRIORITY_H
++
++#include <net/pkt_cls.h>
++
++/* Linux PRIO bands 2/1/0 expressed as AN7581 SP queues 0/4/7. */
++static const u8 airoha_priority_map[TC_PRIO_MAX + 1] = {
++	4, 0, 0, 0, 4, 0, 7, 7, 4, 4, 4, 4, 4, 4, 4, 4,
++};
++
++static inline u8 airoha_priority_queue(u32 priority)
++{
++	/* Class handles belong to the software qdisc, not a hardware queue. */
++	if (TC_H_MAJ(priority))
++		priority = TC_PRIO_BESTEFFORT;
++	return airoha_priority_map[priority & TC_PRIO_MAX];
++}
++
++/* No hardware writes until the entire fixed-map request has been checked. */
++static inline int
++airoha_priority_ets(const struct tc_ets_qopt_offload_replace_params *p,
++		    u16 weights[8], u8 *mode)
++{
++	unsigned int i, strict = 0;
++
++	if (p->bands != 8)
++		return -EOPNOTSUPP;
++	while (strict < 8 && !p->quanta[strict])
++		strict++;
++	if (strict == 7)
++		return -EOPNOTSUPP;
++	for (i = strict; i < 8; i++)
++		if (!p->quanta[i])
++			return -EINVAL;
++	for (i = 0; i <= TC_PRIO_MAX; i++) {
++		u8 queue = airoha_priority_queue(i);
++		u8 band = queue >= 8 - strict ? 7 - queue : strict + queue;
++
++		if (p->priomap[i] != band)
++			return -EOPNOTSUPP;
++	}
++	for (i = 0; i < 8; i++)
++		weights[i] = i < 8 - strict ? p->weights[strict + i] : 0;
++	/* Hardware modes: WRR8=0, SP=1, WRR7..WRR2=2..7. */
++	*mode = strict == 8 ? 1 : strict ? strict + 1 : 0;
++	return 0;
++}
++#endif
