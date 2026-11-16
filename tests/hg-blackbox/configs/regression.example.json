@@ -1,0 +1,49 @@
+{
+  "hg": {
+    "ssh": "hg-test-hg"
+  },
+  "win": {
+    "ssh": "hg-test-win"
+  },
+  "fnos": {
+    "ssh": "hg-test-fnos"
+  },
+  "win_ip": "192.0.2.2",
+  "fnos_ip": "192.0.2.3",
+  "hg_ip": "192.0.2.1",
+  "test_vip": "198.19.255.3",
+  "input_device": "lan1",
+  "output_device": "lan4",
+  "fnos_device": "eth0",
+  "egress_mbps": 1000,
+  "fnos_dscp": 8,
+  "tiers": [
+    {
+      "name": "normal",
+      "dscp": 7,
+      "priority": 4,
+      "port": 45101
+    },
+    {
+      "name": "proxy",
+      "dscp": 3,
+      "priority": 2,
+      "port": 45102
+    },
+    {
+      "name": "background",
+      "dscp": 8,
+      "priority": 0,
+      "port": 45103
+    }
+  ],
+  "qos_device": "lan1",
+  "expected_qos": {
+    "mode": "dscp",
+    "map": {
+      "7": 4,
+      "3": 2,
+      "8": 0
+    }
+  }
+}

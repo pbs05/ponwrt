@@ -1,0 +1,345 @@
+{
+  "source_repository": "https://github.com/excelwang/ponwrt",
+  "source_revision": "e801b682c18a5ff3802f9cdac7510b48eece6f4e",
+  "note": "Source blobs/hashes below identify the retained pre-export files, not the sanitized exported bytes. Submission replaces site-shaped example/default/fixture IPs consistently with TEST-NET addresses and updates documentation links; probes, thresholds and cleanup logic remain retained. Original import metadata was historical and covered only the two QoS suites.",
+  "files": [
+    {
+      "path": "tests/hg-blackbox/.gitignore",
+      "source_blob": "e0b095da7882a04394f0ff36ad58685e75bf4d90",
+      "source_sha256": "4ea0bacd90e4ee269871c0d6bd0a13748e6d5a359293cddd7f0d43beaf4a2358"
+    },
+    {
+      "path": "tests/hg-blackbox/CPU.md",
+      "source_blob": "2975bd8e71fbaab5f06c2880a6ac0d305852e31f",
+      "source_sha256": "f5691318f17f474329a2431bf6bf3af9ef85c51c4e7a2fb74c58c1e579e52210"
+    },
+    {
+      "path": "tests/hg-blackbox/IPTV.md",
+      "source_blob": "af15b447a6aa541fdcbd7ef0d8f8bf062f5530d1",
+      "source_sha256": "11c734b44ae604810a96e6d2e9742c4caf4b4dd6b0128e5c96e6b6899611571d"
+    },
+    {
+      "path": "tests/hg-blackbox/LAN1.md",
+      "source_blob": "2f840dfc2940a5db588d6d32a0d4d36456ea7a0d",
+      "source_sha256": "13f46afbb8aae05bf594a016164ce8d43ca6275d050eb10a025349f013ac6e25"
+    },
+    {
+      "path": "tests/hg-blackbox/MULTICAST.md",
+      "source_blob": "156c23086f957744599eba6b45291f2260e47977",
+      "source_sha256": "4b5a5e1ac2dbf3b2ea4a43871ed7c1f59d888cc13322a2f8a4d93a3357e9da4d"
+    },
+    {
+      "path": "tests/hg-blackbox/README.md",
+      "source_blob": "d3a5acef86c6d1ca9dc46e8f3e7051c5440c0a31",
+      "source_sha256": "ca73a91be973d01ee4851fca67c1354965b9f31f55d77908bc789d26f4b31cc9"
+    },
+    {
+      "path": "tests/hg-blackbox/REGRESSION.md",
+      "source_blob": "3711a6b782d7e885bc0a77164240254943529df4",
+      "source_sha256": "0afc09d0b1bc460a1331c1b472e51651e3293261eabc0f14d93fe49520d9b9a6"
+    },
+    {
+      "path": "tests/hg-blackbox/SCENARIOS.md",
+      "source_blob": "e861482fcba6de5fcfb4a3a91d23483e3ef4a698",
+      "source_sha256": "155a4788f8e872b0c226f4828566dd43ebaf83e92bd107591bd24988df08e473"
+    },
+    {
+      "path": "tests/hg-blackbox/SOURCE.json",
+      "source_blob": "b8ed59079f62b1df838e1993356d8a5efb459eb6",
+      "source_sha256": "97ec42e34f9cbdac0ecd0d780deefd10f20bbe16a8d9c291efa5a2fae9316987"
+    },
+    {
+      "path": "tests/hg-blackbox/configs/cpu.example.json",
+      "source_blob": "58c910e7160c4d01af7ac4f42962c0a0fe64c1ed",
+      "source_sha256": "dc073fdb24e92c5eaad97b29b32b1e8697be2a5f535617b01df8003aee642f9e"
+    },
+    {
+      "path": "tests/hg-blackbox/configs/iptv.example.json",
+      "source_blob": "96ca1bcac23367a4ed16e00e273e56950b664939",
+      "source_sha256": "ed5520846c7b3b5310cd70774f3a9e1e4b0bdb0b065595dfb8e82242e3677394"
+    },
+    {
+      "path": "tests/hg-blackbox/configs/multicast.example.json",
+      "source_blob": "38908cd75caf03ca3bd68cc10cbb256219569035",
+      "source_sha256": "40033f8efefdfb363035e722919dd47b244912f41365b624f0d9a3bf0d38cf0c"
+    },
+    {
+      "path": "tests/hg-blackbox/configs/pse-switching-prefix.json",
+      "source_blob": "0f731e730f50c1761445ac0c83969e6ae5fc6589",
+      "source_sha256": "0d4768b6a8d3a0e123867021159494fbbca9368aeded363013be587946ee12ec"
+    },
+    {
+      "path": "tests/hg-blackbox/configs/regression.example.json",
+      "source_blob": "a643f97dc2b43b1c12a8df1230ad684dd403b3c8",
+      "source_sha256": "c7e238c8332ff313bee69c4dbc8247a592a46dcf88dec8e0a7e8f6c42f322e96"
+    },
+    {
+      "path": "tests/hg-blackbox/configs/scenarios.example.json",
+      "source_blob": "3dfea40ebb16e71054af3ebb030ca9a1901ddb61",
+      "source_sha256": "17d4eeab5a04b3841e4951acd8f544966deea1102abcf766508bf8048bfc4ae6"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg-qos-probe/main.go",
+      "source_blob": "ec42f2b5c7c85e9999702947a054f3c35b283d46",
+      "source_sha256": "dfee156737ffc71f2f673d2d96dfcfa235754b6816903a6582aa567fb2979330"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg-qos-probe/send_linux.go",
+      "source_blob": "169bd01569fac18ade287a5fb823ce0abb03a89d",
+      "source_sha256": "4ea04e97b2920f9129abcb5e150385831e8d7b1fcb49dfd23602b87f8587fb05"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg-qos-probe/sender.cs",
+      "source_blob": "8e0623b1309abddfb99d79dbe731c592ddd16b0c",
+      "source_sha256": "81f85c48365a0c3e187a32392be2b14e8a052ca7cfc2d94e5edfad7964b1b84b"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg-qos-probe/tos_linux.go",
+      "source_blob": "6779113b5624a75c101082392545c7d0e861ab78",
+      "source_sha256": "dc6be21c44b6216cab72d4ca8d876c7ab0249e5f8d158576a59067eccae6ad78"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg-qos-scenario-probe/client.cs",
+      "source_blob": "bb120152004cb89f19eeaab2ed710e2e85d87edb",
+      "source_sha256": "53b7f0c507fc66db51f48d9a7faf76c937cb5f9a7007dd3683092ba2d4981919"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg-qos-scenario-probe/main.go",
+      "source_blob": "651bac92732ef2d1702b919e10672fe6f036fd7f",
+      "source_sha256": "7764712b4adf653c13b0b904591a926ec6f805e96828e47c5d3bb7f014b3ade4"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_cpu_common.py",
+      "source_blob": "f1b8d51694a18d26d4d624a31787e3689a31d197",
+      "source_sha256": "a2a6a370fe08c6cdcdfcacdb356056c2d3bee796adb75552ef32a6022462ba6f"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_common.py",
+      "source_blob": "fb354908112aa54b213b203a4578f73966db4625",
+      "source_sha256": "2846567fbcc2e53be58c76a24e2062587e7cfb75eb73075e68e2fb07ad3a0493"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_diag.c",
+      "source_blob": "3057efc86b618ffd9e3fdf879824f8b74543a535",
+      "source_sha256": "dff026d3e57a44e35fd3118fddb900287e8d0fcb80e44f1d0df4022f995d56cb"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_guard.sh",
+      "source_blob": "595ba8e5eaf752122755c215f0c66ab738d37385",
+      "source_sha256": "9f99b39af8d594ad7e79b8b1668d88c71f158a189fc9e0adc4960d1ecbc1f36c"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_native.c",
+      "source_blob": "cc5ed8a24daae3ceee1099b9d70a7a303cbdf149",
+      "source_sha256": "1557af0c6714aaee1ed3417a55a35f97e29d2ebac4c42fc26beda61819bfc268"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_observe.sh",
+      "source_blob": "171ac4e003ddaaca60ecb15f6e839fc0c1037330",
+      "source_sha256": "b9157156f3de0c183e301b47889e456fe4949e8b549d509a4fb52535386cddcd"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_pse.c",
+      "source_blob": "58010da6997d93ba12a9eaa28eebac5d4ab0c6be",
+      "source_sha256": "f9e9283c1e1cdbb6eac65c79fb07f2b58517e1b5a834ba92021c045ba7c2502e"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_pse.py",
+      "source_blob": "2fb6aaef8b7d57370fa468b06274ce00defb8b0f",
+      "source_sha256": "3b57c15b836b9cbc4788286978b54e013fbb1ae71c4bba53678bb88bbe070a82"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_reliability.py",
+      "source_blob": "93b1a18b5d0ed14d373516bde41e5956b077fba4",
+      "source_sha256": "7215a202a0da476c4816e9c19fc9d16da91748d239f2716cb4c62362bb7fecaf"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_rtp.c",
+      "source_blob": "9c01828308c74314c842c390a4be5c7cc970d6a5",
+      "source_sha256": "09c61f4eed5579a18db3b61830a9fc76c0720afb99568cf1fb7c74f7c61419f9"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_sample.c",
+      "source_blob": "a1b82c403ad9a15a3218ab6d78a33f1d6d29a8aa",
+      "source_sha256": "dbaa6bd7439ff486c33eedb485ce713d224301b341fb3fc3aa86f61da8943a9c"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_stream.go",
+      "source_blob": "ca837e3e4f6d140a1251b1ee200328d81d8e4bd2",
+      "source_sha256": "0761b8212329dae2574bbc1ef4a15d045771bb89c589a077741cc900d6c39714"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_iptv_stream_test.go",
+      "source_blob": "71a6e592fe5d83074d810415b3b77af1b3dae85e",
+      "source_sha256": "daa509c8f03856217f472a4dac2d99eff901d1253d2d9f5274351bf20870050d"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_lan1_snapshot.sh",
+      "source_blob": "0516ef3c9b47b42de10ea7d03fef2560c9225b54",
+      "source_sha256": "b53f272dde159b57e70c1f91075c931a0a4596d0d29a111130ad4f9790b54617"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_mcast_local.c",
+      "source_blob": "fd5eb0afdef0d5d8a2d853535dc5c4882190908a",
+      "source_sha256": "bc010452cd867116444493049cbda5925c9d17977b64f4e950b81a5e25e7451f"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_multicast_probe.py",
+      "source_blob": "35d50c4ded99350b574b6099258d920f21e4e04a",
+      "source_sha256": "cdf9326b352c6d79b0f62acca732bd3b0741d8fad4397fa6178bdcc8fa0f574c"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_qos_common.py",
+      "source_blob": "07830ecae584d43525247e2f1d49764789a8ed56",
+      "source_sha256": "9342369d8f4ebb50b2ecb9e71ef3318901506c2f61f74bb38a9dce02fedcdc64"
+    },
+    {
+      "path": "tests/hg-blackbox/helpers/hg_qos_pcap.py",
+      "source_blob": "7389c7303be5b3b19e3707fe0cd3b899e69cb0f5",
+      "source_sha256": "4d727d5a0746866e745d10608bae8bc326c699091794a8155807cc17e0e968af"
+    },
+    {
+      "path": "tests/hg-blackbox/hg-cpu-regression.py",
+      "source_blob": "9e56bb09a69cbc34fb392877a3a55f9d797b8f89",
+      "source_sha256": "a6c4dcb50b24188797b1628cd8c6e99f589bfe8c50714cf64af23ffbeab94630"
+    },
+    {
+      "path": "tests/hg-blackbox/hg-iptv-regression.py",
+      "source_blob": "d15a5fa8e5de38268c94348c98943f8e624b5429",
+      "source_sha256": "6871fade38fca1defaa614c55d87fc178d0de1e7c3b39bce402b95605805ddee"
+    },
+    {
+      "path": "tests/hg-blackbox/hg-lan1-regression.py",
+      "source_blob": "3f2993aade4c1520bcc1c8eb496115d2ba15ba43",
+      "source_sha256": "885288235664cdfa7e0a04d4a3af038a94f8c3aa86fed8bad829b4bf6e81b7de"
+    },
+    {
+      "path": "tests/hg-blackbox/hg-multicast-regression.py",
+      "source_blob": "8b7841b43c569b6a9e618ffbacfbf9fddad46fd2",
+      "source_sha256": "73312e0b11ced165576bf6ebf0eff158d4d7a5c00eee44f442485d868779655d"
+    },
+    {
+      "path": "tests/hg-blackbox/hg-qos-regression.py",
+      "source_blob": "5adfa81e62fe1003a98653434ab29323ae0da5b0",
+      "source_sha256": "194e597e462ccdc63f529a97b48b48a9414a65c766101fd9d7a5bee62735a5f3"
+    },
+    {
+      "path": "tests/hg-blackbox/hg-qos-scenarios.py",
+      "source_blob": "b1c1dc880593f10a88e161bd356d577d27ae40b4",
+      "source_sha256": "22c99cb9e5027f9583a4a9887549e15f33195136e578339562b7c8c2775655bc"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_cpu.py",
+      "source_blob": "613268c5dcfe6e42dcd1474439c64d52383d7996",
+      "source_sha256": "1ed121048fa85b2ab3c98883ce012e0b05511fb0e213507290fbd80d3f58a592"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_iptv.py",
+      "source_blob": "e555149e9457c8a3942519b121d23f7ef18cc17b",
+      "source_sha256": "661558fbf2d7bf1f85bdb17096586e4170799229ac77658a3f641cea672d4d2b"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_iptv_pse.py",
+      "source_blob": "8dbf5f5519f63d9f8580f18dc2f77f3b8c4f1de5",
+      "source_sha256": "5518b3810cbe231fba4e18a0673e7a0048645098dde69cd3946d0933b7291c91"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_iptv_reliability.py",
+      "source_blob": "5cac0f7c5ceae9ca5f8b0bb058eac1551d93f9c2",
+      "source_sha256": "f2d1084bf180c02649817ce6511d1fe60f4f8d27b878d8cad29b963f520f74f4"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_lan1.py",
+      "source_blob": "342b0deec27a63a1eacd0d59e7a6d6d2ea640bb9",
+      "source_sha256": "611116e8b664b535e4943b6f560ecaabe1b414ebc9b14da338f88f5f45b2bccf"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_multicast.py",
+      "source_blob": "988ebe4f6c4718604a132ec09f07f32f17055cce",
+      "source_sha256": "31a7681f6e54218997a4778a409974f4e194793d55d06d8cdbd14c518b1b8d84"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_qos_profile.py",
+      "source_blob": "8fbf0a7ca09d490dc66bf5e2f2b43b568e848620",
+      "source_sha256": "f650108807910ee60992d9af8fe083e5db1c236c53fbdefd0e560520cc80dae1"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_qos_regression.py",
+      "source_blob": "7bf349a8b2eb2dd04d900b03f3101732b2527bf1",
+      "source_sha256": "761e18c6b1fb0688b6ccd039727b6938e5c659b4a99facd10c1615c8eb357bb5"
+    },
+    {
+      "path": "tests/hg-blackbox/unit/test_hg_qos_scenarios.py",
+      "source_blob": "59d61614a6660474c3474e9f3f76e0f96de74393",
+      "source_sha256": "eeb77507ac7c802e897eb07500d4b64d28e9176ec16b230b355943e93bdd8dde"
+    }
+  ],
+  "original_qos_import": {
+    "imported_on": "2026-10-13",
+    "source_workspace": "homelab",
+    "source_revision": null,
+    "note": "Imported from existing untracked workspace files; SHA256 identifies the exact original bytes.",
+    "files": [
+      {
+        "source": "scripts/hg-qos-regression.py",
+        "destination": "hg-qos-regression.py",
+        "source_sha256": "79d2f0561900ee8cfc9f6a6dc8ae1d3679d5acc5d560b1617a5d7fbcbd60173b"
+      },
+      {
+        "source": "scripts/hg-qos-scenarios.py",
+        "destination": "hg-qos-scenarios.py",
+        "source_sha256": "bd369845fe61944da56be732ee7dda05f336d9bc129412904165af8b34dae1d3"
+      },
+      {
+        "source": "scripts/helpers/hg_qos_common.py",
+        "destination": "helpers/hg_qos_common.py",
+        "source_sha256": "4ccf5a60c4d852803a74942a0b782d0ec17b310a32265336b524390e311a03a1"
+      },
+      {
+        "source": "scripts/helpers/hg_qos_pcap.py",
+        "destination": "helpers/hg_qos_pcap.py",
+        "source_sha256": "4d727d5a0746866e745d10608bae8bc326c699091794a8155807cc17e0e968af"
+      },
+      {
+        "source": "tests/quality/test_hg_qos_regression.py",
+        "destination": "unit/test_hg_qos_regression.py",
+        "source_sha256": "6ee5116c8ad7aa664d6038e5a1c9e8728df31d0701d0970974afaa4afbd2bbdf"
+      },
+      {
+        "source": "tests/quality/test_hg_qos_scenarios.py",
+        "destination": "unit/test_hg_qos_scenarios.py",
+        "source_sha256": "743dc882f5d51e32fc964c7fa3f842291cd4ebc0412a852b0a180d51aec06992"
+      },
+      {
+        "source": "scripts/helpers/hg-qos-probe/main.go",
+        "destination": "helpers/hg-qos-probe/main.go",
+        "source_sha256": "dfee156737ffc71f2f673d2d96dfcfa235754b6816903a6582aa567fb2979330"
+      },
+      {
+        "source": "scripts/helpers/hg-qos-probe/send_linux.go",
+        "destination": "helpers/hg-qos-probe/send_linux.go",
+        "source_sha256": "4ea04e97b2920f9129abcb5e150385831e8d7b1fcb49dfd23602b87f8587fb05"
+      },
+      {
+        "source": "scripts/helpers/hg-qos-probe/sender.cs",
+        "destination": "helpers/hg-qos-probe/sender.cs",
+        "source_sha256": "81f85c48365a0c3e187a32392be2b14e8a052ca7cfc2d94e5edfad7964b1b84b"
+      },
+      {
+        "source": "scripts/helpers/hg-qos-probe/tos_linux.go",
+        "destination": "helpers/hg-qos-probe/tos_linux.go",
+        "source_sha256": "dc6be21c44b6216cab72d4ca8d876c7ab0249e5f8d158576a59067eccae6ad78"
+      },
+      {
+        "source": "scripts/helpers/hg-qos-scenario-probe/client.cs",
+        "destination": "helpers/hg-qos-scenario-probe/client.cs",
+        "source_sha256": "53b7f0c507fc66db51f48d9a7faf76c937cb5f9a7007dd3683092ba2d4981919"
+      },
+      {
+        "source": "scripts/helpers/hg-qos-scenario-probe/main.go",
+        "destination": "helpers/hg-qos-scenario-probe/main.go",
+        "source_sha256": "7764712b4adf653c13b0b904591a926ec6f805e96828e47c5d3bb7f014b3ade4"
+      }
+    ]
+  }
+}

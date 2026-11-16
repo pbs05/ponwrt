@@ -1,0 +1,49 @@
+{
+  "hg": {
+    "ssh": "hg-test-hg"
+  },
+  "win": {
+    "ssh": "hg-test-win"
+  },
+  "fnos": {
+    "ssh": "hg-test-fnos"
+  },
+  "win_ip": "192.0.2.2",
+  "input_device": "lan1",
+  "output_device": "lan4",
+  "egress_mbps": 1000,
+  "endpoints": {
+    "normal": {
+      "ip": "192.0.2.252",
+      "container": "normal-endpoint",
+      "interface": "eth0",
+      "dscp": 7
+    },
+    "proxy": {
+      "ip": "192.0.2.254",
+      "container": "proxy-endpoint",
+      "interface": "eth0",
+      "dscp": 3
+    },
+    "background": {
+      "ip": "192.0.2.3",
+      "interface": "eth0",
+      "dscp": 8
+    },
+    "fakeip": {
+      "ip": "198.18.0.1",
+      "container": "proxy-endpoint",
+      "interface": "eth0",
+      "dscp": 3
+    }
+  },
+  "qos_device": "lan1",
+  "expected_qos": {
+    "mode": "dscp",
+    "map": {
+      "7": 4,
+      "3": 2,
+      "8": 0
+    }
+  }
+}
