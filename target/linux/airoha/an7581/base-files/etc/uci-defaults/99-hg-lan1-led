@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+. /lib/functions.sh
+
+[ "$(board_name)" = "nokia,xg-040g-md-ubi" ] || exit 0
+
+led_sysfs="mt7530-0:0f:green:lan-1"
+# Retry on a later boot if the PHY LED has not been registered yet.
+[ -d "/sys/class/leds/$led_sysfs" ] || exit 1
+
+led_configured=0
+check_lan1_led() {
+	local sysfs
+	config_get sysfs "$1" sysfs
+	[ "$sysfs" = "$led_sysfs" ] && led_configured=1
+}
+
+# board.d supplies fresh defaults. Restored /etc/config/system files need
+# this migration, but an existing LED choice (including "none") is retained.
+config_load system
+config_foreach check_lan1_led led
+[ "$led_configured" = 0 ] || exit 0
+
+# An anonymous section avoids overwriting an unrelated user section.
+section="$(uci add system led)" || exit 1
+uci set "system.$section.name=lan1" &&
+uci set "system.$section.sysfs=$led_sysfs" &&
+uci set "system.$section.trigger=netdev" &&
+uci set "system.$section.dev=lan1" &&
+uci set "system.$section.mode=link tx rx" &&
+uci commit system
