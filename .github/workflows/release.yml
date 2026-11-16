@@ -1,4 +1,5 @@
 name: Release PonWrt
+run-name: Release PonWrt ${{ inputs.tag }}
 
 on:
   workflow_dispatch:
