@@ -1,0 +1,25 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Sourced by /etc/init.d/led's load_led().
+
+local device devices level=0
+
+[ -e "/sys/class/leds/$sysfs/brightness" ] || return 0
+
+# Use installed main-table routes. Netifd's interface dump may also advertise
+# DHCP routes that were deliberately not installed (e.g. a service network).
+# Neither logical interface names nor protocol-generated device names matter.
+devices="$(
+	{ ip -4 route show default; ip -6 route show default; } 2>/dev/null |
+		awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i+1) }'
+)"
+for device in $devices; do
+	[ "$(cat "/sys/class/net/$device/carrier" 2>/dev/null)" = 1 ] || continue
+	level="$(cat "/sys/class/leds/$sysfs/max_brightness")"
+	break
+done
+
+# This indicates a connected default-route device, not an Internet probe or
+# the independent PON service-authentication state.
+printf '%s\n' none > "/sys/class/leds/$sysfs/trigger"
+printf '%s\n' "$level" > "/sys/class/leds/$sysfs/brightness"
