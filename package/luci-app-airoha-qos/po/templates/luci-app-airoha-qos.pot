@@ -1,0 +1,165 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "Unknown mode"
+msgstr ""
+
+msgid "Use DSCP:QUEUE, with DSCP 0–63 and queue 0–7."
+msgstr ""
+
+msgid "Each DSCP may appear only once."
+msgstr ""
+
+msgid "Running policy"
+msgstr ""
+
+msgid "Driver status is unavailable. The saved configuration does not prove that a hardware policy is active."
+msgstr ""
+
+msgid "Traditional priority"
+msgstr ""
+
+msgid "DSCP"
+msgstr ""
+
+msgid "Legacy kernel: default mapping unknown"
+msgstr ""
+
+msgid "The driver reports a QoS fault. Hardware policy is not confirmed. Base networking remains enabled."
+msgstr ""
+
+msgid "The running policy is locked until the next boot."
+msgstr ""
+
+msgid "Saved policy differs from the running policy; reboot to apply it."
+msgstr ""
+
+msgid "Saved and running policies match."
+msgstr ""
+
+msgid "Default priority → queue (priority 0–15):"
+msgstr ""
+
+msgid "This kernel does not report the revised default priority map."
+msgstr ""
+
+msgid "Configured DSCP queue"
+msgstr ""
+
+msgid "Running DSCP queue"
+msgstr ""
+
+msgid "Inactive or unknown"
+msgstr ""
+
+msgid "Complete DSCP table"
+msgstr ""
+
+msgid "Refresh status"
+msgstr ""
+
+msgid "Airoha QoS"
+msgstr ""
+
+msgid "One policy covers the shared FE/QDMA/switch hardware. Save changes for the next boot. This page does not restart networking."
+msgstr ""
+
+msgid "Classification mode"
+msgstr ""
+
+msgid "Traditional priority (default)"
+msgstr ""
+
+msgid "DSCP determines hardware queues"
+msgstr ""
+
+msgid "Traditional mode maps Linux priority to three QDMA classes: interactive/control, ordinary, and bulk/filler. PPE retains its existing TOS input; different forwarding paths may classify differently."
+msgstr ""
+
+msgid "DSCP mode"
+msgstr ""
+
+msgid "DSCP directly selects Q0–Q7 across CPU, PPE and switch paths. This avoids legacy TOS classification, stale skb priority and software-flowtable differences. The original skb priority is preserved, but does not choose the hardware queue for parsed IP packets. Mark traffic consistently in both directions before offload; established PPE flows do not follow per-packet DSCP changes."
+msgstr ""
+
+msgid "DSCP → queue overrides"
+msgstr ""
+
+msgid "Format DSCP:QUEUE. Unspecified values retain the original PPE numeric map; this is not a standard DiffServ/WMM mapping. Q0 is valid. With default strict scheduling, Q7 is highest and Q0 lowest; no minimum bandwidth is guaranteed."
+msgstr ""
+
+msgid "QoS configuration saved. Changes take effect on reboot."
+msgstr ""
+
+msgid "The base mapping is unavailable. Update the QoS controller and refresh this page."
+msgstr ""
+
+msgid "Unknown base mapping: %s"
+msgstr ""
+
+msgid "Base mapping: original PPE compatibility map (ppe-legacy-v1). Empty overrides still use all 64 entries below. This is not a standard DiffServ or WMM mapping."
+msgstr ""
+
+msgid "This older configuration inherits ppe-legacy-v1. Saving makes the preset explicit without changing its mapping."
+msgstr ""
+
+msgid "Base queue"
+msgstr ""
+
+msgid "Override"
+msgstr ""
+
+msgid "Base DSCP mapping"
+msgstr ""
+
+msgid "Original PPE compatibility map (v1)"
+msgstr ""
+
+msgid "The named preset fixes the meaning of unspecified DSCP values across upgrades. Overrides below only replace selected entries."
+msgstr ""
+
+msgid "Restore base mapping"
+msgstr ""
+
+msgid "Clear overrides"
+msgstr ""
+
+msgid "Clears the edits in this form. Save to use the base mapping at the next boot."
+msgstr ""
+
+msgid "Reboot required"
+msgstr ""
+
+msgid "Saved policy differs from the running policy. Reboot the device to apply it and rebuild the flow offload entries."
+msgstr ""
+
+msgid "Open reboot page"
+msgstr ""
+
+msgid "Saved and running hardware mappings match. This does not verify external traffic marking rules."
+msgstr ""
+
+msgid "Applying policy changes"
+msgstr ""
+
+msgid "Save stores the hardware mode and queue mapping for the next device boot. Restarting the QoS service or the firewall does not apply this hardware profile."
+msgstr ""
+
+msgid "Traffic marking rules"
+msgstr ""
+
+msgid "Traffic to DSCP classification is configured in the firewall or another marking tool. After changing those rules, reboot the device so software and hardware offloaded flows learn the new marks. This page only defers its own hardware settings; an external rule editor may apply changes immediately."
+msgstr ""
+
+msgid "QoS configuration saved for the next device boot. Use System → Reboot when ready to apply it."
+msgstr ""
+
+msgid "Configure traffic-to-DSCP rules in Firewall → Traffic Rules and describe their purpose in each rule name. A full firewall reload rebuilds its software and hardware flowtables. Updating a separate nft marking table alone does not retire old flows. Supported multicast firmware also retires its own cache through the firewall include. None of these actions applies a pending hardware mode or queue-map change."
+msgstr ""
+
+msgid "Business classification"
+msgstr ""
+
+msgid "Open firewall traffic rules"
+msgstr ""
