@@ -1,0 +1,53 @@
+From: Homelab maintainers <homelab@localhost>
+Subject: [PATCH] netfilter: preserve hop limits in native bridge flowtables
+
+The native bridge fastpath reuses the IP flow hooks, but forwarding inside
+a bridge must not consume a routing hop. Preserve IPv4 TTL and IPv6 hop
+limit in software and carry bridge provenance to hardware offload rules.
+flow_rule_alloc() zero-initializes the flag, preserving existing routed
+and TC behavior unless the bridge flowtable explicitly marks the rule.
+
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -438,6 +438,8 @@
+ 
+ struct flow_rule {
+ 	struct flow_match	match;
++	/* A bridge fastpath must preserve the IP TTL and IPv6 hop limit. */
++	bool			is_bridge;
+ 	struct flow_action	action;
+ };
+ 
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -801,6 +801,8 @@
+ 			enum flow_offload_tuple_dir dir,
+ 			struct nf_flow_rule *flow_rule)
+ {
++	flow_rule->rule->is_bridge = true;
++
+ 	if (nf_flow_rule_route_common(net, flow, dir, flow_rule) < 0)
+ 		return -1;
+ 
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -421,7 +421,8 @@
+ 				    FIELD_PREP(INET_DSCP_MASK,
+ 					       tuplehash->tuple.dscp));
+ 
+-	ip_decrease_ttl(iph);
++	if (flow_table->type->family != NFPROTO_BRIDGE)
++		ip_decrease_ttl(iph);
+ 	skb_clear_tstamp(skb);
+ 
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
+@@ -716,7 +717,8 @@
+ 				    FIELD_PREP(INET_DSCP_MASK,
+ 					       tuplehash->tuple.dscp));
+ 
+-	ip6h->hop_limit--;
++	if (flow_table->type->family != NFPROTO_BRIDGE)
++		ip6h->hop_limit--;
+ 	skb_clear_tstamp(skb);
+ 
+ 	if (flow_table->flags & NF_FLOWTABLE_COUNTER)
