@@ -269,14 +269,6 @@
 	};
 
 
-	fsl_reset_hog: fsl-reset-hog {
-		gpio-hog;
-		gpios = <4 GPIO_ACTIVE_LOW>;
-		output-high;
-		line-name = "fsl-reset";
-	};
-
-
 	gpon_power_hog: gpon-power-hog {
 		gpio-hog;
 		gpios = <20 GPIO_ACTIVE_HIGH>;
@@ -311,32 +303,22 @@
 
 &{/soc} {
 
-	pcm_spi: spi@1fbd4000 {
-		compatible = "airoha,en7581-spi", "airoha,spi";
+	fsl: fsl@1fbd4000 {
+		compatible = "fiberhome,an4475-fsl";
 		reg = <0x0 0x1fbd4000 0x0 0x140>;
 
-		clocks = <&scuclk EN7523_CLK_SPI>;
-		clock-names = "spi";
+		clocks = <&scuclk EN7523_CLK_SLIC>;
+		clock-names = "slic";
 		resets = <&scuclk EN7581_SFC2_PCM_RST>;
 		reset-names = "pcm";
-
-		#address-cells = <1>;
-		#size-cells = <0>;
-		spi-num-chipselects = <2>;
+		airoha,scu = <&chip_scu>;
+		reset-gpios = <&en7581_pinctrl 4 GPIO_ACTIVE_LOW>;
 
 		pinctrl-names = "default";
 		pinctrl-0 = <&downstream_pon_spi_pins>;
 
-		status = "disabled";
-
-		fsl: fsl@0 {
-			compatible = "fiberhome,an4475-g2-fsl";
-			reg = <0>;
-			spi-max-frequency = <20000000>;
-			spi-cpol;
-			spi-cpha;
-			/* GPIO4 releases reset while the downstream PON controller is inactive. */
-		};
+		spi-max-frequency = <10000000>;
+		status = "okay";
 	};
 };
 
