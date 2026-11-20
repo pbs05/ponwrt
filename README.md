@@ -25,6 +25,7 @@ The authors and contributors are not responsible for device damage, network serv
 | AN7581 | Gemtek XG2010G | `gemtek_xg2010g` | `dsd` |
 | AN7581 | Nokia XG-040G-MD UBI | `nokia_xg-040g-md-ubi` | `bosa`, `ri` |
 | AN7581 | Nokia XG-040G-TF UBI | `nokia_xg-040g-tf-ubi` | `bosa`, `ri` |
+| AN7581 | Nokia XG-140G-TF UBI | `nokia_xg-140g-tf-ubi` | `bosa`, `ri` |
 | AN7581 | UnionMan UNG00A | `unionman_ung00a` | `reservearea` |
 | AN7581 | ZNXT ZN504XG-D | `znxt_zn504xg-d` | `reservearea` |
 | AN7581 | ZNXT ZN515XG-D | `znxt_zn515xg-d` | `reservearea` |

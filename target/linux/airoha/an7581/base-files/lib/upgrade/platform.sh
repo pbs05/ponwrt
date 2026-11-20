@@ -43,6 +43,7 @@ platform_check_image() {
 	h3c,hm2004-du|\
 	nokia,xg-040g-md-ubi|\
 	nokia,xg-040g-tf-ubi|\
+	nokia,xg-140g-tf-ubi|\
 	quantum,q1000k-ubi)
 		fit_check_image "$1"
 		return $?
@@ -72,7 +73,8 @@ platform_do_upgrade() {
 			airoha_require_ubi_layout factory && fit_do_upgrade "$1"
 			;;
 		nokia,xg-040g-md-ubi|\
-		nokia,xg-040g-tf-ubi)
+		nokia,xg-040g-tf-ubi|\
+		nokia,xg-140g-tf-ubi)
 			airoha_require_ubi_layout bosa ri && fit_do_upgrade "$1"
 			;;
 		*)

@@ -441,6 +441,28 @@ define Device/nokia_xg-040g-tf-ubi
 endef
 TARGET_DEVICES += nokia_xg-040g-tf-ubi
 
+# Nokia XG-140G-TF is the voice (FXS/POTS) variant of XG-040G-TF. The board
+# is otherwise identical, so it reuses the same DTSI, U-Boot, and bosa/ri
+# calibration volumes; only the identity and the extra voice port differ.
+define Device/nokia_xg-140g-tf-ubi
+  $(call Device/nokia_xg-040g-tf-common)
+  DEVICE_MODEL := XG-140G-TF
+  DEVICE_VARIANT := (UBI)
+  DEVICE_DTS := an7581-nokia_xg-140g-tf-ubi
+  UBOOTENV_IN_UBI := 1
+  KERNEL_IN_UBI := 1
+  KERNEL := kernel-bin | gzip
+  KERNEL_INITRAMFS := kernel-bin | lzma | \
+	fit lzma $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb with-initrd | pad-to 128k
+  KERNEL_INITRAMFS_SUFFIX := -recovery.itb
+  IMAGES := sysupgrade.itb
+  IMAGE/sysupgrade.itb := append-kernel | \
+	fit gzip $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb external-static-with-rootfs | \
+	append-metadata
+  DEVICE_PACKAGES += fitblk
+endef
+TARGET_DEVICES += nokia_xg-140g-tf-ubi
+
 # FiberHome AN4475-G2: 10G xPON uplink plus FTTR downstream, 512 MiB
 # SPI-NAND, MT7990AN/MT7976CN Wi-Fi 7 (PCI 14c3:7993 / 14c3:799b), one
 # 2.5G combo port and four GSW GE ports. The factory UBI volume MUST be

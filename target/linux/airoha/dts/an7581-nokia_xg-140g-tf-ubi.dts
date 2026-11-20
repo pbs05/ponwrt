@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+#include "an7581-nokia_xg-040g-tf-common.dtsi"
+#include "an758x-nokia_xg-040g-ubi-parts.dtsi"
+
+/ {
+	/*
+	 * XG-140G-TF is the voice variant of XG-040G-TF: the board is identical
+	 * except for one additional FXS/POTS port. That port is owned entirely
+	 * by the Linux SLIC voice stack (Lantiq DUSLIC XS, SPI + PCM, reset
+	 * GPIO14) and is not touched by the bootloader or Linux networking.
+	 */
+	model = "Nokia XG-140G-TF (UBI)";
+	compatible = "nokia,xg-140g-tf-ubi", "airoha,an7581",
+		     "airoha,en7581";
+};
