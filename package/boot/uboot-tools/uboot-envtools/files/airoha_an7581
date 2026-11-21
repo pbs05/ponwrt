@@ -14,7 +14,8 @@ board=$(board_name)
 case "$board" in
 gemtek,w1700k-ubi|\
 nokia,xg-040g-md-ubi|\
-nokia,xg-040g-tf-ubi)
+nokia,xg-040g-tf-ubi|\
+nokia,xg-140g-tf-ubi)
 	ubootenv_add_ubi_default
 	;;
 esac
