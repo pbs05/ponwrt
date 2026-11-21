@@ -323,6 +323,7 @@
 };
 
 &spi_nand {
+	nand-ecc-engine = <&spi_nand>;
 	#address-cells = <1>;
 	#size-cells = <1>;
 
@@ -480,13 +481,13 @@
 
 &ubi_env {
 	nvmem-layout {
-		compatible = "u-boot,env-redundant-bool";
+		compatible = "u-boot,env-redundant-bool-layout";
 	};
 };
 
 &ubi_env2 {
 	nvmem-layout {
-		compatible = "u-boot,env-redundant-bool";
+		compatible = "u-boot,env-redundant-bool-layout";
 	};
 };
 
