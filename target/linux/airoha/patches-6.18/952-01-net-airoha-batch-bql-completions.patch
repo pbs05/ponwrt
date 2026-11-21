@@ -1,0 +1,193 @@
+From b199e03e42590e8e03c48cbb8ff207265bd39724 Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 23:12:04 +0800
+Subject: [PATCH] net: airoha: batch BQL completion while retaining upstream
+ queue locks
+
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 79 ++++++++++++++++++++----
+ drivers/net/ethernet/airoha/airoha_eth.h | 11 ++++
+ 2 files changed, 77 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 37f53f9..4c37696 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1375,9 +1375,60 @@ static void airoha_unmap_xmit_buf(struct airoha_eth *eth,
+ 	e->dma_type = AIROHA_DMA_UNMAPPED;
+ }
+ 
++/* A software TX queue can share a QDMA ring with other netdevices. */
++static unsigned int
++airoha_tx_bql_account(struct airoha_tx_irq_queue *irq_q, unsigned int count,
++                     struct sk_buff *skb)
++{
++	struct netdev_queue *txq = skb_get_tx_queue(skb->dev, skb);
++	struct airoha_tx_bql *bql = irq_q->bql;
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		if (bql[i].txq != txq)
++			continue;
++		bql[i].packets++;
++		bql[i].bytes += skb->len;
++		return count;
++	}
++
++	/* At most one distinct owner per completion entry in the IRQ ring. */
++	bql[count].txq = txq;
++	bql[count].packets = 1;
++	bql[count].bytes = skb->len;
++	return count + 1;
++}
++
++static void airoha_tx_bql_complete(struct airoha_tx_irq_queue *irq_q,
++                                 unsigned int count)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++) {
++		struct airoha_tx_bql *bql = &irq_q->bql[i];
++		struct net_device *netdev = bql->txq->dev;
++		struct airoha_gdm_dev *dev = NULL;
++		unsigned int qidx = bql->txq - netdev_get_tx_queue(netdev, 0);
++
++		if (netdev->netdev_ops == &airoha_netdev_ops)
++			dev = netdev_priv(netdev);
++		/* Preserve upstream serialization across completion rings sharing
++		 * one software queue, once per aggregate instead of per skb.
++		 */
++		if (dev)
++			spin_lock_bh(&dev->txq_lock[qidx]);
++		netdev_tx_completed_queue(bql->txq, bql->packets, bql->bytes);
++		if (dev)
++			spin_unlock_bh(&dev->txq_lock[qidx]);
++		irq_q->bql_packets += bql->packets;
++		irq_q->bql_calls++;
++	}
++}
++
+ static int airoha_qdma_tx_napi_poll(struct napi_struct *napi, int budget)
+ {
+ 	struct airoha_tx_irq_queue *irq_q;
++	unsigned int bql_count = 0;
+ 	int id, done = 0, irq_queued;
+ 	struct airoha_qdma *qdma;
+ 	struct airoha_eth *eth;
+@@ -1445,9 +1496,7 @@ static int airoha_qdma_tx_napi_poll(struct napi_struct *napi, int budget)
+ 		q->queued--;
+ 
+ 		if (skb) {
+-			u16 qidx = skb_get_queue_mapping(skb);
+ 			struct airoha_gdm_dev *dev = NULL;
+-			struct netdev_queue *txq;
+ 
+ 			/* PON control frames are owned by OMCI/OAM netdevs. */
+ 			if (skb->dev->netdev_ops == &airoha_netdev_ops)
+@@ -1461,13 +1510,7 @@ static int airoha_qdma_tx_napi_poll(struct napi_struct *napi, int budget)
+ 						     &dev->pon_stats.tx_bytes_completed);
+ 				}
+ 			}
+-			txq = skb_get_tx_queue(skb->dev, skb);
+-
+-			if (dev)
+-				spin_lock_bh(&dev->txq_lock[qidx]);
+-			netdev_tx_completed_queue(txq, 1, skb->len);
+-			if (dev)
+-				spin_unlock_bh(&dev->txq_lock[qidx]);
++			bql_count = airoha_tx_bql_account(irq_q, bql_count, skb);
+ 
+ 			dev_kfree_skb_any(skb);
+ 		}
+@@ -1488,6 +1531,8 @@ unlock:
+ 		spin_unlock_bh(&q->lock);
+ 	}
+ 
++	airoha_tx_bql_complete(irq_q, bql_count);
++
+ 	if (done) {
+ 		int i, len = done >> 7;
+ 
+@@ -1555,6 +1600,11 @@ static int airoha_qdma_tx_irq_init(struct airoha_tx_irq_queue *irq_q,
+ 	struct airoha_eth *eth = qdma->eth;
+ 	dma_addr_t dma_addr;
+ 
++	irq_q->bql = devm_kcalloc(eth->dev, size, sizeof(*irq_q->bql),
++				 GFP_KERNEL);
++	if (!irq_q->bql)
++		return -ENOMEM;
++
+ 	irq_q->q = dmam_alloc_coherent(eth->dev, size * sizeof(u32),
+ 				       &dma_addr, GFP_KERNEL);
+ 	if (!irq_q->q)
+@@ -1600,6 +1650,7 @@ static int airoha_qdma_init_tx(struct airoha_qdma *qdma)
+ 
+ static void airoha_qdma_tx_cleanup(struct airoha_qdma *qdma)
+ {
++	struct airoha_tx_irq_queue *irq_q = &qdma->q_tx_irq[0];
+ 	u32 status;
+ 	int i;
+ 
+@@ -1613,6 +1664,7 @@ static void airoha_qdma_tx_cleanup(struct airoha_qdma *qdma)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
+ 		struct airoha_queue *q = &qdma->q_tx[i];
++		unsigned int bql_count = 0;
+ 		u16 index = 0;
+ 		int j;
+ 
+@@ -1641,10 +1693,9 @@ static void airoha_qdma_tx_cleanup(struct airoha_qdma *qdma)
+ 			WRITE_ONCE(desc->msg2, 0);
+ 
+ 			if (skb) {
+-				struct netdev_queue *txq;
+-
+-				txq = skb_get_tx_queue(skb->dev, skb);
+-				netdev_tx_completed_queue(txq, 1, skb->len);
++				/* One HW TX ring has at most TX_DSCP_NUM owners. */
++				bql_count = airoha_tx_bql_account(irq_q, bql_count,
++							  skb);
+ 				dev_kfree_skb_any(skb);
+ 				e->skb = NULL;
+ 			}
+@@ -1652,6 +1703,8 @@ static void airoha_qdma_tx_cleanup(struct airoha_qdma *qdma)
+ 			q->queued--;
+ 		}
+ 
++		airoha_tx_bql_complete(irq_q, bql_count);
++
+ 		if (!list_empty(&q->tx_list)) {
+ 			struct airoha_queue_entry *e;
+ 
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 8702b54..e62815b 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -232,6 +232,12 @@ struct airoha_queue {
+ 	struct list_head tx_list;
+ };
+ 
++struct airoha_tx_bql {
++	struct netdev_queue *txq;
++	unsigned int packets;
++	unsigned int bytes;
++};
++
+ struct airoha_tx_irq_queue {
+ 	struct airoha_qdma *qdma;
+ 
+@@ -239,6 +245,11 @@ struct airoha_tx_irq_queue {
+ 
+ 	int size;
+ 	u32 *q;
++
++	/* Private to this completion NAPI, or cleanup after NAPI is stopped. */
++	struct airoha_tx_bql *bql;
++	u64 bql_packets;
++	u64 bql_calls;
+ };
+ 
+ struct airoha_hw_stats {
+-- 
+2.53.0
+

@@ -1,0 +1,112 @@
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:33:00 +0800
+Subject: [PATCH] net: airoha: retain acknowledged DMA error causes
+
+The interrupt handler acknowledges enabled coherent and no-descriptor
+causes without retaining them. A userspace register poll can therefore
+miss a short error preceding a data-path stall.
+
+Keep software-only per-bank lifetime diagnostics before the existing W1C.
+Do not alter interrupt masks, acknowledgment order, DMA state or
+forwarding.
+Expose a root-only read-only debugfs file; no MMIO reads or reset on
+lookup.
+Counts describe error acknowledgements, not packet loss or error recovery.
+
+Signed-off-by: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1919,4 +1919,32 @@
+ }
+ 
++static __always_inline void
++airoha_qdma_record_irq_error(struct airoha_irq_bank *bank, int index, u32 status)
++{
++	static const u32 errors[QDMA_INT_REG_MAX] = {
++		[QDMA_INT_REG_IDX0] = RX_COHERENT_LOW_INT_MASK |
++			TX_COHERENT_LOW_INT_MASK | HWFWD_DSCP_LOW_INT_MASK |
++			HWFWD_DSCP_EMPTY_INT_MASK,
++		[QDMA_INT_REG_IDX1] = RX_NO_CPU_DSCP_LOW_INT_MASK,
++		[QDMA_INT_REG_IDX2] = RX_NO_CPU_DSCP_HIGH_INT_MASK,
++		[QDMA_INT_REG_IDX3] = RX_COHERENT_HIGH_INT_MASK,
++		[QDMA_INT_REG_IDX4] = TX_COHERENT_HIGH_INT_MASK,
++	};
++	u32 observed = status & errors[index];
++
++	if (!IS_ENABLED(CONFIG_DEBUG_FS) || likely(!observed))
++		return;
++	/* Save exactly the enabled error bits about to be acknowledged. Do not
++	 * enable more interrupts, poll hardware, reset DMA or log per packet.
++	 * An IRQ line serializes writers for its bank; readers use READ_ONCE.
++	 */
++	WRITE_ONCE(bank->error_seen[index],
++		   READ_ONCE(bank->error_seen[index]) | observed);
++	WRITE_ONCE(bank->error_last[index], observed);
++	WRITE_ONCE(bank->error_jiffies[index], jiffies);
++	WRITE_ONCE(bank->error_irqs[index],
++		   READ_ONCE(bank->error_irqs[index]) + 1);
++}
++
+ static irqreturn_t airoha_irq_handler(int irq, void *dev_instance)
+ {
+@@ -1930,4 +1958,5 @@
+ 		intr[i] = airoha_qdma_rr(qdma, REG_INT_STATUS(i));
+ 		intr[i] &= irq_bank->irqmask[i];
++		airoha_qdma_record_irq_error(irq_bank, i, intr[i]);
+ 		airoha_qdma_wr(qdma, REG_INT_STATUS(i), intr[i]);
+ 	}
+@@ -5085,4 +5114,31 @@
+ };
+ 
++static int airoha_qdma_irq_errors_show(struct seq_file *s, void *unused)
++{
++	struct airoha_eth *eth = s->private;
++	int id, bank, reg;
++
++	seq_puts(s, "# airoha-qdma-irq-errors 1\n");
++	seq_puts(s, "# lifetime acknowledged error IRQs, not packet drops; rows are not atomic snapshots\n");
++	seq_puts(s, "# qdma bank irq reg error_irqs seen last last_jiffies\n");
++	for (id = 0; id < ARRAY_SIZE(eth->qdma); id++) {
++		struct airoha_qdma *qdma = &eth->qdma[id];
++
++		for (bank = 0; bank < ARRAY_SIZE(qdma->irq_banks); bank++) {
++			struct airoha_irq_bank *b = &qdma->irq_banks[bank];
++
++			for (reg = 0; reg < QDMA_INT_REG_MAX; reg++)
++				seq_printf(s, "%d %d %d %d %llu %08x %08x %lu\n",
++					   id, bank, b->irq, reg,
++					   READ_ONCE(b->error_irqs[reg]),
++					   READ_ONCE(b->error_seen[reg]),
++					   READ_ONCE(b->error_last[reg]),
++					   READ_ONCE(b->error_jiffies[reg]));
++		}
++	}
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(airoha_qdma_irq_errors);
++
+ /* The internal dummy netdev is not enumerable through netdev-genl.
+  * Export hardware identities, including unrouted preallocated rings, so
+@@ -5164,4 +5220,6 @@
+ 		return;
+ 	eth->napi_debugfs = debugfs_create_dir(name, NULL);
++	debugfs_create_file("qdma_irq_errors", 0400, eth->napi_debugfs, eth,
++			    &airoha_qdma_irq_errors_fops);
+ 	debugfs_create_file("napi_map", 0400, eth->napi_debugfs, eth,
+ 			    &airoha_napi_map_fops);
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -607,4 +607,10 @@
+ 	u32 irqmask[QDMA_INT_REG_MAX];
+ 	int irq;
++
++	/* One hard-IRQ writer per bank; read-only lifetime diagnostics. */
++	u64 error_irqs[QDMA_INT_REG_MAX];
++	u32 error_seen[QDMA_INT_REG_MAX];
++	u32 error_last[QDMA_INT_REG_MAX];
++	unsigned long error_jiffies[QDMA_INT_REG_MAX];
+ };
+ 
