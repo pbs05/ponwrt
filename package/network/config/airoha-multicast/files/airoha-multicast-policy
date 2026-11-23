@@ -1,0 +1,75 @@
+#!/bin/sh
+# Event-driven policy application. No periodic daemon or packet processing.
+set -f
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+mode="$1"
+dir=/var/run/airoha-multicast
+umask 077
+mkdir -p "$dir" || exit 1
+exec 9>"$dir/lock"
+flock -x 9 || exit 1
+
+read_config() {
+	config_load airoha_multicast || return 1
+	config_get enabled main enabled 0
+	config_get upstream main upstream iptv
+	config_get downstream main downstream lan
+}
+
+validate() {
+	case "$enabled" in 0|1) ;; *) return 1 ;; esac
+	case "$upstream:$downstream" in *[!a-zA-Z0-9_:.-]*|:|:*|*:) return 1 ;; esac
+	[ "$enabled" = 0 ] || [ "$upstream" != "$downstream" ]
+}
+
+remember() {
+	printf '%s %s %s\n' "$enabled" "$upstream" "$downstream" > "$dir/policy.new" &&
+		mv "$dir/policy.new" "$dir/policy"
+}
+
+case "$mode" in
+	boot)
+		# Capture scope before netifd emits interface events.
+		[ ! -f "$dir/policy" ] || exit 0
+		read_config && validate && remember || exit 1
+		;;
+	apply)
+		read_config && validate || exit 1
+		# Allocate the new snapshot before changing hardware policy.
+		printf '%s %s %s\n' "$enabled" "$upstream" "$downstream" > "$dir/policy.new" || exit 1
+		;;
+	sync)
+		[ -f "$dir/policy" ] || exit 0
+		read -r enabled upstream downstream < "$dir/policy"
+		validate || exit 1
+		# Never apply saved-but-unapplied edits on an unrelated ifup.
+		case "${INTERFACE:-}" in "$upstream"|"$downstream") ;; *) exit 0 ;; esac
+		;;
+	stop)
+		/usr/sbin/airoha-mcastctl apply 0 >/dev/null || exit 1
+		rm -f "$dir/policy"
+		exit 0
+		;;
+	*) exit 2 ;;
+esac
+
+if [ "$enabled" = 1 ]; then
+	network_flush_cache
+	if ! network_get_device ingress "$upstream" || ! network_get_device egress "$downstream"; then
+		logger -t airoha-multicast 'Configured interfaces are unavailable; waiting for their ifup event'
+		[ "$mode" != apply ]
+		exit $?
+	fi
+	/usr/sbin/airoha-mcastctl apply 1 "$ingress" "$egress" >/dev/null || exit 1
+else
+	/usr/sbin/airoha-mcastctl apply 0 >/dev/null || exit 1
+fi
+if [ "$mode" = apply ] && ! mv "$dir/policy.new" "$dir/policy"; then
+	# Do not let an old snapshot undo a successfully applied hardware policy.
+	rm -f "$dir/policy"
+	logger -t airoha-multicast 'Policy accepted but recovery snapshot could not be stored; automatic rebinding disabled'
+	exit 1
+fi
+logger -t airoha-multicast 'Policy accepted; inspect running state for hardware readiness'

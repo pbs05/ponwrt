@@ -1,0 +1,4 @@
+#!/bin/sh
+case "$ACTION" in ifup|ifupdate) ;; *) exit 0 ;; esac
+# Re-resolve only the last applied logical scope; Save alone is not Apply.
+/usr/libexec/airoha-multicast-policy sync

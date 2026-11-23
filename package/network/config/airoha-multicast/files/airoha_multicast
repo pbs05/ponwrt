@@ -1,0 +1,4 @@
+config offload 'main'
+	option enabled '1'
+	option upstream 'iptv'
+	option downstream 'lan'

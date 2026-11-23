@@ -1,0 +1,67 @@
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Subject: [PATCH] net: airoha: decode IPv6 source MAC metadata in debugfs
+
+IPv6 entries encode a source MAC update-table index and PPPoE session ID
+in src_mac_hi. Treating it as an address manufactures a source MAC whose
+last two bytes are zero. Report the selector and, when enabled, PPPoE SID
+explicitly. Selector 0xf preserves the original packet source address.
+
+Only diagnostic formatting changes. IPv4 and native L2B address decoding
+remain unchanged, and reading the table issues no extra hardware requests.
+
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+--- a/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe_debugfs.c
+@@ -68,7 +68,7 @@
+ 		unsigned char h_dest[ETH_ALEN];
+ 		struct airoha_foe_entry *hwe;
+ 		u32 type, state, ib2, data;
+-		bool ipv6 = false;
++		bool ipv6 = false, smac_index = false;
+ 
+ 		hwe = airoha_ppe_foe_get_entry(ppe, i);
+ 		if (!hwe)
+@@ -149,6 +149,7 @@
+ 			data = hwe->ipv6.data;
+ 			ib2 = hwe->ipv6.ib2;
+ 			l2 = &hwe->ipv6.l2;
++			smac_index = true;
+ 		} else {
+ 			data = hwe->ipv4.data;
+ 			ib2 = hwe->ipv4.ib2;
+@@ -161,12 +162,30 @@
+ 
+ 		*((__be32 *)h_dest) = cpu_to_be32(l2->dest_mac_hi);
+ 		*((__be16 *)&h_dest[4]) = cpu_to_be16(l2->dest_mac_lo);
+-		*((__be32 *)h_source) = cpu_to_be32(l2->src_mac_hi);
+-
+-		seq_printf(m, " eth=%pM->%pM etype=%04x data=%08x"
++		if (smac_index) {
++			/* IPv6 stores an update-table selector and PPPoE SID here,
++			 * not the first four bytes of an Ethernet source address.
++			 * Selector 0xf preserves the packet's original source MAC.
++			 */
++			seq_printf(m, " eth=unknown->%pM", h_dest);
++			if (state == AIROHA_FOE_STATE_BIND) {
++				seq_printf(m, " smac_id=%u",
++					   (u32)FIELD_GET(AIROHA_FOE_MAC_SMAC_ID,
++						     l2->src_mac_hi));
++				if (hwe->ib1 & AIROHA_FOE_IB1_BIND_PPPOE)
++					seq_printf(m, " pppoe_sid=%u",
++						   (u32)FIELD_GET(AIROHA_FOE_MAC_PPPOE_ID,
++							     l2->src_mac_hi));
++			}
++		} else {
++			*((__be32 *)h_source) = cpu_to_be32(l2->src_mac_hi);
++			seq_printf(m, " eth=%pM->%pM", h_source, h_dest);
++		}
++
++		seq_printf(m, " etype=%04x data=%08x"
+ 			      " vlan=%d,%d ib1=%08x ib2=%08x"
+ 			      " packets=%llu bytes=%llu\n",
+-			   h_source, h_dest, l2->etype, data,
++			   l2->etype, data,
+ 			   l2->vlan1, l2->vlan2, hwe->ib1, ib2,
+ 			   stats.packets, stats.bytes);
+ 	}

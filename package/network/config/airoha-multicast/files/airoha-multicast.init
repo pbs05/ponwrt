@@ -1,0 +1,9 @@
+#!/bin/sh /etc/rc.common
+START=17
+STOP=89
+
+boot() { /usr/libexec/airoha-multicast-policy boot; }
+start() { /usr/libexec/airoha-multicast-policy apply; }
+reload() { start; }
+restart() { start; }
+stop() { /usr/libexec/airoha-multicast-policy stop; }
