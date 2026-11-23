@@ -71,6 +71,12 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      - name: Fix luci-app-upnp nftables counter regex
+        run: |
+          upnp_ucode="package/feeds/luci/luci-app-upnp/root/usr/share/rpcd/ucode/luci.upnp"
+          test -f "$upnp_ucode"
+          sed -i --follow-symlinks 's/th dport (\[0-9\]+) dnat ip to/th dport ([0-9]+).* dnat ip to/' "$upnp_ucode"
+
       - name: Load repository signing key
         env:
           PONWRT_APK_PRIVATE_KEY: ${{ secrets.PONWRT_APK_PRIVATE_KEY }}
