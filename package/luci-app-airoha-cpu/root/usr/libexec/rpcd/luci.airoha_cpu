@@ -1,0 +1,25 @@
+#!/bin/sh
+# Fixed operations only; no caller-provided command, path or arguments.
+case "$1:$2" in
+	list:*) printf '{"getStatus":{},"apply":{}}\n' ;;
+	call:getStatus)
+		result=$(/usr/sbin/airoha-cpuctl status 2>/dev/null) && printf '%s\n' "$result" ||
+			printf '{"error":"status_unavailable"}\n'
+		;;
+	call:apply)
+		result=$(/usr/sbin/airoha-cpuctl status 2>/dev/null) || {
+			printf '{"error":"status_unavailable"}\n'; exit 0;
+		}
+		if [ "$(printf '%s' "$result" | jsonfilter -e '@.state.active')" = true ] &&
+		   [ "$(printf '%s' "$result" | jsonfilter -e '@.state.trial')" = true ]; then
+			printf '{"error":"trial_active"}\n'; exit 0
+		fi
+		if result=$(/etc/init.d/airoha-cpu reload 2>&1); then
+			printf '{"ok":true}\n'
+		else
+			printf '%.1024s\n' "$result" | logger -t airoha-cpu
+			printf '{"error":"apply_failed"}\n'
+		fi
+		;;
+	*) exit 1 ;;
+esac

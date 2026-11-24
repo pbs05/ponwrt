@@ -1,0 +1,85 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: zh_Hans\n"
+
+msgid "Running policy"
+msgstr "当前运行策略"
+
+msgid "CPU policy status unavailable. Saved settings do not prove that the policy is active."
+msgstr "无法读取 CPU 策略状态。已保存的配置不代表策略已经生效。"
+
+msgid "A temporary trial is active. Finish or restore the trial before applying persistent settings."
+msgstr "临时试运行正在进行。请先结束或还原试运行，再应用持久配置。"
+
+msgid "CPU policy active"
+msgstr "CPU 调度策略已启用"
+
+msgid "CPU policy inactive"
+msgstr "CPU 调度策略未启用"
+
+msgid "Saved settings differ from the running policy. Apply them online; no reboot is needed."
+msgstr "已保存配置与运行策略不同，可在线应用，无需重启设备。"
+
+msgid "Affinity entries checked: %s; mismatches: %s; exited or unavailable objects: %s."
+msgstr "已核对亲和性项：%s；不匹配：%s；已退出或无法读取的对象：%s。"
+
+msgid "Restore failures or externally changed affinities were recorded. Inspect the controller status and system log."
+msgstr "记录到还原失败或其他程序修改亲和性，请检查控制工具状态和系统日志。"
+
+msgid "Refresh status"
+msgstr "刷新状态"
+
+msgid "Use CPU numbers 0–3, or a list such as 0,3."
+msgstr "请使用 CPU 编号 0～3，或 0,3 这样的列表。"
+
+msgid "WAN and LAN must use different CPUs. Other roles must exclude both of those CPUs."
+msgstr "WAN 和 LAN 必须使用不同的 CPU，其余职责必须避开这两个 CPU。"
+
+msgid "WAN receive and completion CPU"
+msgstr "WAN 接收及完成队列 CPU"
+
+msgid "LAN receive and completion CPU"
+msgstr "LAN 接收及完成队列 CPU"
+
+msgid "Special receive queues CPU"
+msgstr "特殊接收队列 CPU"
+
+msgid "Other device interrupts CPU"
+msgstr "其他设备中断 CPU"
+
+msgid "Ordinary applications CPUs"
+msgstr "普通应用允许使用的 CPU"
+
+msgid "Unbound workqueue CPUs"
+msgstr "非绑定工作队列允许使用的 CPU"
+
+msgid "Airoha CPU scheduling"
+msgstr "Airoha CPU 调度"
+
+msgid "Keep ingress IRQs and threaded NAPI together. Applying changes is online and may briefly increase jitter while tasks move between CPUs."
+msgstr "将入口中断与对应 NAPI 线程放在同一 CPU。配置可在线应用；任务迁移期间可能出现短暂抖动。"
+
+msgid "Enable CPU scheduling policy"
+msgstr "启用 CPU 调度策略"
+
+msgid "Disabling restores affinities owned by this controller. Existing custom application affinities are preserved."
+msgstr "关闭后还原本控制工具管理的亲和性，保留应用已有的自定义亲和性。"
+
+msgid "Scope"
+msgstr "作用范围"
+
+msgid "WAN/LAN describe packet ingress and completion queues, not every transmit instruction. Hardware forwarding is independent. Per-CPU workers, including WireGuard crypto workers, are not confined by the unbound-workqueue setting."
+msgstr "WAN/LAN 指入口及完成队列的调度位置，无法约束全部发送指令。硬件转发独立运行。非绑定工作队列设置不约束每 CPU 工作线程，包括 WireGuard 加密线程。"
+
+msgid "Settings saved. Use Save & Apply to apply them online."
+msgstr "配置已保存。点击“保存并应用”可在线生效。"
+
+msgid "A temporary trial is active."
+msgstr "临时试运行正在进行。"
+
+msgid "Apply failed. Settings remain saved; refresh status and inspect the system log."
+msgstr "应用失败，配置仍已保存；请刷新状态并检查系统日志。"
+
+msgid "CPU policy applied online."
+msgstr "CPU 调度策略已在线应用。"

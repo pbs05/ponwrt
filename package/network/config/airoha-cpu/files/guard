@@ -1,0 +1,13 @@
+#!/bin/sh
+# Detached, bounded-lease rollback. No dependence on the SSH client or procd.
+case "$1" in ''|*[!a-f0-9-]*) exit 1;; esac
+(
+	trap '' HUP
+	printf '%s\n' "$1" > /tmp/airoha-cpu/ready
+	while :; do
+		/usr/sbin/airoha-cpuctl watch "$1"
+		[ "$?" = 10 ] && exit 0
+		# Transient I/O/CLI failures must not disarm pending rollback.
+		sleep 2
+	done
+) </dev/null >>/tmp/airoha-cpu/watchdog.log 2>&1 &

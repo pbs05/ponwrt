@@ -1,0 +1,13 @@
+{
+	"luci-app-airoha-qos": {
+		"description": "Configure the Airoha boot QoS policy and read its status",
+		"read": {
+			"uci": [ "airoha_qos" ],
+			"ubus": { "luci.airoha_qos": [ "getStatus", "getDefaults" ] }
+		},
+		"write": {
+			"uci": [ "airoha_qos" ],
+			"ubus": { "uci": [ "commit" ] }
+		}
+	}
+}

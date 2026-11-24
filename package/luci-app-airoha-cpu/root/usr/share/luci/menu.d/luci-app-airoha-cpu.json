@@ -1,0 +1,8 @@
+{
+	"admin/system/airoha-cpu": {
+		"title": "Airoha CPU scheduling",
+		"order": 65,
+		"action": { "type": "view", "path": "airoha_cpu/settings" },
+		"depends": { "acl": [ "luci-app-airoha-cpu" ] }
+	}
+}

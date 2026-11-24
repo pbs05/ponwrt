@@ -1,0 +1,13 @@
+{
+	"luci-app-airoha-cpu": {
+		"description": "Configure and apply Airoha ingress CPU scheduling",
+		"read": {
+			"uci": [ "airoha_cpu" ],
+			"ubus": { "luci.airoha_cpu": [ "getStatus" ] }
+		},
+		"write": {
+			"uci": [ "airoha_cpu" ],
+			"ubus": { "uci": [ "commit" ], "luci.airoha_cpu": [ "apply" ] }
+		}
+	}
+}

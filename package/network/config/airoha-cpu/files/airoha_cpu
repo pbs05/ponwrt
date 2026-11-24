@@ -1,0 +1,8 @@
+config policy 'main'
+	option enabled '0'
+	option wan_cpu '1'
+	option lan_cpu '2'
+	option special_cpu '3'
+	option other_irq_cpu '0'
+	option service_cpus '0,3'
+	option unbound_cpus '0,3'
