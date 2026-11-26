@@ -1,0 +1,234 @@
+From: HG maintainers <hg@localhost>
+Subject: [PATCH] net: pcs: airoha: propagate PCS configuration failures
+
+Keep the first pre/post configuration failure until a new attempt starts.
+phylink's pre callback is void, so return the saved error from both later
+configuration callbacks and do not let link-up reopen a partially set port.
+Check Ethernet SCU selection and the MAC reset/fragment setup operations.
+
+Signed-off-by: HG maintainers <hg@localhost>
+---
+--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
+@@ -19,11 +19,12 @@
+ 
+ #include "pcs-airoha.h"
+ 
+-static void airoha_pcs_setup_scu_eth(struct airoha_pcs_priv *priv,
+-				     phy_interface_t interface)
++static int airoha_pcs_setup_scu_eth(struct airoha_pcs_priv *priv,
++				    phy_interface_t interface)
+ {
+ 	struct device *dev = priv->dev;
+ 	u32 xsi_sel;
++	int ret;
+ 
+ 	switch (interface) {
+ 	case PHY_INTERFACE_MODE_SGMII:
+@@ -37,15 +38,19 @@
+ 		xsi_sel = AIROHA_SCU_ETH_XSI_USXGMII;
+ 	}
+ 
+-	regmap_update_bits(priv->scu, AIROHA_SCU_SSR3,
+-			   AIROHA_SCU_ETH_XSI_SEL,
+-			   xsi_sel);
++	ret = regmap_update_bits(priv->scu, AIROHA_SCU_SSR3,
++				 AIROHA_SCU_ETH_XSI_SEL,
++				 xsi_sel);
++	if (ret)
++		return ret;
+ 
+ 	/* AN7583 require additional setting */
+ 	if (device_is_compatible(dev, "airoha,an7583-pcs-eth"))
+-		regmap_update_bits(priv->scu, AIROHA_SCU_WAN_CONF,
+-				   AIROHA_SCU_ETH_MAC_SEL,
+-				   AIROHA_SCU_ETH_MAC_SEL_XFI);
++		return regmap_update_bits(priv->scu, AIROHA_SCU_WAN_CONF,
++					  AIROHA_SCU_ETH_MAC_SEL,
++					  AIROHA_SCU_ETH_MAC_SEL_XFI);
++
++	return 0;
+ }
+ 
+ static void airoha_pcs_setup_scu_pon(struct airoha_pcs_priv *priv,
+@@ -158,7 +163,9 @@
+ 
+ 	switch (data->port_type) {
+ 	case AIROHA_PCS_ETH:
+-		airoha_pcs_setup_scu_eth(priv, interface);
++		ret = airoha_pcs_setup_scu_eth(priv, interface);
++		if (ret)
++			return ret;
+ 		break;
+ 	case AIROHA_PCS_PON:
+ 		airoha_pcs_setup_scu_pon(priv, interface);
+@@ -736,6 +743,26 @@
+ 	}
+ }
+ 
++/* Preserve the first failure until the next complete configuration attempt. */
++static int airoha_pcs_config_failed(struct airoha_pcs_port *port, int error)
++{
++	struct airoha_pcs_priv *priv = port->priv;
++
++	if (!port->config_error) {
++		port->config_error = error;
++		dev_err_ratelimited(priv->dev, "PCS %d configuration failed: %d\n",
++				    port->index, error);
++	}
++
++	/* Best effort: never reopen a port after partially programming it. */
++	regmap_set_bits(priv->maps[port->index].pcs_mac,
++			AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			AIROHA_PCS_XFI_RXMPI_STOP | AIROHA_PCS_XFI_RXMBI_STOP |
++			AIROHA_PCS_XFI_TXMPI_STOP | AIROHA_PCS_XFI_TXMBI_STOP);
++
++	return port->config_error;
++}
++
+ static int airoha_pcs_config(struct phylink_pcs *pcs, unsigned int neg_mode,
+ 			     phy_interface_t interface,
+ 			     const unsigned long *advertising,
+@@ -749,6 +776,9 @@
+ 	u32 rate_adapt;
+ 	int ret;
+ 
++	if (port->config_error)
++		return port->config_error;
++
+ 	maps = &priv->maps[port->index];
+ 	port->interface = interface;
+ 	data = priv->data;
+@@ -757,7 +787,7 @@
+ 	if (data->bringup) {
+ 		ret = data->bringup(priv, index, interface);
+ 		if (ret)
+-			return ret;
++			return airoha_pcs_config_failed(port, ret);
+ 	}
+ 
+ 	/* Set final configuration for various modes */
+@@ -989,6 +1019,9 @@
+ 	struct airoha_pcs_priv *priv = port->priv;
+ 	const struct airoha_pcs_match_data *data;
+ 	struct airoha_pcs_maps *maps;
++
++	if (port->config_error)
++		return;
+ 
+ 	maps = &priv->maps[port->index];
+ 	data = priv->data;
+@@ -1164,30 +1197,45 @@
+ 	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
+ 	struct airoha_pcs_priv *priv = port->priv;
+ 	struct airoha_pcs_maps *maps;
++	int ret;
+ 
+ 	maps = &priv->maps[port->index];
++	port->config_error = 0;
+ 
+ 	/* Select HSGMII or USXGMII in SCU regs */
+-	airoha_pcs_setup_scu(priv, port->index, interface);
++	ret = airoha_pcs_setup_scu(priv, port->index, interface);
++	if (ret)
++		goto failed;
+ 
+ 	/* MPI MBI disable */
+-	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			AIROHA_PCS_XFI_RXMPI_STOP |
+-			AIROHA_PCS_XFI_RXMBI_STOP |
+-			AIROHA_PCS_XFI_TXMPI_STOP |
+-			AIROHA_PCS_XFI_TXMBI_STOP);
++	ret = regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++			      AIROHA_PCS_XFI_RXMPI_STOP |
++			      AIROHA_PCS_XFI_RXMBI_STOP |
++			      AIROHA_PCS_XFI_TXMPI_STOP |
++			      AIROHA_PCS_XFI_TXMBI_STOP);
++	if (ret)
++		goto failed;
+ 
+ 	/* Write 1 to trigger reset and clear */
+-	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_LOGIC_RST,
+-			  AIROHA_PCS_XFI_MAC_LOGIC_RST);
+-	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_LOGIC_RST,
+-			AIROHA_PCS_XFI_MAC_LOGIC_RST);
++	ret = regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_LOGIC_RST,
++				AIROHA_PCS_XFI_MAC_LOGIC_RST);
++	if (ret)
++		goto failed;
++	ret = regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_LOGIC_RST,
++			      AIROHA_PCS_XFI_MAC_LOGIC_RST);
++	if (ret)
++		goto failed;
+ 
+ 	usleep_range(1000, 2000);
+ 
+ 	/* Clear XFI MAC counter */
+-	regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_CNT_CLR,
+-			AIROHA_PCS_XFI_GLB_CNT_CLR);
++	ret = regmap_set_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_CNT_CLR,
++			      AIROHA_PCS_XFI_GLB_CNT_CLR);
++	if (!ret)
++		return;
++
++failed:
++	airoha_pcs_config_failed(port, ret);
+ }
+ 
+ static int airoha_pcs_post_config(struct phylink_pcs *pcs,
+@@ -1196,23 +1244,36 @@
+ 	struct airoha_pcs_port *port = to_airoha_pcs_port(pcs);
+ 	struct airoha_pcs_priv *priv = port->priv;
+ 	struct airoha_pcs_maps *maps;
++	int ret;
++
++	if (port->config_error)
++		return port->config_error;
+ 
+ 	maps = &priv->maps[port->index];
+ 
+ 	/* Frag disable */
+-	regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			   AIROHA_PCS_XFI_RX_FRAG_LEN,
+-			   FIELD_PREP(AIROHA_PCS_XFI_RX_FRAG_LEN, 31));
+-	regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			   AIROHA_PCS_XFI_TX_FRAG_LEN,
+-			   FIELD_PREP(AIROHA_PCS_XFI_TX_FRAG_LEN, 31));
++	ret = regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++				 AIROHA_PCS_XFI_RX_FRAG_LEN,
++				 FIELD_PREP(AIROHA_PCS_XFI_RX_FRAG_LEN, 31));
++	if (ret)
++		goto failed;
++	ret = regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++				 AIROHA_PCS_XFI_TX_FRAG_LEN,
++				 FIELD_PREP(AIROHA_PCS_XFI_TX_FRAG_LEN, 31));
++	if (ret)
++		goto failed;
+ 
+ 	/* IPG NUM */
+-	regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+-			   AIROHA_PCS_XFI_IPG_NUM,
+-			   FIELD_PREP(AIROHA_PCS_XFI_IPG_NUM, 10));
++	ret = regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++				 AIROHA_PCS_XFI_IPG_NUM,
++				 FIELD_PREP(AIROHA_PCS_XFI_IPG_NUM, 10));
++	if (ret)
++		goto failed;
+ 
+ 	return 0;
++
++failed:
++	return airoha_pcs_config_failed(port, ret);
+ }
+ 
+ static unsigned int airoha_pcs_inband_caps(struct phylink_pcs *pcs,
+--- a/drivers/net/pcs/airoha/pcs-airoha.h
++++ b/drivers/net/pcs/airoha/pcs-airoha.h
+@@ -1687,6 +1687,7 @@
+ 	struct airoha_pcs_priv *priv;
+ 	phy_interface_t interface;
+ 	int index;
++	int config_error;
+ 
+ 	struct phylink_pcs pcs;
+ };
