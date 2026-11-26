@@ -1,0 +1,33 @@
+#!/bin/sh
+# Bounded boot-only worker. No daemon, packet processing, firewall or tc rules.
+. /lib/functions/network.sh
+
+enabled="$1"
+upstream="$2"
+downstream="$3"
+case "$enabled" in 0|1) ;; *) exit 2;; esac
+case "$upstream:$downstream" in *[!a-zA-Z0-9_:.-]*|:|:*|*:) exit 2;; esac
+umask 077
+mkdir /var/run/airoha-multicast.boot 2>/dev/null || exit 0
+
+if [ "$enabled" = 0 ]; then
+	/usr/sbin/airoha-mcastctl apply 0 ||
+		logger -t airoha-multicast 'Disabled policy unavailable; backend remains inactive'
+	exit 0
+fi
+
+attempt=0
+while [ "$attempt" -lt 150 ]; do
+	network_flush_cache
+	if network_get_device ingress "$upstream" &&
+	   network_get_device egress "$downstream"; then
+		# Kernel validates PON ingress, bridge egress and derives both VIDs.
+		if /usr/sbin/airoha-mcastctl apply 1 "$ingress" "$egress"; then
+			logger -t airoha-multicast "Boot policy frozen: $ingress to $egress; inspect status for actual bindings"
+			exit 0
+		fi
+	fi
+	attempt=$((attempt + 1))
+	sleep 2
+done
+logger -t airoha-multicast 'Boot scope unavailable after 150 attempts; software forwarding retained; check UCI then reboot'

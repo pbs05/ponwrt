@@ -1,0 +1,13 @@
+{
+	"luci-app-airoha-multicast": {
+		"description": "Configure and apply Airoha multicast offload",
+		"read": {
+			"uci": [ "airoha_multicast", "network" ],
+			"ubus": { "luci.airoha_multicast": [ "getStatus" ], "network.interface": [ "dump" ] }
+		},
+		"write": {
+			"uci": [ "airoha_multicast" ],
+			"ubus": { "uci": [ "commit" ], "luci.airoha_multicast": [ "apply" ] }
+		}
+	}
+}

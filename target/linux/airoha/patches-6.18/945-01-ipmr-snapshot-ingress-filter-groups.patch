@@ -1,0 +1,143 @@
+From dcbadcad334d8e34a22cec280bdeeb3a6a2faeca Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:40:42 +0800
+Subject: [PATCH] ipmr: snapshot explicit ingress multicast groups before
+ report
+
+Consolidate retained group admission, drop-only matching and applied-state fixes.
+---
+ include/linux/mroute.h |  3 ++
+ net/ipv4/igmp.c        |  5 ++-
+ net/ipv4/ipmr.c        | 78 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/mroute.h b/include/linux/mroute.h
+index 67f5397..85a265b 100644
+--- a/include/linux/mroute.h
++++ b/include/linux/mroute.h
+@@ -83,6 +83,9 @@ struct ipmr_offload_event {
+ #ifdef CONFIG_IP_MROUTE
+ int ipmr_offload_snapshot(struct net_device *in, __be32 source, __be32 group,
+ 			 struct ipmr_offload_route *route);
++/* Append routed groups for an ingress filter. RTNL must be held. */
++int ipmr_offload_group_snapshot(struct net_device *in, __be32 *groups,
++			       unsigned int *count, unsigned int capacity);
+ int ipmr_offload_register(struct notifier_block *nb);
+ void ipmr_offload_unregister(struct notifier_block *nb);
+ void ipmr_offload_notify(struct net *net, struct net_device *dev, __be32 group);
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+index 978f684..66b6658 100644
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -1608,8 +1608,11 @@ static void ____ip_mc_inc_group(struct in_device *in_dev, __be32 addr,
+ #ifdef CONFIG_IP_MULTICAST
+ 	igmpv3_del_delrec(in_dev, im);
+ #endif
+-	igmp_group_added(im);
+ 	ipmr_offload_notify(dev_net(in_dev->dev), in_dev->dev, addr);
++	/* Let ingress filters admit the group before its first report can
++	 * solicit data. The published membership is already visible here.
++	 */
++	igmp_group_added(im);
+ 	inet_ifmcaddr_notify(in_dev->dev, im, RTM_NEWMULTICAST);
+ 	if (!in_dev->dead)
+ 		ip_rt_multicast_event(in_dev);
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index 1a4a07b..469744f 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -1069,6 +1069,83 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(ipmr_offload_snapshot);
+ 
++/* A group-level ingress filter must also admit explicitly routed groups.
++ * No packet or resolved (S,G) is needed for a local socket membership;
++ * callers collect those separately. This snapshot only adds positive MFC
++ * routes, never unresolved/negative data-created cache entries. Source
++ * filtering and actual forwarding authorization remain in the IP stack.
++ */
++int ipmr_offload_group_snapshot(struct net_device *in, __be32 *groups,
++			       unsigned int *count, unsigned int capacity)
++{
++	struct net *net = dev_net(in);
++	struct mr_table *mrt;
++	int err = 0;
++
++	ASSERT_RTNL();
++	if (*count > capacity)
++		return -EINVAL;
++	rcu_read_lock();
++	spin_lock_bh(&mrt_lock);
++	ipmr_for_each_table(mrt, net) {
++		struct mr_mfc *entry;
++		int i;
++		bool is_vif = false;
++
++		for (i = 0; i < mrt->maxvif; i++)
++			if (vif_dev_read(&mrt->vif_table[i]) == in)
++				is_vif = true;
++		if (!is_vif)
++			continue;
++		/* PIM may need unjoined data to discover sources or assert a
++		 * route. Its discovery cannot depend on an existing whitelist.
++		 */
++		if (mrt->mroute_do_pim || mrt->mroute_do_wrvifwhole) {
++			err = -EOPNOTSUPP;
++			goto out;
++		}
++		list_for_each_entry(entry, &mrt->mfc_cache_list, list) {
++			struct mfc_cache *c = (struct mfc_cache *)entry;
++			unsigned int n;
++			bool output = false;
++
++			if (entry->mfc_parent >= MAXVIFS ||
++			    vif_dev_read(&mrt->vif_table[entry->mfc_parent]) != in)
++				continue;
++			for (i = entry->mfc_un.res.minvif;
++			     i < entry->mfc_un.res.maxvif; i++)
++				if (i != entry->mfc_parent &&
++				    entry->mfc_un.res.ttls[i] < 255 &&
++				    vif_dev_read(&mrt->vif_table[i]))
++					output = true;
++			if (!output)
++				continue;
++			if (!c->mfc_mcastgrp) {
++				err = -EOPNOTSUPP;
++				goto out;
++			}
++			if (!ipv4_is_multicast(c->mfc_mcastgrp) ||
++			    ipv4_is_local_multicast(c->mfc_mcastgrp))
++				continue;
++			for (n = 0; n < *count; n++)
++				if (groups[n] == c->mfc_mcastgrp)
++					break;
++			if (n < *count)
++				continue;
++			if (*count == capacity) {
++				err = -ENOSPC;
++				goto out;
++			}
++			groups[(*count)++] = c->mfc_mcastgrp;
++		}
++	}
++out:
++	spin_unlock_bh(&mrt_lock);
++	rcu_read_unlock();
++	return err;
++}
++EXPORT_SYMBOL_GPL(ipmr_offload_group_snapshot);
++
+ static struct mfc_cache *ipmr_cache_find_any(struct mr_table *mrt,
+ 					     __be32 mcastgrp, int vifi)
+ {
+@@ -1668,6 +1745,7 @@ int ip_mroute_setsockopt(struct sock *sk, int optname, sockptr_t optval,
+ 			mrt->mroute_do_pim = val;
+ 			mrt->mroute_do_assert = val;
+ 			mrt->mroute_do_wrvifwhole = do_wrvifwhole;
++			ipmr_offload_notify(net, NULL, 0);
+ 		}
+ 		break;
+ 	case MRT_TABLE:
+-- 
+2.53.0
+

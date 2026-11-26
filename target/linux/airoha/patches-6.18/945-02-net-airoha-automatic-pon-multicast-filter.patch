@@ -1,0 +1,910 @@
+From 1b03c2c11285108d985d4af60902468478d4361d Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:40:42 +0800
+Subject: [PATCH] net: airoha: add automatic drop-only PON multicast admission
+
+Consolidate retained group admission, drop-only matching and applied-state fixes.
+---
+ drivers/net/ethernet/airoha/Makefile     |   2 +-
+ drivers/net/ethernet/airoha/airoha_eth.c |   3 +
+ drivers/net/ethernet/airoha/airoha_eth.h |   1 +
+ drivers/net/ethernet/airoha/airoha_ifc.c | 817 +++++++++++++++++++++++
+ drivers/net/ethernet/airoha/airoha_ifc.h |  14 +
+ 5 files changed, 836 insertions(+), 1 deletion(-)
+ create mode 100644 drivers/net/ethernet/airoha/airoha_ifc.c
+ create mode 100644 drivers/net/ethernet/airoha/airoha_ifc.h
+
+diff --git a/drivers/net/ethernet/airoha/Makefile b/drivers/net/ethernet/airoha/Makefile
+index 2bbfbb7..1ed6f00 100644
+--- a/drivers/net/ethernet/airoha/Makefile
++++ b/drivers/net/ethernet/airoha/Makefile
+@@ -13,2 +13,3 @@
+ obj-$(CONFIG_NET_AIROHA_NPU) += airoha_npu.o
++airoha-eth-$(CONFIG_NET_AIROHA_MCAST) += airoha_ifc.o
+ obj-$(CONFIG_NET_AIROHA_QOS_KUNIT_TEST) += airoha_qos_test.o
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 771e2de..3cdf9e2 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -22,6 +22,7 @@
+ 
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
++#include "airoha_ifc.h"
+ 
+ static const struct net_device_ops airoha_netdev_ops;
+ 
+@@ -5332,6 +5333,7 @@ static int airoha_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	airoha_napi_map_init(eth);
++	airoha_ifc_init(eth);
+ 	return 0;
+ 
+ error_napi_stop:
+@@ -5377,6 +5379,7 @@ static void airoha_remove(struct platform_device *pdev)
+ 	int i;
+ 
+ 	/* Drain readers before destroying any referenced NAPI/thread. */
++	airoha_ifc_exit(eth);
+ 	debugfs_remove_recursive(eth->napi_debugfs);
+ 
+ 	if (airoha_is_7581(eth))
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 2c4585b..b9f990c 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -778,6 +778,7 @@ struct airoha_eth_soc_data {
+ };
+ 
+ struct airoha_eth {
++	struct airoha_ifc *ifc;
+ 	/* Enabled only by the coordinated boot profile. */
+ 	struct airoha_qos_domain qos;
+ 	u32 qos_saved[AIROHA_MAX_NUM_QDMA][4];
+diff --git a/drivers/net/ethernet/airoha/airoha_ifc.c b/drivers/net/ethernet/airoha/airoha_ifc.c
+new file mode 100644
+index 0000000..4d1ac34
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ifc.c
+@@ -0,0 +1,817 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* AN7581 PON IPv4/IPoE multicast admission, driven by kernel membership.
++ * No packet learning, polling daemon, user policy or player dependency.
++ * This is a group filter, not an ACL: IPMR/UDP still enforce source filters.
++ */
++#include <linux/debugfs.h>
++#include <linux/if_vlan.h>
++#include <linux/igmp.h>
++#include <linux/inetdevice.h>
++#include <linux/iopoll.h>
++#include <linux/mroute.h>
++#include <linux/rtnetlink.h>
++#include <linux/seq_file.h>
++#include <linux/workqueue.h>
++#include <net/ip.h>
++#include <net/ip_fib.h>
++#include "airoha_eth.h"
++#include "airoha_ifc.h"
++
++/* SDK IFC register/table layout; field encodings independently exercised
++ * with the board's original IFC implementation and bounded live probes.
++ */
++#define IFC_PORT		0x1f4
++#define IFC_CFG		0x200
++#define IFC_CTRL		0x204
++#define IFC_DATA(n)	(0x210 + 4 * (n))
++#define IFC_ENABLE	BIT(0)
++#define IFC_ACK		BIT(31)
++#define IFC_PON		BIT(2)
++#define IFC_PORTS	GENMASK(8, 0)
++#define IFC_RULES	64
++#define IFC_LUTS		32
++#define IFC_COMMON_LUTS	3
++#define IFC_MIB		31
++#define IFC_VALID	BIT(31)
++#define IFC_END		BIT(30)
++#define IFC_COUNT	(BIT(27) | (IFC_MIB << 16))
++#define IFC_LUT_VALID	(BIT(15) | BIT(14))
++#define IFC_UDP		BIT(0)
++#define IFC_MULTICAST	BIT(1)
++#define IFC_LINK_LOCAL	BIT(2)
++
++struct ifc_rule {
++	u32 key[9], mask[9], action[6];
++};
++
++struct ifc_scope {
++	__be32 groups[IFC_RULES];
++	unsigned int count;
++	u16 vid;
++	bool tagged, bypass;
++};
++
++/* One scope per distinct VLAN lookup plus the untagged PON. Store lookup
++ * bits, not a duplicated group list for each VLAN. Diagnostics never read
++ * back TCAM/LUT tables or affect the packet path.
++ */
++struct ifc_admission {
++	u32 groups;
++	u16 vid;
++	bool tagged, bypass;
++};
++
++struct ifc_applied {
++	struct ifc_admission scopes[IFC_LUTS + 1];
++	u32 lut[IFC_LUTS][2];
++	u64 generation;
++	unsigned int rules, lookups, groups, count, bypass;
++};
++
++struct airoha_ifc {
++	struct airoha_eth *eth;
++	struct net_device *pon;
++	struct notifier_block member_nb, net_nb, addr_nb, fib_nb;
++	struct work_struct work;
++	/* A notification only closes the hardware gate and queues work.
++	 * It never waits for RTNL, the route lock or a table transaction.
++	 */
++	spinlock_t gate_lock;
++	struct mutex mutex;
++	struct dentry *debugfs;
++	struct ifc_rule saved[IFC_RULES], rules[IFC_RULES];
++	u32 saved_lut[IFC_LUTS][2], lut[IFC_LUTS][2];
++	u32 saved_cfg, saved_port, saved_data[4];
++	struct ifc_admission scopes[IFC_LUTS + 1];
++	struct ifc_applied applied;
++	u64 generation, attempted_generation, updates, events, errors, mib_base;
++	unsigned int rule_count, lut_count, group_count, scope_count, bypass_count;
++	int last_error;
++	bool ready, owned, active, stopping, broken;
++};
++
++static int ifc_request(struct airoha_ifc *ifc, unsigned int id,
++		       unsigned int offset, unsigned int table, bool write)
++{
++	u32 value;
++
++	airoha_fe_wr(ifc->eth, IFC_CTRL,
++		     id << 16 | offset << 8 | table << 4 | write << 1 | 1);
++	return read_poll_timeout(airoha_fe_rr, value, value & IFC_ACK,
++				 10, 1000, false, ifc->eth, IFC_CTRL);
++}
++
++static int ifc_action(struct airoha_ifc *ifc, unsigned int id,
++		      u32 action[6], bool write)
++{
++	static const u8 first[] = { 5, 3, 0 }, count[] = { 2, 3, 1 };
++	unsigned int i, j;
++	int err;
++
++	for (i = 0; i < ARRAY_SIZE(first); i++) {
++		if (write)
++			for (j = 0; j < count[i]; j++)
++				airoha_fe_wr(ifc->eth, IFC_DATA(j), action[first[i] - j]);
++		err = ifc_request(ifc, id, i, 2, write);
++		if (err)
++			return err;
++		if (!write)
++			for (j = 0; j < count[i]; j++)
++				action[first[i] - j] = airoha_fe_rr(ifc->eth, IFC_DATA(j));
++	}
++	return 0;
++}
++
++static int ifc_key(struct airoha_ifc *ifc, unsigned int id,
++		   struct ifc_rule *rule, bool write)
++{
++	unsigned int i;
++	int err;
++
++	for (i = 0; i < ARRAY_SIZE(rule->key); i++) {
++		if (write) {
++			airoha_fe_wr(ifc->eth, IFC_DATA(0), rule->key[i]);
++			airoha_fe_wr(ifc->eth, IFC_DATA(1), rule->mask[i]);
++		}
++		err = ifc_request(ifc, id, 8 - i, 0, write);
++		if (err)
++			return err;
++		if (!write) {
++			rule->key[i] = airoha_fe_rr(ifc->eth, IFC_DATA(0));
++			rule->mask[i] = airoha_fe_rr(ifc->eth, IFC_DATA(1));
++		}
++	}
++	return 0;
++}
++
++static int ifc_lut(struct airoha_ifc *ifc, unsigned int id,
++		   u32 words[2], bool write)
++{
++	int err;
++
++	if (write) {
++		airoha_fe_wr(ifc->eth, IFC_DATA(0), words[0]);
++		airoha_fe_wr(ifc->eth, IFC_DATA(1), words[1]);
++	}
++	err = ifc_request(ifc, id, 0, 1, write);
++	if (!err && !write) {
++		words[0] = airoha_fe_rr(ifc->eth, IFC_DATA(0));
++		words[1] = airoha_fe_rr(ifc->eth, IFC_DATA(1));
++	}
++	return err;
++}
++
++static int ifc_mib(struct airoha_ifc *ifc, u64 *packets)
++{
++	int err = ifc_request(ifc, IFC_MIB, 0, 3, false);
++
++	if (!err)
++		*packets = airoha_fe_rr(ifc->eth, IFC_DATA(2)) |
++			   (u64)(airoha_fe_rr(ifc->eth, IFC_DATA(3)) & 0xffffff) << 32;
++	return err;
++}
++
++static void ifc_gate_close(struct airoha_ifc *ifc)
++{
++	lockdep_assert_held(&ifc->gate_lock);
++	if (ifc->owned) {
++		airoha_fe_wr(ifc->eth, IFC_CFG, ifc->saved_cfg);
++		airoha_fe_rr(ifc->eth, IFC_CFG);
++	}
++	ifc->active = false;
++}
++
++static void ifc_changed(struct airoha_ifc *ifc)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&ifc->gate_lock, flags);
++	if (ifc->ready && !ifc->stopping && !ifc->broken) {
++		ifc_gate_close(ifc);
++		ifc->generation++;
++		ifc->events++;
++		queue_work(system_unbound_wq, &ifc->work);
++	}
++	spin_unlock_irqrestore(&ifc->gate_lock, flags);
++}
++
++static bool ifc_related(struct airoha_ifc *ifc, struct net_device *dev)
++{
++	while (is_vlan_dev(dev))
++		dev = vlan_dev_real_dev(dev);
++	return dev == ifc->pon;
++}
++
++static int ifc_member_notify(struct notifier_block *nb,
++			     unsigned long event, void *data)
++{
++	struct airoha_ifc *ifc = container_of(nb, struct airoha_ifc, member_nb);
++	const struct ipmr_offload_event *info = data;
++
++	if (net_eq(info->net, &init_net) &&
++	    (!info->dev || ifc_related(ifc, info->dev)))
++		ifc_changed(ifc);
++	return NOTIFY_DONE;
++}
++
++static int ifc_net_notify(struct notifier_block *nb,
++			  unsigned long event, void *data)
++{
++	struct airoha_ifc *ifc = container_of(nb, struct airoha_ifc, net_nb);
++	struct net_device *dev = netdev_notifier_info_to_dev(data);
++
++	if (ifc_related(ifc, dev))
++		ifc_changed(ifc);
++	return NOTIFY_DONE;
++}
++
++static int ifc_addr_notify(struct notifier_block *nb,
++			   unsigned long event, void *data)
++{
++	struct airoha_ifc *ifc = container_of(nb, struct airoha_ifc, addr_nb);
++	struct in_ifaddr *ifa = data;
++
++	if (ifc_related(ifc, ifa->ifa_dev->dev))
++		ifc_changed(ifc);
++	return NOTIFY_DONE;
++}
++
++static int ifc_fib_notify(struct notifier_block *nb,
++			  unsigned long event, void *data)
++{
++	struct airoha_ifc *ifc = container_of(nb, struct airoha_ifc, fib_nb);
++	struct fib_notifier_info *info = data;
++
++	if (info->family == RTNL_FAMILY_IPMR)
++		ifc_changed(ifc);
++	return NOTIFY_DONE;
++}
++
++static int ifc_add_group(struct ifc_scope *scope, __be32 group)
++{
++	unsigned int i;
++
++	if (!ipv4_is_multicast(group) || ipv4_is_local_multicast(group))
++		return 0;
++	for (i = 0; i < scope->count; i++)
++		if (scope->groups[i] == group)
++			return 0;
++	if (scope->count == ARRAY_SIZE(scope->groups))
++		return -ENOSPC;
++	scope->groups[scope->count++] = group;
++	return 0;
++}
++
++/* Type 0 carries the VLAN-valid/PPPoE flags; LUT1 selectors only cover
++ * fields 1..47. Use native VLAN qualifiers and LUT1 for full IPv4 groups.
++ * A format-1 LUT prefix length of zero means an exact 32-bit comparison.
++ */
++static int ifc_add_drop(struct airoha_ifc *ifc, bool tagged, int vid,
++			u32 exclude_hits)
++{
++	struct ifc_rule *r;
++
++	if (ifc->rule_count == IFC_RULES)
++		return -ENOSPC;
++	r = &ifc->rules[ifc->rule_count++];
++	memset(r, 0, sizeof(*r));
++	r->key[0] = BIT(1); /* type 0, valid IPv4 */
++	r->mask[0] = 0xc2;
++	/* IPoE, at most one VLAN. PPPoE and QinQ use ordinary networking. */
++	r->mask[1] = BIT(10) | BIT(4) | BIT(5);
++	if (tagged) {
++		r->key[1] = BIT(5);
++		if (vid >= 0) {
++			r->key[2] = (u32)vid << 20;
++			r->mask[2] = 0xfff00000;
++		}
++	}
++	r->key[3] = ETH_P_IP;
++	r->mask[3] = 0xffff;
++	/* An admitted packet must MISS IFC entirely. Even a terminal no-op
++	 * hit changes multicast learning on AN7581: its learned HSK loses the
++	 * ingress VID and the packet keeps returning as PPE UN_HIT. Match
++	 * only UDP multicast with every allowed group/scope lookup bit clear.
++	 */
++	r->key[4] = IFC_UDP | IFC_MULTICAST;
++	r->mask[4] = r->key[4] | IFC_LINK_LOCAL | exclude_hits;
++	r->key[8] = r->mask[8] = IFC_PON;
++	r->action[0] = IFC_VALID | IFC_END | IFC_COUNT;
++	r->action[2] = BIT(28); /* force-port enable */
++	r->action[5] = 15 << 8; /* discard, no CPU destination */
++	return 0;
++}
++
++static int ifc_lookup(struct airoha_ifc *ifc, u32 value, u32 format,
++		      u32 *hits)
++{
++	unsigned int n;
++
++	for (n = IFC_COMMON_LUTS; n < ifc->lut_count; n++)
++		if (ifc->lut[n][0] == value && ifc->lut[n][1] == format)
++			break;
++	if (n == IFC_LUTS)
++		return -ENOSPC;
++	if (n == ifc->lut_count) {
++		ifc->lut[n][0] = value;
++		ifc->lut[n][1] = format;
++		ifc->lut_count++;
++	}
++	*hits |= BIT(n);
++	return 0;
++}
++
++static int ifc_scope_rules(struct airoha_ifc *ifc, struct ifc_scope *scope,
++			   u32 *vid_hits, u32 *untagged_hits,
++			   bool *untagged_bypass)
++{
++	u32 groups = 0;
++	unsigned int i;
++	int err;
++
++	if (!scope->count && !scope->bypass)
++		return 0;
++	ifc->scope_count++;
++	if (scope->tagged) {
++		/* Exclude this VID from the tagged default discard. Its own
++		 * discard below excludes just the groups admitted on this VID.
++		 */
++		err = ifc_lookup(ifc, 0x0fff0000 | scope->vid,
++				 IFC_LUT_VALID | 18, vid_hits);
++		if (err)
++			return err;
++	}
++	if (scope->bypass) {
++		ifc->scopes[ifc->scope_count - 1] = (struct ifc_admission) {
++			.vid = scope->vid, .tagged = scope->tagged, .bypass = true,
++		};
++		ifc->bypass_count++;
++		if (!scope->tagged)
++			*untagged_bypass = true;
++		return 0;
++	}
++	for (i = 0; i < scope->count; i++) {
++		err = ifc_lookup(ifc, ntohl(scope->groups[i]),
++				 IFC_LUT_VALID | BIT(13) | 3, &groups);
++		if (err)
++			return err;
++		ifc->group_count++;
++	}
++	ifc->scopes[ifc->scope_count - 1] = (struct ifc_admission) {
++		.groups = groups, .vid = scope->vid, .tagged = scope->tagged,
++		/* Priority-tagged VID 0 always bypasses the tagged default. */
++		.bypass = scope->tagged && !scope->vid,
++	};
++	if (scope->tagged && scope->vid)
++		return ifc_add_drop(ifc, true, scope->vid, groups);
++	if (!scope->tagged)
++		*untagged_hits |= groups;
++	return 0;
++}
++
++static int ifc_snapshot(struct airoha_ifc *ifc)
++{
++	static const u32 common[IFC_COMMON_LUTS][2] = {
++		{ 0x00ff0011, IFC_LUT_VALID | 24 }, /* IPv4 UDP */
++		{ 0xe0000000, IFC_LUT_VALID | BIT(13) | (4 << 8) | 3 },
++		{ 0xe0000000, IFC_LUT_VALID | BIT(13) | (24 << 8) | 3 },
++	};
++	struct net_device *dev, *upper;
++	struct list_head *iter;
++	u32 vid_hits = 0, untagged_hits = 0;
++	bool supported = true, untagged_bypass = false;
++	int err;
++
++	ASSERT_RTNL();
++	ifc->rule_count = 0;
++	ifc->group_count = 0;
++	ifc->scope_count = 0;
++	ifc->bypass_count = 0;
++	ifc->lut_count = IFC_COMMON_LUTS;
++	memset(ifc->scopes, 0, sizeof(ifc->scopes));
++	memset(ifc->lut, 0, sizeof(ifc->lut));
++	memcpy(ifc->lut, common, sizeof(common));
++	if (!net_eq(dev_net(ifc->pon), &init_net) ||
++	    ifc->pon->reg_state != NETREG_REGISTERED ||
++	    netif_is_bridge_port(ifc->pon))
++		return -EOPNOTSUPP;
++	/* A VLAN can move namespaces independently of its PON lower device.
++	 * This owner only observes init_net routing and memberships. Do not
++	 * install a default discard over a scope we cannot observe.
++	 */
++	rcu_read_lock();
++	netdev_for_each_upper_dev_rcu(ifc->pon, upper, iter)
++		if (!net_eq(dev_net(upper), &init_net))
++			supported = false;
++	rcu_read_unlock();
++	if (!supported)
++		return -EOPNOTSUPP;
++	/* Link-local control/discovery remains ordinary networking. IGMP,
++	 * unicast, IPv6, PPPoE and QinQ do not match the UDP/IPoE rules.
++	 */
++	/* VID 0 can demultiplex to the physical device. Exclude it from
++	 * the tagged default rule without installing any terminal ALLOW.
++	 */
++	err = ifc_lookup(ifc, 0x0fff0000, IFC_LUT_VALID | 18, &vid_hits);
++	if (err)
++		return err;
++	for_each_netdev(&init_net, dev) {
++		struct ifc_scope scope = {};
++		struct net_device *real = dev, *upper;
++		struct in_device *idev;
++		struct ip_mc_list *im;
++		struct list_head *iter;
++
++		if (!netif_running(dev))
++			continue;
++		if (is_vlan_dev(dev)) {
++			real = vlan_dev_real_dev(dev);
++			if (real == ifc->pon &&
++			    vlan_dev_vlan_proto(dev) != htons(ETH_P_8021Q))
++				return -EOPNOTSUPP;
++			scope.tagged = true;
++			scope.vid = vlan_dev_vlan_id(dev);
++		}
++		if (real != ifc->pon)
++			continue;
++		/* A bridged VLAN or an unknown upper has a different membership
++		 * authority. Bypass only that VLAN instead of blackholing it.
++		 */
++		scope.bypass = netif_is_bridge_port(dev);
++		rcu_read_lock();
++		netdev_for_each_upper_dev_rcu(dev, upper, iter)
++			if (!is_vlan_dev(upper))
++				scope.bypass = true;
++		rcu_read_unlock();
++		idev = __in_dev_get_rtnl(dev);
++		if (idev)
++			for (im = rtnl_dereference(idev->mc_list); im;
++			     im = rtnl_dereference(im->next_rcu)) {
++				err = ifc_add_group(&scope, im->multiaddr);
++				if (err)
++					return err;
++			}
++		err = ipmr_offload_group_snapshot(dev, scope.groups, &scope.count,
++						 ARRAY_SIZE(scope.groups));
++		if (err == -EOPNOTSUPP)
++			scope.bypass = true;
++		else if (err)
++			return err;
++		err = ifc_scope_rules(ifc, &scope, &vid_hits, &untagged_hits,
++				      &untagged_bypass);
++		if (err)
++			return err;
++	}
++	if (!untagged_bypass) {
++		err = ifc_add_drop(ifc, false, -1, untagged_hits);
++		if (err)
++			return err;
++	}
++	return ifc_add_drop(ifc, true, -1, vid_hits);
++}
++
++static int ifc_program(struct airoha_ifc *ifc)
++{
++	struct ifc_rule check;
++	u32 disabled[6] = {};
++	unsigned int i, j;
++	int err;
++
++	/* Gate is closed throughout the replacement. Disable old exceptions
++	 * before writing any key so a partial update is never live.
++	 */
++	for (i = 0; i < IFC_RULES; i++) {
++		err = ifc_action(ifc, i, disabled, true);
++		if (err)
++			return err;
++	}
++	for (i = 0; i < IFC_LUTS; i++) {
++		u32 words[2];
++
++		err = ifc_lut(ifc, i, ifc->lut[i], true);
++		if (!err)
++			err = ifc_lut(ifc, i, words, false);
++		if (err || memcmp(words, ifc->lut[i], sizeof(words)))
++			return err ?: -EIO;
++	}
++	for (i = 0; i < ifc->rule_count; i++) {
++		struct ifc_rule *r = &ifc->rules[i];
++
++		err = ifc_key(ifc, i, r, true);
++		if (!err)
++			err = ifc_action(ifc, i, r->action, true);
++		if (!err)
++			err = ifc_key(ifc, i, &check, false);
++		if (!err)
++			err = ifc_action(ifc, i, check.action, false);
++		if (err)
++			return err;
++		if (memcmp(check.mask, r->mask, sizeof(r->mask)) ||
++		    memcmp(check.action, r->action, sizeof(r->action)))
++			return -EIO;
++		/* TCAM returns don't-care key bits as ones. */
++		for (j = 0; j < ARRAY_SIZE(r->key); j++)
++			if ((check.key[j] ^ r->key[j]) & r->mask[j])
++				return -EIO;
++	}
++	return 0;
++}
++
++static void ifc_save_applied(struct airoha_ifc *ifc, u64 generation)
++{
++	struct ifc_applied *a = &ifc->applied;
++	unsigned int i;
++
++	/* Worker mutex protects this copy; keep it out of the IRQ gate lock. */
++	memcpy(a->scopes, ifc->scopes, sizeof(a->scopes));
++	memcpy(a->lut, ifc->lut, sizeof(a->lut));
++	a->generation = generation;
++	a->rules = ifc->rule_count;
++	a->lookups = ifc->lut_count;
++	a->groups = ifc->group_count;
++	a->count = ifc->scope_count;
++	a->bypass = 0;
++	for (i = 0; i < a->count; i++)
++		a->bypass += a->scopes[i].bypass;
++}
++
++static void ifc_work(struct work_struct *work)
++{
++	struct airoha_ifc *ifc = container_of(work, struct airoha_ifc, work);
++	unsigned long flags;
++	u64 generation;
++	bool applied = false;
++	int err;
++
++	mutex_lock(&ifc->mutex);
++	rtnl_lock();
++	spin_lock_irqsave(&ifc->gate_lock, flags);
++	if (ifc->stopping || ifc->broken) {
++		spin_unlock_irqrestore(&ifc->gate_lock, flags);
++		goto out;
++	}
++	ifc_gate_close(ifc);
++	generation = ifc->generation;
++	spin_unlock_irqrestore(&ifc->gate_lock, flags);
++	err = ifc_snapshot(ifc);
++	if (!err) {
++		err = ifc_program(ifc);
++		if (err) {
++			spin_lock_irqsave(&ifc->gate_lock, flags);
++			ifc->broken = true;
++			ifc->errors++;
++			spin_unlock_irqrestore(&ifc->gate_lock, flags);
++			dev_warn(ifc->eth->dev, "IFC table update failed (%d); hardware filtering bypassed\n", err);
++		}
++	}
++	ifc->last_error = err;
++	ifc->attempted_generation = generation;
++	spin_lock_irqsave(&ifc->gate_lock, flags);
++	if (!err && !ifc->stopping && generation == ifc->generation) {
++		airoha_fe_wr(ifc->eth, IFC_PORT,
++			     (ifc->saved_port & ~IFC_PORTS) | IFC_PON);
++		airoha_fe_wr(ifc->eth, IFC_CFG, ifc->saved_cfg | IFC_ENABLE);
++		if (airoha_fe_rr(ifc->eth, IFC_CFG) !=
++		    (ifc->saved_cfg | IFC_ENABLE) ||
++		    airoha_fe_rr(ifc->eth, IFC_PORT) !=
++		    ((ifc->saved_port & ~IFC_PORTS) | IFC_PON)) {
++			ifc_gate_close(ifc);
++			ifc->broken = true;
++			ifc->errors++;
++			ifc->last_error = -EIO;
++		} else {
++			ifc->active = true;
++			ifc->updates++;
++			applied = true;
++		}
++	}
++	spin_unlock_irqrestore(&ifc->gate_lock, flags);
++	if (applied)
++		ifc_save_applied(ifc, generation);
++out:
++	rtnl_unlock();
++	mutex_unlock(&ifc->mutex);
++}
++
++static int ifc_save(struct airoha_ifc *ifc)
++{
++	unsigned int i;
++	int err;
++
++	ifc->saved_cfg = airoha_fe_rr(ifc->eth, IFC_CFG);
++	ifc->saved_port = airoha_fe_rr(ifc->eth, IFC_PORT);
++	for (i = 0; i < ARRAY_SIZE(ifc->saved_data); i++)
++		ifc->saved_data[i] = airoha_fe_rr(ifc->eth, IFC_DATA(i));
++	if (ifc->saved_cfg & IFC_ENABLE)
++		return -EBUSY;
++	for (i = 0; i < IFC_RULES; i++) {
++		err = ifc_action(ifc, i, ifc->saved[i].action, false);
++		if (err)
++			return err;
++		if (ifc->saved[i].action[0] & IFC_VALID)
++			return -EBUSY;
++		err = ifc_key(ifc, i, &ifc->saved[i], false);
++		if (err)
++			return err;
++	}
++	for (i = 0; i < IFC_LUTS; i++) {
++		err = ifc_lut(ifc, i, ifc->saved_lut[i], false);
++		if (err)
++			return err;
++	}
++	err = ifc_mib(ifc, &ifc->mib_base);
++	if (!err)
++		ifc->owned = true;
++	return err;
++}
++
++static void ifc_restore(struct airoha_ifc *ifc)
++{
++	unsigned int i;
++	int err = 0;
++
++	if (ifc->owned) {
++		airoha_fe_wr(ifc->eth, IFC_CFG, ifc->saved_cfg);
++		for (i = 0; !err && i < IFC_RULES; i++) {
++			err = ifc_key(ifc, i, &ifc->saved[i], true);
++			if (!err)
++				err = ifc_action(ifc, i, ifc->saved[i].action, true);
++		}
++		for (i = 0; !err && i < IFC_LUTS; i++)
++			err = ifc_lut(ifc, i, ifc->saved_lut[i], true);
++		airoha_fe_wr(ifc->eth, IFC_PORT, ifc->saved_port);
++		if (err)
++			dev_warn(ifc->eth->dev, "IFC restore failed (%d); classifier remains disabled\n", err);
++	}
++	for (i = 0; i < ARRAY_SIZE(ifc->saved_data); i++)
++		airoha_fe_wr(ifc->eth, IFC_DATA(i), ifc->saved_data[i]);
++}
++
++/* Called while holding mutex and gate_lock. An old successful snapshot is
++ * historical when a new event has disabled the classifier, even if its work
++ * has not run yet and last_error still describes the previous attempt.
++ */
++static const char *ifc_state(struct airoha_ifc *ifc)
++{
++	if (ifc->broken)
++		return "hardware-failure";
++	if (ifc->stopping || !ifc->ready || !ifc->owned)
++		return "bypass";
++	if (ifc->active && ifc->generation == ifc->applied.generation)
++		return ifc->applied.bypass ? "partial-bypass" : "active";
++	if (ifc->generation != ifc->attempted_generation)
++		return "updating";
++	if (ifc->last_error == -ENOSPC)
++		return "capacity-exceeded";
++	if (ifc->last_error == -EOPNOTSUPP)
++		return "unsupported-scope";
++	return "updating";
++}
++
++static int ifc_show(struct seq_file *s, void *unused)
++{
++	struct airoha_ifc *ifc = s->private;
++	struct ifc_applied *a = &ifc->applied;
++	unsigned long flags;
++	unsigned int i, j;
++	u64 generation, events;
++	bool active, broken, snapshot_current;
++	const char *state;
++	u64 packets;
++	int err;
++
++	mutex_lock(&ifc->mutex);
++	spin_lock_irqsave(&ifc->gate_lock, flags);
++	active = ifc->active;
++	broken = ifc->broken;
++	generation = ifc->generation;
++	events = ifc->events;
++	snapshot_current = active && generation == a->generation;
++	state = ifc_state(ifc);
++	spin_unlock_irqrestore(&ifc->gate_lock, flags);
++	seq_printf(s, "automatic=1 active=%u broken=%u last_error=%d\n",
++		   active, broken, ifc->last_error);
++	seq_printf(s, "scope=pon-ipv4-udp-ipoe-single-vlan policy=membership-default-drop groups=%u exceptions=%u bypass_scopes=%u rules=%u\n",
++		   ifc->group_count, ifc->scope_count, ifc->bypass_count, ifc->rule_count);
++	seq_printf(s, "lookup_entries=%u capacity=32 (4 reserved; groups and admitted VLANs share the rest)\n",
++		   ifc->lut_count);
++	seq_printf(s, "updates=%llu events=%llu errors=%llu\n",
++		   ifc->updates, events, ifc->errors);
++	seq_printf(s, "status_version=1 state=%s generation=%llu applied_generation=%llu snapshot_current=%u\n",
++		   state, generation, a->generation, snapshot_current);
++	seq_printf(s, "applied_rules=%u rule_capacity=%u applied_lookups=%u lookup_capacity=%u applied_groups=%u applied_scopes=%u applied_bypass=%u\n",
++		   a->rules, IFC_RULES, a->lookups, IFC_LUTS, a->groups,
++		   a->count, a->bypass);
++	for (i = 0; i < a->count; i++) {
++		struct ifc_admission *scope = &a->scopes[i];
++
++		seq_printf(s, "admission tagged=%u vid=%u bypass=%u groups=",
++			   scope->tagged, scope->vid, scope->bypass);
++		for (j = IFC_COMMON_LUTS; j < a->lookups; j++) {
++			__be32 group;
++
++			if (!(scope->groups & BIT(j)))
++				continue;
++			group = htonl(a->lut[j][0]);
++			seq_printf(s, "%pI4,", &group);
++		}
++		seq_putc(s, '\n');
++	}
++	err = ifc_mib(ifc, &packets);
++	if (!err)
++		seq_printf(s, "hardware_drops=%llu\n",
++			   (packets - ifc->mib_base) & GENMASK_ULL(55, 0));
++	else
++		seq_printf(s, "hardware_drops_error=%d\n", err);
++	mutex_unlock(&ifc->mutex);
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(ifc);
++
++void airoha_ifc_init(struct airoha_eth *eth)
++{
++	struct airoha_ifc *ifc;
++	struct airoha_gdm_port *port;
++	unsigned int i;
++	int err;
++
++	if (!airoha_is_7581(eth))
++		return;
++	/* Hardware GDM IDs start at one; the driver array starts at zero. */
++	port = eth->ports[AIROHA_GDM2_IDX - 1];
++	if (!port || !port->devs[0] || !test_bit(AIROHA_DEV_F_PON, &port->devs[0]->flags))
++		return;
++	ifc = devm_kzalloc(eth->dev, sizeof(*ifc), GFP_KERNEL);
++	if (!ifc)
++		return;
++	ifc->eth = eth;
++	ifc->pon = netdev_from_priv(port->devs[0]);
++	spin_lock_init(&ifc->gate_lock);
++	mutex_init(&ifc->mutex);
++	INIT_WORK(&ifc->work, ifc_work);
++	ifc->member_nb.notifier_call = ifc_member_notify;
++	ifc->net_nb.notifier_call = ifc_net_notify;
++	ifc->addr_nb.notifier_call = ifc_addr_notify;
++	ifc->fib_nb.notifier_call = ifc_fib_notify;
++	err = ifc_save(ifc);
++	if (err)
++		goto unavailable;
++	err = ipmr_offload_register(&ifc->member_nb);
++	if (err)
++		goto unavailable;
++	err = register_netdevice_notifier(&ifc->net_nb);
++	if (err)
++		goto unregister_member;
++	err = register_inetaddr_notifier(&ifc->addr_nb);
++	if (err)
++		goto unregister_net;
++	err = register_fib_notifier(&init_net, &ifc->fib_nb, NULL, NULL);
++	if (err)
++		goto unregister_addr;
++	eth->ifc = ifc;
++	ifc->debugfs = debugfs_create_file("pon_multicast_filter", 0400,
++					 eth->napi_debugfs, ifc, &ifc_fops);
++	spin_lock_irq(&ifc->gate_lock);
++	ifc->ready = true;
++	spin_unlock_irq(&ifc->gate_lock);
++	ifc_changed(ifc);
++	dev_info(eth->dev, "automatic PON multicast membership filter registered\n");
++	return;
++unregister_addr:
++	unregister_inetaddr_notifier(&ifc->addr_nb);
++unregister_net:
++	unregister_netdevice_notifier(&ifc->net_nb);
++unregister_member:
++	ipmr_offload_unregister(&ifc->member_nb);
++unavailable:
++	/* No gate was enabled and no key was changed before all registrations
++	 * succeeded. Leave any pre-existing classifier owner untouched.
++	 */
++	for (i = 0; i < ARRAY_SIZE(ifc->saved_data); i++)
++		airoha_fe_wr(eth, IFC_DATA(i), ifc->saved_data[i]);
++	dev_warn(eth->dev, "automatic PON multicast filter unavailable (%d)\n", err);
++	devm_kfree(eth->dev, ifc);
++}
++
++void airoha_ifc_exit(struct airoha_eth *eth)
++{
++	struct airoha_ifc *ifc = eth->ifc;
++	unsigned long flags;
++
++	if (!ifc)
++		return;
++	spin_lock_irqsave(&ifc->gate_lock, flags);
++	ifc->stopping = true;
++	ifc_gate_close(ifc);
++	spin_unlock_irqrestore(&ifc->gate_lock, flags);
++	unregister_fib_notifier(&init_net, &ifc->fib_nb);
++	unregister_inetaddr_notifier(&ifc->addr_nb);
++	unregister_netdevice_notifier(&ifc->net_nb);
++	ipmr_offload_unregister(&ifc->member_nb);
++	cancel_work_sync(&ifc->work);
++	debugfs_remove(ifc->debugfs);
++	mutex_lock(&ifc->mutex);
++	ifc_restore(ifc);
++	mutex_unlock(&ifc->mutex);
++	eth->ifc = NULL;
++}
+diff --git a/drivers/net/ethernet/airoha/airoha_ifc.h b/drivers/net/ethernet/airoha/airoha_ifc.h
+new file mode 100644
+index 0000000..5f983a6
+--- /dev/null
++++ b/drivers/net/ethernet/airoha/airoha_ifc.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _AIROHA_IFC_H
++#define _AIROHA_IFC_H
++
++struct airoha_eth;
++
++#if IS_ENABLED(CONFIG_NET_AIROHA_MCAST)
++void airoha_ifc_init(struct airoha_eth *eth);
++void airoha_ifc_exit(struct airoha_eth *eth);
++#else
++static inline void airoha_ifc_init(struct airoha_eth *eth) {}
++static inline void airoha_ifc_exit(struct airoha_eth *eth) {}
++#endif
++#endif
+-- 
+2.53.0
+

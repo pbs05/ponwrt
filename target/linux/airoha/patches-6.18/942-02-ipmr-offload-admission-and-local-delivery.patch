@@ -1,0 +1,290 @@
+From 04944f4845092f961dd488f1863cc10e99bd30b8 Mon Sep 17 00:00:00 2001
+From: Huajin Wang <7976028+excelwang@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 22:27:38 +0800
+Subject: [PATCH] ipmr: expose routed multicast admission and local-delivery
+ state
+
+Consolidate retained multicast implementation and follow-up fixes.
+---
+ include/linux/mroute.h |  28 ++++++++++
+ include/linux/skbuff.h |   5 ++
+ net/core/skbuff.c      |   4 ++
+ net/ipv4/igmp.c        |   4 +-
+ net/ipv4/ipmr.c        | 118 +++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/mroute.h b/include/linux/mroute.h
+index 4c5003a..67f5397 100644
+--- a/include/linux/mroute.h
++++ b/include/linux/mroute.h
+@@ -63,6 +63,34 @@ static inline int ipmr_sk_ioctl(struct sock *sk, unsigned int cmd,
+ }
+ #endif
+ 
++/* Exact (S,G) admission for drivers; pointers are valid under RCU. */
++struct ipmr_offload_route {
++	struct net_device *out;
++	struct mr_mfc *mfc;
++	vifi_t parent;
++	u8 ttls[MAXVIFS];
++	bool local;
++};
++
++/* Private notifications only cover membership and rule changes. MFC/VIF
++ * changes already have typed FIB notifications. A NULL dev means rules.
++ */
++struct ipmr_offload_event {
++	struct net *net;
++	struct net_device *dev;
++	__be32 group;
++};
++#ifdef CONFIG_IP_MROUTE
++int ipmr_offload_snapshot(struct net_device *in, __be32 source, __be32 group,
++			 struct ipmr_offload_route *route);
++int ipmr_offload_register(struct notifier_block *nb);
++void ipmr_offload_unregister(struct notifier_block *nb);
++void ipmr_offload_notify(struct net *net, struct net_device *dev, __be32 group);
++#else
++static inline void ipmr_offload_notify(struct net *net, struct net_device *dev,
++				       __be32 group) {}
++#endif
++
+ #define VIFF_STATIC 0x8000
+ 
+ struct mfc_cache_cmp_arg {
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index a14d7c9..5f92485 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -806,6 +806,7 @@ enum skb_tstamp_type {
+  *		ENCAP_TYPE_ETHER or ENCAP_TYPE_IPPROTO
+  *	@remcsum_offload: remote checksum offload is enabled
+  *	@offload_fwd_mark: Packet was L2-forwarded in hardware
++ *	@offload_mr_fwd_mark: Complete multicast fanout was forwarded in hardware
+  *	@offload_l3_fwd_mark: Packet was L3-forwarded in hardware
+  *	@tc_skip_classify: do not classify packet. set by IFB device
+  *	@tc_at_ingress: used within tc_classify to distinguish in/egress
+@@ -1014,6 +1015,7 @@ struct sk_buff {
+ #ifdef CONFIG_NET_SWITCHDEV
+ 	__u8			offload_fwd_mark:1;
+ 	__u8			offload_l3_fwd_mark:1;
++	__u8			offload_mr_fwd_mark:1;
+ #endif
+ 	__u8			redirected:1;
+ #ifdef CONFIG_NET_REDIRECT
+@@ -4934,6 +4936,9 @@ enum skb_ext_id {
+ #endif
+ #if IS_ENABLED(CONFIG_INET_PSP)
+ 	SKB_EXT_PSP,
++#endif
++#if IS_ENABLED(CONFIG_NET_AIROHA_MCAST)
++	SKB_EXT_MCAST_COOKIE,
+ #endif
+ 	SKB_EXT_NUM, /* must be last */
+ };
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 7cd4f55..1552d06 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -5102,6 +5102,9 @@ EXPORT_SYMBOL_GPL(skb_segment);
+ #define SKB_EXT_CHUNKSIZEOF(x)	(ALIGN((sizeof(x)), SKB_EXT_ALIGN_VALUE) / SKB_EXT_ALIGN_VALUE)
+ 
+ static const u8 skb_ext_type_len[] = {
++#if IS_ENABLED(CONFIG_NET_AIROHA_MCAST)
++	[SKB_EXT_MCAST_COOKIE] = SKB_EXT_CHUNKSIZEOF(u64),
++#endif
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	[SKB_EXT_BRIDGE_NF] = SKB_EXT_CHUNKSIZEOF(struct nf_bridge_info),
+ #endif
+@@ -6256,6 +6259,7 @@ void skb_scrub_packet(struct sk_buff *skb, bool xnet)
+ #ifdef CONFIG_NET_SWITCHDEV
+ 	skb->offload_fwd_mark = 0;
+ 	skb->offload_l3_fwd_mark = 0;
++	skb->offload_mr_fwd_mark = 0;
+ #endif
+ 	ipvs_reset(skb);
+ 
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+index 2846c2c..978f684 100644
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -99,9 +99,7 @@
+ #include <net/checksum.h>
+ #include <net/inet_common.h>
+ #include <linux/netfilter_ipv4.h>
+-#ifdef CONFIG_IP_MROUTE
+ #include <linux/mroute.h>
+-#endif
+ #ifdef CONFIG_PROC_FS
+ #include <linux/proc_fs.h>
+ #include <linux/seq_file.h>
+@@ -1611,6 +1609,7 @@ static void ____ip_mc_inc_group(struct in_device *in_dev, __be32 addr,
+ 	igmpv3_del_delrec(in_dev, im);
+ #endif
+ 	igmp_group_added(im);
++	ipmr_offload_notify(dev_net(in_dev->dev), in_dev->dev, addr);
+ 	inet_ifmcaddr_notify(in_dev->dev, im, RTM_NEWMULTICAST);
+ 	if (!in_dev->dead)
+ 		ip_rt_multicast_event(in_dev);
+@@ -1827,6 +1826,7 @@ void __ip_mc_dec_group(struct in_device *in_dev, __be32 addr, gfp_t gfp)
+ 				ip_mc_hash_remove(in_dev, i);
+ 				*ip = i->next_rcu;
+ 				in_dev->mc_count--;
++				ipmr_offload_notify(dev_net(in_dev->dev), in_dev->dev, addr);
+ 				__igmp_group_dropped(i, gfp);
+ 				inet_ifmcaddr_notify(in_dev->dev, i,
+ 						     RTM_DELMULTICAST);
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index ae9efbb..1a4a07b 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -80,6 +80,33 @@ struct ipmr_result {
+  * Note that the changes are semaphored via rtnl_lock.
+  */
+ 
++/* No table or bridge locks may be acquired by notifier consumers. */
++static ATOMIC_NOTIFIER_HEAD(ipmr_offload_chain);
++
++int ipmr_offload_register(struct notifier_block *nb)
++{
++	return atomic_notifier_chain_register(&ipmr_offload_chain, nb);
++}
++EXPORT_SYMBOL_GPL(ipmr_offload_register);
++
++void ipmr_offload_unregister(struct notifier_block *nb)
++{
++	atomic_notifier_chain_unregister(&ipmr_offload_chain, nb);
++}
++EXPORT_SYMBOL_GPL(ipmr_offload_unregister);
++
++void ipmr_offload_notify(struct net *net, struct net_device *dev, __be32 group)
++{
++	struct ipmr_offload_event event = {
++		.net = net,
++		.dev = dev,
++		.group = group,
++	};
++
++	atomic_notifier_call_chain(&ipmr_offload_chain, 0, &event);
++}
++EXPORT_SYMBOL_GPL(ipmr_offload_notify);
++
+ static DEFINE_SPINLOCK(mrt_lock);
+ 
+ static struct net_device *vif_dev_read(const struct vif_device *vif)
+@@ -228,7 +255,13 @@ static int ipmr_rule_fill(struct fib_rule *rule, struct sk_buff *skb,
+ 	return 0;
+ }
+ 
++static void ipmr_offload_flush_rules(struct fib_rules_ops *ops)
++{
++	ipmr_offload_notify(ops->fro_net, NULL, 0);
++}
++
+ static const struct fib_rules_ops __net_initconst ipmr_rules_ops_template = {
++	.flush_cache	= ipmr_offload_flush_rules,
+ 	.family		= RTNL_FAMILY_IPMR,
+ 	.rule_size	= sizeof(struct ipmr_rule),
+ 	.addr_size	= sizeof(u32),
+@@ -958,6 +991,84 @@ static struct mfc_cache *ipmr_cache_find(struct mr_table *mrt,
+ }
+ 
+ /* Look for a (*,G) entry */
++/* The first backend supports one routed bridge domain. Reject wildcard
++ * routes, tunnels, non-default TTL thresholds and policy routing: hardware
++ * must never silently implement only a subset of the software fanout.
++ */
++int ipmr_offload_snapshot(struct net_device *in, __be32 source, __be32 group,
++			 struct ipmr_offload_route *route)
++{
++	struct net *net = dev_net(in);
++	struct in_device *idev;
++	struct ip_mc_list *im;
++	struct mfc_cache *c;
++	struct mr_table *mrt;
++	int i, err = -EOPNOTSUPP;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "ipmr snapshot requires RCU");
++	memset(route, 0, sizeof(*route));
++	if (!ipv4_is_multicast(group) || ipv4_is_local_multicast(group) ||
++	    !source || ipv4_is_multicast(source) || ipv4_is_lbcast(source) ||
++	    !net_eq(net, &init_net))
++		return -EOPNOTSUPP;
++#ifdef CONFIG_IP_MROUTE_MULTIPLE_TABLES
++	{
++		struct fib_rule *rule;
++
++		list_for_each_entry_rcu(rule, &net->ipv4.mr_rules_ops->rules_list, list)
++			if (!ipmr_rule_default(rule))
++				return -EOPNOTSUPP;
++	}
++#endif
++	mrt = __ipmr_get_table(net, RT_TABLE_DEFAULT);
++	if (!mrt || mrt->mroute_do_pim || mrt->mroute_do_wrvifwhole)
++		return -EOPNOTSUPP;
++	spin_lock_bh(&mrt_lock);
++	c = ipmr_cache_find(mrt, source, group);
++	if (!c || c->_c.mfc_parent >= MAXVIFS ||
++	    vif_dev_read(&mrt->vif_table[c->_c.mfc_parent]) != in)
++		goto out;
++	if (mrt->vif_table[c->_c.mfc_parent].flags & ~VIFF_STATIC)
++		goto out;
++	for (i = c->_c.mfc_un.res.minvif; i < c->_c.mfc_un.res.maxvif; i++) {
++		struct vif_device *vif = &mrt->vif_table[i];
++		u8 ttl = c->_c.mfc_un.res.ttls[i];
++
++		if (ttl == 255)
++			continue;
++		if (ttl != 1 || i == c->_c.mfc_parent || route->out ||
++		    vif->flags & ~VIFF_STATIC || vif->rate_limit)
++			goto out;
++		route->out = vif_dev_read(vif);
++		if (!route->out || !netif_running(route->out))
++			goto out;
++	}
++	if (!route->out)
++		goto out;
++	route->mfc = &c->_c;
++	route->parent = c->_c.mfc_parent;
++	memcpy(route->ttls, c->_c.mfc_un.res.ttls, sizeof(route->ttls));
++	/* Local routing consults the ingress in_device, not subscriptions on
++	 * unrelated interfaces. Keep the group copy independent of source
++	 * filters: IP input/socket filtering remains authoritative and source
++	 * filter changes never need to enable a missing hardware CPU copy.
++	 */
++	idev = __in_dev_get_rcu(in);
++	if (idev) {
++		for (im = rcu_dereference(idev->mc_list); im;
++		     im = rcu_dereference(im->next_rcu))
++			if (im->multiaddr == group) {
++				route->local = true;
++				break;
++			}
++	}
++	err = 0;
++out:
++	spin_unlock_bh(&mrt_lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(ipmr_offload_snapshot);
++
+ static struct mfc_cache *ipmr_cache_find_any(struct mr_table *mrt,
+ 					     __be32 mcastgrp, int vifi)
+ {
+@@ -2240,6 +2351,13 @@ int ip_mr_input(struct sk_buff *skb)
+ 	 */
+ 	if (IPCB(skb)->flags & IPSKB_FORWARDED)
+ 		goto dont_forward;
++#ifdef CONFIG_NET_SWITCHDEV
++	/* This is the local copy of a complete hardware multicast fanout.
++	 * Keep local delivery but never duplicate those routed outputs.
++	 */
++	if (skb->offload_mr_fwd_mark)
++		goto dont_forward;
++#endif
+ 
+ 	if (!local)
+ 		skb_orphan(skb);
+-- 
+2.53.0
+

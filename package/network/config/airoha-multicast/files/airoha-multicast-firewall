@@ -1,0 +1,10 @@
+#!/bin/sh
+# fw4 already retires its unicast/bridge flowtables. Retire the independent
+# multicast cache after the new firewall rules are installed, without changing
+# the accepted scope, the saved settings, or a diagnostic pause.
+status=$(/usr/sbin/airoha-mcastctl get 2>/dev/null) || exit 0
+[ "$(printf '%s' "$status" | jsonfilter -e '@.live_apply')" = true ] || exit 0
+if ! /usr/sbin/airoha-mcastctl flush >/dev/null; then
+	logger -t airoha-multicast 'Firewall updated, but multicast flow retirement failed; inspect driver fault state before trusting offloaded forwarding'
+	exit 1
+fi
